@@ -1,0 +1,43 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+last_settings.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.ruff_cache/
+.pytest_cache/
+
+# OS and editor files
+.DS_Store
+.idea/
+.vscode/
+
+# Local agent/tool state
+.claude/
+.codex/
+.omc/
+.skills/
+
+# Runtime state and generated output
+*.db
+*.log
+assets/
+autokat/assets/
+autokat/output/
+autokat/tasks/
+dist/
+export/
+logs/
+output/
+tasks/
+test_output/
+
+# Local media collections
+*.mp3
+*.zip
+达人素材/

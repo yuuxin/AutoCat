@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta:__legacy__"
+
+[project]
+name = "autokat"
+version = "3.0.0"
+description = "低成本单机智能批量混剪系统 — 基于 FFmpeg + AI 的短视频批量生产工具"
+readme = "README.md"
+authors = [{name = "AutoCat Team"}]
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "PySide6>=6.6",
+    "edge-tts>=6.1",
+    "Pillow>=10.0",
+    "numpy>=1.24",
+    "tqdm>=4.66",
+    "imagehash>=4.3",
+    "librosa>=0.10",
+    "soundfile>=0.12",
+    "pydub>=0.25",
+]
+
+[project.optional-dependencies]
+ai = [
+    "transformers>=4.40",
+    "torch>=2.0",
+    "sentencepiece>=0.2",
+    "accelerate>=0.30",
+]
+
+[project.scripts]
+autokat = "autokat.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["autokat*"]
