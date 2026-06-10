@@ -8,7 +8,6 @@
 不算 state, 纯函数式; 调用方在 generate_batch 循环里维护 recent_sets 和 usage_count。
 """
 
-import math
 from typing import Optional
 
 
@@ -34,6 +33,63 @@ def compute_jaccard(set_a: set, set_b: set) -> float:
     intersection = len(set_a & set_b)
     union = len(set_a | set_b)
     return intersection / union if union > 0 else 0.0
+
+
+def max_jaccard(target: set, previous_sets: list[set]) -> float:
+    """Return the highest Jaccard similarity against previous combinations."""
+    if not previous_sets:
+        return 0.0
+    return max(compute_jaccard(target, previous) for previous in previous_sets)
+
+
+def build_diversity_report(scripts: list[dict], material_pool: list[dict]) -> dict:
+    """Summarize slice/source coverage and pairwise combination similarity."""
+    available_ids = {int(m["id"]) for m in material_pool}
+    available_sources = {
+        int(m.get("source_id") or m["id"]) for m in material_pool
+    }
+    usage: dict[int, int] = {}
+    source_usage: dict[int, int] = {}
+    slice_sets = []
+    source_sets = []
+
+    for script in scripts:
+        script_ids = []
+        script_sources = []
+        for clip in script.get("clips", []):
+            mid = clip.get("material_id")
+            if mid is None:
+                continue
+            mid = int(mid)
+            source_id = int(clip.get("source_id") or mid)
+            usage[mid] = usage.get(mid, 0) + 1
+            source_usage[source_id] = source_usage.get(source_id, 0) + 1
+            script_ids.append(mid)
+            script_sources.append(source_id)
+        slice_sets.append(set(script_ids))
+        source_sets.append(set(script_sources))
+
+    pair_slice_jaccards = []
+    pair_source_jaccards = []
+    for i in range(len(slice_sets)):
+        for j in range(i + 1, len(slice_sets)):
+            pair_slice_jaccards.append(compute_jaccard(slice_sets[i], slice_sets[j]))
+            pair_source_jaccards.append(compute_jaccard(source_sets[i], source_sets[j]))
+
+    return {
+        "slice_coverage": len(usage) / len(available_ids) if available_ids else 0.0,
+        "source_coverage": len(source_usage) / len(available_sources) if available_sources else 0.0,
+        "unused_slices": max(0, len(available_ids) - len(usage)),
+        "max_slice_uses": max(usage.values(), default=0),
+        "max_source_uses": max(source_usage.values(), default=0),
+        "avg_slice_uses": sum(usage.values()) / len(usage) if usage else 0.0,
+        "max_slice_jaccard": max(pair_slice_jaccards, default=0.0),
+        "avg_slice_jaccard": (
+            sum(pair_slice_jaccards) / len(pair_slice_jaccards)
+            if pair_slice_jaccards else 0.0
+        ),
+        "max_source_jaccard": max(pair_source_jaccards, default=0.0),
+    }
 
 
 def compute_risk_level(desired_count: int, max_safe_count: int,

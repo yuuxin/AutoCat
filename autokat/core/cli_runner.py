@@ -15,12 +15,7 @@ from autokat.models.db import init_db
 from autokat.core.tts import save_script, list_scripts
 from autokat.models.db import get_conn
 from autokat.core.renderer import create_and_run_batch
-
-
-# 硬编码 BGM 候选（CLI 默认；GUI 里用户可自选）
-_DEFAULT_BGM_CANDIDATES = [
-    Path(__file__).resolve().parent.parent.parent / "assets" / "bgm" / "piano_test.mp3",
-]
+from autokat.core.bgm import pick_random_bgm
 
 
 def _get_or_create_script(name: str, narration: str, lang: str, tts_config=None) -> int:
@@ -51,10 +46,7 @@ def _get_or_create_script(name: str, narration: str, lang: str, tts_config=None)
 
 def _pick_default_bgm() -> Optional[str]:
     """CLI 没有指定 BGM 时，自动挑一个 assets/bgm/ 下的文件"""
-    for c in _DEFAULT_BGM_CANDIDATES:
-        if c.exists():
-            return str(c)
-    return None
+    return pick_random_bgm()
 
 
 def _parse_rate(s) -> str:

@@ -9,13 +9,12 @@ v2.3 增强：
 
 import json
 import random
-from pathlib import Path
 from typing import Optional
 
 from autokat.core.material import build_material_pool
-from autokat.core.tagger import extract_keywords, match_materials_for_text
+from autokat.core.tagger import extract_keywords
 from autokat.core.diversity import (
-    score_material_for_diversity, slice_key,
+    build_diversity_report, max_jaccard,
 )
 
 # ── 59 种 xfade 转场效果（与 renderer.py 一致） ──
@@ -40,78 +39,76 @@ SUBTITLE_POSITIONS = ["top", "middle", "bottom"]
 
 
 
+def _source_id(mat: dict) -> int:
+    return int(mat.get("source_id") or mat["id"])
+
+
 def _pick_material(pool: list[dict], exclude_ids: set,
-                   min_duration: float,
+                   requested_duration: float,
                    prefer_keywords: Optional[list[str]] = None,
-                   state: Optional[dict] = None) -> Optional[dict]:
-    """从素材池中智能选取素材
-
-    优先选：与关键词匹配度高 + 未用过的素材
-
-    v2.3 增强：差异度调度
-    - state 为 None 时：与旧版完全一致（向后兼容）
-    - state 不为 None 时：综合 (关键词匹配 + Jaccard 软约束 + 配额剩余) 排序
-
-    state 结构 (由 generate_batch 维护):
-        {
-            "usage_count": {mat_id: used_count, ...},
-            "recent_sets": [set_of_mat_ids, ...],  # 最近 N 条成片用过的素材
-            "max_uses": int,
-            "enable_diversity": bool,
-        }
-    """
+                   state: Optional[dict] = None,
+                   exclude_source_ids: Optional[set] = None) -> Optional[dict]:
+    """Select a material using strict least-used tiers before soft scoring."""
     if not pool:
         return None
 
-    candidates = [m for m in pool if m["duration"] >= min_duration]
+    state = state or {}
+    min_segment_duration = float(state.get("min_segment_duration", 0.3))
+    required = min(float(requested_duration), min_segment_duration)
+    candidates = [m for m in pool if float(m.get("duration") or 0) >= required]
+    if not candidates:
+        return None
 
-    if prefer_keywords and candidates:
-        # 按综合打分排序：(关键词匹配 - 复用惩罚) * 差异度系数
-        def score(mat):
-            tags = set(mat.get("tags", []))
-            matched = len(set(prefer_keywords) & tags)
-            reuse_penalty = 0 if mat["id"] not in exclude_ids else 0.3
-            base = matched - reuse_penalty
-            if state is not None and state.get("enable_diversity", False):
-                diversity = score_material_for_diversity(
-                    mat["id"],
-                    state.get("recent_sets", []),
-                    state.get("usage_count", {}),
-                    int(state.get("max_uses", 5)),
-                    base_score=1.0,
-                )
-            else:
-                diversity = 1.0
-            return base * diversity
-        candidates.sort(key=score, reverse=True)
-    else:
-        # 无关键词时按差异度排序（如有 state）
-        if state is not None and state.get("enable_diversity", False) and candidates:
-            def score_div(mat):
-                d = score_material_for_diversity(
-                    mat["id"],
-                    state.get("recent_sets", []),
-                    state.get("usage_count", {}),
-                    int(state.get("max_uses", 5)),
-                    base_score=1.0,
-                )
-                # 优先未用过的（exclude_ids 之外的）
-                bonus = 0.0 if mat["id"] not in exclude_ids else -0.3
-                return d + bonus
-            candidates.sort(key=score_div, reverse=True)
-        else:
-            # 优先选未用过的
-            unused = [m for m in candidates if m["id"] not in exclude_ids]
-            candidates = unused if unused else candidates
+    # Hard tier 1: do not reuse a slice inside one video while alternatives exist.
+    unused_in_video = [m for m in candidates if int(m["id"]) not in exclude_ids]
+    if unused_in_video:
+        candidates = unused_in_video
 
-    # candidates 已按 min_duration 过滤，为空说明没有足够长的素材可用
-    if candidates:
-        return random.choice(candidates)
-    # 容错：候选为空时（所有素材都已被排除 / 池过小），
-    # 从完整 pool 随机选一个（允许重复使用），确保下游不拿到 None
-    if pool:
-        return random.choice(pool)
-    return None
+    if state.get("enable_diversity", False):
+        usage = state.get("usage_count", {})
+        source_usage = state.get("source_usage_count", {})
+        max_uses = max(1, int(state.get("max_uses", 5)))
+
+        # Keep the configured cap while possible; content completeness wins if all hit it.
+        under_cap = [m for m in candidates if usage.get(int(m["id"]), 0) < max_uses]
+        if under_cap:
+            candidates = under_cap
+
+        # Hard tier 2: an already-used slice cannot beat a never/less-used slice.
+        min_usage = min(usage.get(int(m["id"]), 0) for m in candidates)
+        candidates = [m for m in candidates if usage.get(int(m["id"]), 0) == min_usage]
+
+    # Hard tier 3: among equally used slices, avoid a source already in this video.
+    exclude_source_ids = exclude_source_ids or set()
+    unused_sources = [m for m in candidates if _source_id(m) not in exclude_source_ids]
+    if unused_sources:
+        candidates = unused_sources
+
+    if state.get("enable_diversity", False):
+        source_usage = state.get("source_usage_count", {})
+        # Hard tier 4: balance original source videos among equally used slices.
+        min_source_usage = min(source_usage.get(_source_id(m), 0) for m in candidates)
+        candidates = [
+            m for m in candidates
+            if source_usage.get(_source_id(m), 0) == min_source_usage
+        ]
+
+    keyword_set = set(prefer_keywords or [])
+    recent_sets = state.get("recent_sets", [])
+    recent_source_sets = state.get("recent_source_sets", [])
+
+    def soft_score(mat: dict) -> float:
+        mid = int(mat["id"])
+        source_id = _source_id(mat)
+        keyword_score = len(keyword_set & set(mat.get("tags", []))) * 2.0
+        recent_penalty = sum(mid in recent for recent in recent_sets)
+        source_penalty = sum(source_id in recent for recent in recent_source_sets)
+        duration_fit = min(float(mat["duration"]), float(requested_duration))
+        return keyword_score - recent_penalty - source_penalty * 0.5 + duration_fit * 0.01
+
+    candidates.sort(key=soft_score, reverse=True)
+    top_k = max(1, int(state.get("selection_top_k", 5)))
+    return random.choice(candidates[:top_k])
 
 
 def _random_transition() -> str:
@@ -152,7 +149,6 @@ def generate_script(
     """
     cfg = config or {}
     trans_dur = cfg.get("transition_duration", 0.3)
-    allow_reuse = cfg.get("allow_reuse", True)
     fps = cfg.get("fps", 30)
     margin = cfg.get("subtitle_margin", 80)
     narration_text = cfg.get("narration_text", "")
@@ -191,6 +187,7 @@ def generate_script(
     # 素材池偏碎（均2.7s）而音频较长时，单个素材不够填满一个 shot，
     # 改为"吃完"一段素材后再选下一段，循环填充直到 shot_dur 填满。
     used_ids: set = set()
+    used_source_ids: set = set()
     clips = []
     subtitles = []
     sub_pos = cfg.get("subtitle_position") or _random_subtitle_pos()
@@ -205,11 +202,14 @@ def generate_script(
         acc_dur = 0.0
         while acc_dur < shot_dur - 0.05:
             remaining = shot_dur - acc_dur
-            mat = _pick_material(material_pool, used_ids, remaining, keywords, state=state)
+            mat = _pick_material(
+                material_pool, used_ids, remaining, keywords,
+                state=state, exclude_source_ids=used_source_ids,
+            )
             if mat is None:
                 break  # 素材池耗尽，跳过该 shot
-            if not allow_reuse:
-                used_ids.add(mat["id"])
+            used_ids.add(int(mat["id"]))
+            used_source_ids.add(_source_id(mat))
 
             offset = _random_crop_offset(mat["duration"], remaining)
             # 同步修复 v2: 末段 seg_dur 严格等于 remaining, 保证 visual 时长 == audio 时长。
@@ -227,6 +227,7 @@ def generate_script(
 
             clip = {
                 "material_id": mat["id"],
+                "source_id": _source_id(mat),
                 "source_path": mat["path"],
                 "source_type": mat["type"],
                 "offset": round(offset, 2),
@@ -255,6 +256,7 @@ def generate_script(
     # 再走一遍，强制至少产出一条有内容的脚本。
     if not clips and shots:
         used_ids.clear()
+        used_source_ids.clear()
         for shot in shots:
             shot_start = shot[0]["start"]
             shot_end = shot[-1]["end"]
@@ -266,10 +268,14 @@ def generate_script(
             acc_dur = 0.0
             while acc_dur < shot_dur - 0.05:
                 remaining = shot_dur - acc_dur
-                mat = _pick_material(material_pool, used_ids, remaining, keywords, state=state)
+                mat = _pick_material(
+                    material_pool, used_ids, remaining, keywords,
+                    state=state, exclude_source_ids=used_source_ids,
+                )
                 if mat is None:
                     break
-                used_ids.add(mat["id"])
+                used_ids.add(int(mat["id"]))
+                used_source_ids.add(_source_id(mat))
 
                 offset = _random_crop_offset(mat["duration"], remaining)
                 # 同步修复 v2: 末段严格等于 remaining, 保证 visual == audio
@@ -281,6 +287,7 @@ def generate_script(
 
                 clip = {
                     "material_id": mat["id"],
+                    "source_id": _source_id(mat),
                     "source_path": mat["path"],
                     "source_type": mat["type"],
                     "offset": round(offset, 2),
@@ -319,6 +326,7 @@ def generate_batch(
     material_pool: Optional[list[dict]] = None,
     pool_filters: Optional[dict] = None,
     config: Optional[dict] = None,
+    sentence_groups: Optional[list[list[dict]]] = None,
 ) -> list[dict]:
     """批量生成编排脚本
 
@@ -332,34 +340,81 @@ def generate_batch(
         enable_diversity: bool 总开关
     """
     cfg = config or {}
+    if material_pool is None:
+        material_pool = build_material_pool()
+    if not material_pool:
+        raise ValueError("素材池为空，请先导入素材")
     enable_diversity = bool(cfg.get("enable_diversity", True))
     max_uses = int(cfg.get("max_uses_per_slice", 5))
     recent_window = int(cfg.get("diversity_recent_window", 3))
+    max_attempts = max(1, int(cfg.get("diversity_retry_attempts", 4)))
+    jaccard_target = float(cfg.get("diversity_jaccard_target", 0.5))
+    source_jaccard_target = float(cfg.get("diversity_source_jaccard_target", 0.6))
 
     state = {
         "usage_count": {},
+        "source_usage_count": {},
         "recent_sets": [],
+        "recent_source_sets": [],
         "max_uses": max_uses,
         "enable_diversity": enable_diversity,
+        "min_segment_duration": float(cfg.get("min_segment_duration", 0.3)),
+        "selection_top_k": int(cfg.get("diversity_selection_top_k", 5)),
     }
 
     scripts = []
     for i in range(count):
-        script = generate_script(sentences, material_pool, pool_filters, config, state=state)
+        current_sentences = (
+            sentence_groups[i] if sentence_groups and i < len(sentence_groups)
+            else sentences
+        )
+        attempts = []
+        for _ in range(max_attempts if enable_diversity else 1):
+            candidate = generate_script(
+                current_sentences, material_pool, pool_filters, config, state=state
+            )
+            slice_set = {
+                int(c["material_id"]) for c in candidate.get("clips", [])
+                if c.get("material_id") is not None
+            }
+            source_set = {
+                int(c.get("source_id") or c["material_id"])
+                for c in candidate.get("clips", [])
+                if c.get("material_id") is not None
+            }
+            slice_similarity = max_jaccard(slice_set, state["recent_sets"])
+            source_similarity = max_jaccard(source_set, state["recent_source_sets"])
+            attempts.append((max(slice_similarity, source_similarity), candidate, slice_set, source_set))
+            if slice_similarity <= jaccard_target and source_similarity <= source_jaccard_target:
+                break
+
+        _, script, used_set, used_source_set = min(attempts, key=lambda item: item[0])
         script["index"] = i
 
         if enable_diversity:
-            # 收集本次 video 用的 mat_id 集合（不含 offset 视为同源）
             used_mats = [c.get("material_id") for c in script.get("clips", [])]
             used_mats = [m for m in used_mats if m is not None]
             if used_mats:
-                state["recent_sets"].append(set(used_mats))
+                state["recent_sets"].append(used_set)
+                state["recent_source_sets"].append(used_source_set)
                 if len(state["recent_sets"]) > recent_window:
                     state["recent_sets"].pop(0)
+                    state["recent_source_sets"].pop(0)
                 for mid in used_mats:
                     state["usage_count"][mid] = state["usage_count"].get(mid, 0) + 1
+                for source_id in [
+                    c.get("source_id") or c.get("material_id")
+                    for c in script.get("clips", [])
+                    if c.get("material_id") is not None
+                ]:
+                    state["source_usage_count"][source_id] = (
+                        state["source_usage_count"].get(source_id, 0) + 1
+                    )
 
         scripts.append(script)
+    report = build_diversity_report(scripts, material_pool)
+    for script in scripts:
+        script["diversity_report"] = report
     return scripts
 
 

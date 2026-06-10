@@ -7,25 +7,30 @@ import os
 import random
 import subprocess
 import tempfile
+import shutil
 from pathlib import Path
 from typing import Optional
 import json
 
 from autokat.core.ffmpeg_utils import FFMPEG, FFPROBE
+from autokat.core.paths import ASSETS_ROOT, BUNDLED_ASSETS_ROOT
 
-BGM_DIR = Path(__file__).resolve().parent.parent.parent / "assets" / "bgm"
+BGM_DIR = ASSETS_ROOT / "bgm"
+BUNDLED_BGM_DIR = BUNDLED_ASSETS_ROOT / "bgm"
 BGM_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── BGM 管理 ──
 
 def get_bgm_files() -> list[str]:
     """获取 BGM 目录中所有音频文件"""
-    if not BGM_DIR.exists():
-        return []
-    return sorted([
-        str(f) for f in BGM_DIR.iterdir()
-        if f.suffix.lower() in {".mp3", ".wav", ".m4a", ".flac", ".ogg"}
-    ])
+    files = set()
+    for directory in (BGM_DIR, BUNDLED_BGM_DIR):
+        if directory.exists():
+            files.update(
+                str(f) for f in directory.iterdir()
+                if f.suffix.lower() in {".mp3", ".wav", ".m4a", ".flac", ".ogg"}
+            )
+    return sorted(files)
 
 
 def pick_random_bgm(exclude: Optional[list[str]] = None) -> Optional[str]:
@@ -102,6 +107,7 @@ def auto_trim_bgm(bgm_path: str, target_duration: float,
     if dur is None:
         return None
 
+    tmpdir = None
     try:
         if dur >= target_duration:
             # 随机截取一段
@@ -143,15 +149,15 @@ def auto_trim_bgm(bgm_path: str, target_duration: float,
                 "-c", "copy",
                 output_path,
             ]
-            import shutil
-            shutil.rmtree(tmpdir, ignore_errors=True)
-
         subprocess.run(cmd, check=True, capture_output=True, timeout=60)
         return output_path
 
     except Exception as e:
         print(f"[BGM] 裁剪失败: {e}")
         return None
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ── BGM 素材库 ──

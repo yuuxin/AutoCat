@@ -715,7 +715,8 @@ def set_deepseek_key(api_key: str):
     global DEEPSEEK_API_KEY
     DEEPSEEK_API_KEY = api_key
     # 也可以通过写入 .env 文件持久化
-    env_path = Path(__file__).resolve().parent.parent.parent / ".env"
+    from autokat.core.paths import DATA_ROOT
+    env_path = DATA_ROOT / ".env"
     env_path.write_text(f"DEEPSEEK_API_KEY={api_key}\n")
     print("[文案] DeepSeek API Key 已设置")
 

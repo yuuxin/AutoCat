@@ -137,6 +137,10 @@ fi
 # 不设置 PYTHONHOME，让 Python 使用自己的标准库
 # 但把 site-packages 路径加到 PYTHONPATH
 export PYTHONPATH="$RESOURCES/lib/python{py_ver}/site-packages:$PYTHONPATH"
+export AUTOKAT_DATA_DIR="$HOME/Library/Application Support/AutoCat"
+export AUTOKAT_BUNDLED_ASSETS_DIR="$RESOURCES/assets"
+export AUTOKAT_FFMPEG="$RESOURCES/ffmpeg"
+mkdir -p "$AUTOKAT_DATA_DIR"
 
 # DeepSeek API Key
 ENV_FILE="$RESOURCES/.env"
@@ -146,7 +150,7 @@ fi
 
 exec "$PYTHON_BIN" << PYEOF
 import sys
-sys.path.insert(0, "$RESOURCES/lib/python3.14/site-packages")
+sys.path.insert(0, "$RESOURCES/lib/python{py_ver}/site-packages")
 from autokat.models.db import init_db
 from autokat.ui.main_window import run_ui
 init_db()

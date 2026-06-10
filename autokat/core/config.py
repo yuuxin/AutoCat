@@ -18,6 +18,12 @@ DEFAULTS = {
     "perturbation_level": "med",  # off/low/med/high
     "platform": None,  # 必须先选才能生成
     "enable_diversity": True,  # 差异化扰动总开关
+    "diversity_recent_window": 3,
+    "diversity_retry_attempts": 4,
+    "diversity_jaccard_target": 0.5,
+    "diversity_source_jaccard_target": 0.6,
+    "diversity_selection_top_k": 5,
+    "min_segment_duration": 0.3,
     "subtitle_size": 32,
     "subtitle_font": "SourceHanSansSC-Heavy",
     "subtitle_position": "bottom",

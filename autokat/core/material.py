@@ -12,6 +12,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from autokat.models.db import add_material, get_all_materials
+from autokat.core.paths import ASSETS_ROOT
 
 # ── FFmpeg 路径（优先用 ffmpeg-full 确保字幕 filter 可用） ---
 from autokat.core.ffmpeg_utils import FFMPEG, FFPROBE, run_ffmpeg, get_media_duration, get_media_info
@@ -62,7 +63,7 @@ def _clip_display_name(source_name: str, idx: int) -> str:
 
 MIN_VIDEO_DUR = 3.0  # 原视频最短 3s，否则不拆分
 
-ASSETS_DIR = Path(__file__).resolve().parent.parent.parent / "assets"
+ASSETS_DIR = ASSETS_ROOT
 ASSETS_IMAGES = ASSETS_DIR / "images"
 ASSETS_VIDEOS = ASSETS_DIR / "videos"
 ASSETS_KENBURNS = ASSETS_DIR / "kenburns"
@@ -432,6 +433,7 @@ def _build_material_pool_cached(_key: tuple) -> list[dict]:
             continue
         pool.append({
             "id": m["id"],
+            "source_id": m["clip_parent"] or m["id"],
             "path": fp,
             "duration": m["duration"],
             "type": m["mat_type"],
@@ -487,15 +489,6 @@ def import_files_with_callback(
                 on_progress(done, total, fname, "generating kenburns")
                 kb = _generate_kenburns(result["path"], ASSETS_KENBURNS)
                 if kb:
-                    add_material(
-                        file_path=str(kb),
-                        file_hash=_file_hash(str(kb)),
-                        mat_type="video",
-                        duration=2.5,
-                        width=TARGET_W,
-                        height=TARGET_H,
-                        tags=["kenburns"]
-                    )
                     stats["kenburns"] += 1
             done += 1
             on_progress(done, total, fname, "done")

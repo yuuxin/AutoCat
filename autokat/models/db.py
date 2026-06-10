@@ -6,8 +6,9 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional
 
+from autokat.core.paths import TASKS_ROOT
 
-DB_DIR = Path(__file__).resolve().parent.parent.parent / "tasks"
+DB_DIR = TASKS_ROOT
 DB_PATH = DB_DIR / "autokat.db"
 
 

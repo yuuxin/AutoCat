@@ -10,6 +10,7 @@ import time
 from datetime import datetime
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -23,6 +24,7 @@ from autokat.core.editor import (
     generate_batch, save_script_to_file, load_script_from_file,
 )
 from autokat.core.material import build_material_pool
+from autokat.core.paths import OUTPUT_ROOT, TASKS_ROOT
 
 # ── FFmpeg 路径（统一从 ffmpeg_utils 导入） ──
 from autokat.core.ffmpeg_utils import FFMPEG, FFPROBE, run_ffmpeg, get_media_duration
@@ -30,6 +32,22 @@ from autokat.core.perturbation import build_perturbation, is_level_enabled
 from autokat.core.sync_check import verify_sync, parse_srt_last_end
 from autokat.core.progress_log import emit as _log_emit
 import random
+
+_STOP_EVENT = threading.Event()
+
+
+def request_stop():
+    """Request cancellation of the active generation job."""
+    _STOP_EVENT.set()
+
+
+def clear_stop_request():
+    """Clear a previous cancellation request before starting a new job."""
+    _STOP_EVENT.clear()
+
+
+def stop_requested() -> bool:
+    return _STOP_EVENT.is_set()
 
 
 # ── 友好日志辅助 ──────────────────────────────────────────────
@@ -113,8 +131,8 @@ XFADE_TRANSITIONS = [
     "revealleft", "revealright", "revealup", "revealdown",
 ]
 
-OUTPUT_DIR = Path(__file__).resolve().parent.parent.parent / "output"
-SCRIPTS_DIR = Path(__file__).resolve().parent.parent.parent / "tasks" / "scripts"
+OUTPUT_DIR = OUTPUT_ROOT
+SCRIPTS_DIR = TASKS_ROOT / "scripts"
 
 def _safe_progress(clip_id: Optional[int], detail: str,
                      log: bool = False, clip_idx: Optional[int] = None):
@@ -855,6 +873,8 @@ def create_and_run_batch(
     from autokat.models.db import create_task as db_create_task
     from autokat.core.progress_log import set_stage as _set_stage
 
+    clear_stop_request()
+
     # 统一日志出口：有 log_fn 就走 log_fn（GUI 显示），否则落 print（CLI 终端）
     def _log(msg: str) -> None:
         if log_fn is not None:
@@ -929,6 +949,8 @@ def create_and_run_batch(
         f"✅ 配音完成: {len(parts)} 段  ·  "
         f"总时长 {total_audio_dur:.1f}s  ·  文件 {_fmt_size(total_audio_bytes)}"
     )
+    if stop_requested():
+        raise RuntimeError("生成已停止")
 
     _log("─── [2/4] 编排脚本 ───")
     _set_stage(f"📝 编排脚本生成中 (2/4) · 0/{count}")
@@ -974,29 +996,22 @@ def create_and_run_batch(
     }
     if config:
         batch_cfg.update(config)  # 调用方传入的 min_shot_duration 等覆盖默认
-    # 用第 1 段的 sentences 生成 batch（每个 script 都会重新切分自己的句子 — 实际不会，因为 batch_cfg 一样）
-    # 关键：每个 script 用对应段的 sentences
+    sentence_groups = [audio_segments[idx][1] for idx in seg_for_clip]
     batch_scripts = generate_batch(
         audio_segments[0][1], count=count, material_pool=pool, config=batch_cfg,
+        sentence_groups=sentence_groups,
     )
-    # 重新切分 batch_scripts 让每段使用自己的 sentences
-    if is_multi:
-        # 简单做法：每个 script 用自己段的 sentences 重新生成 shots
-        from autokat.core.editor import generate_script as _gen_one
-        new_batch = []
-        for i, script in enumerate(batch_scripts):
-            seg_idx = seg_for_clip[i]
-            seg_path, seg_sents, seg_dur = audio_segments[seg_idx]
-            # 重新生成 shots（基于该段的 sentences 和同样的 config）
-            new_script = _gen_one(seg_sents, material_pool=pool, config=batch_cfg)
-            new_script["index"] = script["index"]
-            new_script["audio_path"] = seg_path
-            new_batch.append(new_script)
-            # 多段模式下重生成会慢，每 10 个刷一次 stage 让用户看到进度
-            if (i + 1) % 10 == 0 or (i + 1) == count:
-                _set_stage(f"📝 编排脚本生成中 · {i+1}/{count}")
-        batch_scripts = new_batch
-
+    _div_report = batch_scripts[0].get("diversity_report", {}) if batch_scripts else {}
+    if _div_report:
+        _log(
+            "   ♻️ 多样性: "
+            f"切片覆盖 {_div_report.get('slice_coverage', 0):.0%}  ·  "
+            f"未使用 {_div_report.get('unused_slices', 0)}  ·  "
+            f"最大复用 {_div_report.get('max_slice_uses', 0)} 次  ·  "
+            f"最大组合相似度 {_div_report.get('max_slice_jaccard', 0):.0%}"
+        )
+    if stop_requested():
+        raise RuntimeError("生成已停止")
     # 统计 batch 里所有 script 的 clip 数（一次素材引用 = 一个 clip）
     _total_shot_refs = sum(len(s.get("clips", [])) for s in batch_scripts)
 
@@ -1134,6 +1149,13 @@ def _render_task(task_id: int, workers: int = 2, batch_cfg: Optional[dict] = Non
         return err_msg is None
 
     done_count = 0
+    def _task_stop_requested() -> bool:
+        current = get_task(task_id)
+        if stop_requested() and current and current["status"] == "running":
+            update_task_status(task_id, "failed", done=done_count)
+            current = get_task(task_id)
+        return stop_requested() or bool(current and current["status"] in ("pending", "failed"))
+
     if workers > 1:
         # 多进程并行渲染
         with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -1142,9 +1164,8 @@ def _render_task(task_id: int, workers: int = 2, batch_cfg: Optional[dict] = Non
                 if future.result():
                     done_count += 1
                 # 暂停检测必须放在 update_task_status 之前，否则会被自己覆盖成 running
-                cur_task = get_task(task_id)
-                if cur_task and cur_task["status"] == "pending":
-                    print(f"  ⏸ 任务 #{task_id} 暂停，跳过剩余 clip（{done_count}/{len(clips)} 已完成）")
+                if _task_stop_requested():
+                    print(f"  ⏸ 任务 #{task_id} 已暂停或停止，跳过剩余 clip（{done_count}/{len(clips)} 已完成）")
                     for f in futures:
                         f.cancel()
                     return
@@ -1154,15 +1175,13 @@ def _render_task(task_id: int, workers: int = 2, batch_cfg: Optional[dict] = Non
         # 单线程
         for c in clips:
             # 暂停检测放在 _render_one 之前（也防止 _render_one 内调 update_clip_status 干扰判断）
-            cur_task = get_task(task_id)
-            if cur_task and cur_task["status"] == "pending":
-                print(f"  ⏸ 任务 #{task_id} 暂停，跳过剩余 clip（{done_count}/{len(clips)} 已完成）")
+            if _task_stop_requested():
+                print(f"  ⏸ 任务 #{task_id} 已暂停或停止，跳过剩余 clip（{done_count}/{len(clips)} 已完成）")
                 return
             if _render_one(c):
                 done_count += 1
-            cur_task = get_task(task_id)
-            if cur_task and cur_task["status"] == "pending":
-                print(f"  ⏸ 任务 #{task_id} 暂停，跳过剩余 clip（{done_count}/{len(clips)} 已完成）")
+            if _task_stop_requested():
+                print(f"  ⏸ 任务 #{task_id} 已暂停或停止，跳过剩余 clip（{done_count}/{len(clips)} 已完成）")
                 return
             update_task_status(task_id, "running", done=done_count)
             _set_stage(f"🎬 视频渲染中 · {done_count}/{_total_clips}")
@@ -1185,16 +1204,19 @@ def _render_task(task_id: int, workers: int = 2, batch_cfg: Optional[dict] = Non
     # v2.4: 写 titles.txt (同 batch 共用一条 AI 标题, 一行一条 filename\ttitle)
     try:
         from autokat.core.writer import generate_publish_title as _gen_title
-        _title_src = parts[0] if parts else narration_text
-        _title_lang = lang if lang in ("zh", "en", "th") else "zh"
+        _title_src = (_script_obj.get("narration") or "").split("---", 1)[0].strip()
+        _script_lang = _script_obj.get("lang") or "zh"
+        _title_lang = _script_lang.split("-", 1)[0]
+        if _title_lang not in ("zh", "en", "th"):
+            _title_lang = "zh"
         _publish_title = _gen_title(_title_src, lang=_title_lang, max_chars=20)
         if _publish_title:
             _titles_path = task_dir / "titles.txt"
             with open(_titles_path, "w", encoding="utf-8") as _tf:
-                for _i in range(count):
+                for _i in range(int(task.get("total") or len(clips))):
                     _fn = f"{safe_name}_{_i+1:04d}.mp4"
                     _tf.write(f"{_fn}\t{_publish_title}\n")
-            _log(f"   📝 发布标题已生成 → titles.txt ({count} 行, 标题: {_publish_title})")
+            _log(f"   📝 发布标题已生成 → titles.txt ({task.get('total') or len(clips)} 行, 标题: {_publish_title})")
     except Exception as _t_exc:
         print(f"[titles] 生成/写盘失败 (不影响渲染): {_t_exc}")
     _log("─── 全部完成 ✅ ───")
@@ -1202,6 +1224,7 @@ def _render_task(task_id: int, workers: int = 2, batch_cfg: Optional[dict] = Non
 
 def resume_pending_tasks(workers: int = 2):
     from autokat.models.db import get_pending_tasks
+    clear_stop_request()
     pending = get_pending_tasks()
     if not pending:
         print("没有未完成的任务")

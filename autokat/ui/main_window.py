@@ -36,14 +36,15 @@ from autokat.core.bgm import get_bgm_files, pick_random_bgm, detect_bpm, downloa
 from autokat.core.bgm import get_bgm_duration, split_bgm_to_segments
 from autokat.core.bgm import get_bgm_duration, split_bgm_to_segments
 from autokat.core.writer import generate_script_by_topic, list_styles, check_deepseek_available, set_deepseek_key
-_env_path = Path(__file__).resolve().parent.parent.parent / ".env"
+from autokat.core.paths import DATA_ROOT
+_env_path = DATA_ROOT / ".env"
 if _env_path.exists():
     for line in _env_path.read_text().splitlines():
         if line.startswith("DEEPSEEK_API_KEY="):
             key = line.split("=", 1)[1].strip()
             if key:
                 set_deepseek_key(key)
-BASE_DIR = Path(__file__).resolve().parent.parent.parent
+BASE_DIR = DATA_ROOT
 CONFIG_DIR = Path.home() / ".config" / "autokat"
 CONFIG_FILE = CONFIG_DIR / "subtitle_pos.json"
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
@@ -889,7 +890,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 5, 10, 5)
         layout.setSpacing(5)
         # 编号
-        num = QLabel(f"#{t["id"]}")
+        num = QLabel(f"#{t['id']}")
         num.setFixedWidth(30)
         num.setStyleSheet("font-size:12px;font-weight:700;color:#6B7280;background:transparent;")
         layout.addWidget(num)
@@ -944,43 +945,6 @@ class MainWindow(QMainWindow):
         time_lbl.setFixedWidth(100)
         time_lbl.setStyleSheet("font-size:12px;color:#6B7280;background:transparent;")
         layout.addWidget(time_lbl)
-        return card
-        def icon_btn(text, tip, cb):
-            b = QPushButton(text)
-            b.setFixedSize(26, 26)
-            b.setToolTip(tip)
-            b.setStyleSheet(icon_style)
-            b.clicked.connect(cb)
-            return b
-        col = 4
-        if t["status"] == "running":
-            layout.addWidget(icon_btn("⏸", "暂停", lambda tid=t["id"]: self._pause_task(tid)), 0, col); col += 1
-        elif t["status"] == "pending":
-            layout.addWidget(icon_btn("▶", "继续", lambda tid=t["id"]: self._resume_task(tid)), 0, col); col += 1
-        elif t["status"] == "failed":
-            layout.addWidget(icon_btn("🔄", "重试", lambda tid=t["id"]: self._retry_task(tid)), 0, col); col += 1
-        layout.addWidget(icon_btn("🔁", "复现", lambda tid=t["id"]: self._replay_task(tid)), 0, col); col += 1
-        layout.addWidget(icon_btn("📂", "查看详情", lambda tid=t["id"]: self._navigate_to_task(tid)), 0, col)
-        # Row 2: 进度条 + 比例 + 参数信息
-        pct = int(t["done"] / t["total"] * 100) if t["total"] > 0 else 0
-        pb = QProgressBar()
-        pb.setRange(0, t["total"])
-        pb.setValue(t["done"])
-        pb.setFixedHeight(6)
-        pb.setMinimumWidth(80)
-        pb.setTextVisible(False)
-        layout.addWidget(pb, 1, 0, 1, 3)
-        pct_label = QLabel(f"{t["done"]}/{t["total"]} ({pct}%)")
-        pct_label.setStyleSheet("font-size:11px; color:#6B7280; background:transparent;")
-        layout.addWidget(pct_label, 1, 3)
-        # 参数信息（紧凑）
-        mat_count = len(get_all_materials())
-        parts = [f"📦{mat_count}"]
-        if cfg.get("enable_bgm"): parts.append("🎵")
-        parts.append(f"⚡{cfg.get('fps', 30)}fps")
-        info = QLabel(" · ".join(parts))
-        info.setStyleSheet("font-size:11px; color:#6B7280; background:transparent;")
-        layout.addWidget(info, 1, 4, 1, 4)
         return card
     @staticmethod
     def _make_small_btn(text: str, cb) -> QPushButton:
@@ -2714,7 +2678,7 @@ class MainWindow(QMainWindow):
             if idx >= 0: self._wiz_voice.setCurrentIndex(idx)
         self._go_to_step(1)
     # ── 设置持久化 ──
-    _SETTINGS_FILE = Path(__file__).resolve().parent.parent.parent / "last_settings.json"
+    _SETTINGS_FILE = CONFIG_DIR / "last_settings.json"
     def _save_last_settings(self, settings: dict):
         try:
             with open(self._SETTINGS_FILE, "w", encoding="utf-8") as f:
@@ -3044,7 +3008,7 @@ class MainWindow(QMainWindow):
             else:
                 self._wiz_progress.setValue(task["done"])
                 self._wiz_task_info.setText(
-                    f"任务 #{task["id"]} | {task["done"]}/{task["total"]} 条 ({task["status"]})"
+                    f"任务 #{task['id']} | {task['done']}/{task['total']} 条 ({task['status']})"
                 )
             # 当前活动：任务完成后显示静态提示；进行中拼3段信息
             rendering = get_rendering_clips(self._current_task_id)
@@ -3295,9 +3259,15 @@ class MainWindow(QMainWindow):
         except Exception:
             import traceback
             traceback.print_exc()
-        self._wiz_task_info.setText(f"✅ 任务 #{task_id} 已完成！")
-        self._wiz_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ 生成完成！task_id={task_id}")
-        if enable_dedup:
+        task = get_task(task_id)
+        stopped_or_failed = bool(task and task["status"] == "failed")
+        if stopped_or_failed:
+            self._wiz_task_info.setText(f"⏹ 任务 #{task_id} 已停止或失败")
+            self._wiz_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] ⏹ 任务已停止或失败 task_id={task_id}")
+        else:
+            self._wiz_task_info.setText(f"✅ 任务 #{task_id} 已完成！")
+            self._wiz_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ 生成完成！task_id={task_id}")
+        if enable_dedup and not stopped_or_failed:
             self._wiz_log.append("开始去重...")
             threading.Thread(target=lambda: self._do_dedup(), daemon=True).start()
         self._refresh_sidebar()
@@ -3327,6 +3297,8 @@ class MainWindow(QMainWindow):
             self._wiz_pause_btn.setEnabled(False)
     def _on_wizard_stop(self):
         self._stop_requested = True
+        from autokat.core.renderer import request_stop
+        request_stop()
         if self._current_task_id:
             from autokat.models.db import update_task_status
             update_task_status(self._current_task_id, "failed")
@@ -3597,7 +3569,7 @@ class MainWindow(QMainWindow):
         if not task:
             return
         self._detail_task_id = task_id
-        self._detail_task_id_label.setText(f"#{task["id"]}")
+        self._detail_task_id_label.setText(f"#{task['id']}")
         self._detail_status_tag.setText(_tag_text(task["status"]))
         self._detail_status_tag.setStyleSheet(_tag_style(task["status"]))
         self._detail_time_label.setText(task["created_at"][:16] if task["created_at"] else "")
@@ -3611,7 +3583,7 @@ class MainWindow(QMainWindow):
         self._detail_narration.setText(narration[:200] + ("..." if len(narration) > 200 else ""))
         self._detail_progress.setRange(0, task["total"])
         self._detail_progress.setValue(task["done"])
-        self._detail_progress.setFormat(f"{task["done"]}/{task["total"]} ({int(task["done"]/task["total"]*100) if task["total"]>0 else 0}%)")
+        self._detail_progress.setFormat(f"{task['done']}/{task['total']} ({int(task['done']/task['total']*100) if task['total']>0 else 0}%)")
         cfg = json.loads(task["config"]) if isinstance(task["config"], str) else task["config"]
         parts = []
         parts.append(f"📦 {len(get_all_materials())} 素材")
@@ -3632,7 +3604,7 @@ class MainWindow(QMainWindow):
             clips = get_clips_by_task(task_id)
             for c in clips:
                 icon = {"done": "✅", "rendering": "🔄", "pending": "⏳", "failed": "❌"}.get(c["status"], "⏳")
-                name = Path(c["output_path"]).name if c["output_path"] else f"clip_{c["idx"]:04d}"
+                name = Path(c["output_path"]).name if c["output_path"] else f"clip_{c['idx']:04d}"
                 # 时长列：从 DB 读 duration_seconds（ffprobe 写回），M:SS 格式
                 dur = c.get("duration_seconds")
                 if dur:
@@ -3640,9 +3612,9 @@ class MainWindow(QMainWindow):
                     dur_str = f"{m}:{s:02d}"
                 else:
                     dur_str = "—:—"
-                text = f"{icon}  {name}  [{dur_str} · {c["status"]}]"
+                text = f"{icon}  {name}  [{dur_str} · {c['status']}]"
                 if c["error_msg"]:
-                    text += f"  ❌ {c["error_msg"]}"
+                    text += f"  ❌ {c['error_msg']}"
                 item = QListWidgetItem(text)
                 self._detail_clips_list.addItem(item)
     def _on_detail_resume(self):
@@ -4543,7 +4515,8 @@ def run_ui():
         init_db()
     except Exception as e:
         warnings.append(f"Database init failed: {e}")
-        db_path = Path(__file__).resolve().parent.parent.parent / "tasks" / "autokat.db"
+        from autokat.models.db import DB_PATH
+        db_path = DB_PATH
         if db_path.exists():
             db_path.unlink()
         init_db()

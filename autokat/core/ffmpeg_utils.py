@@ -7,6 +7,7 @@ from pathlib import Path
 
 # ── FFmpeg 路径 ──
 FFMPEG_CANDIDATES = [
+    os.environ.get("AUTOKAT_FFMPEG", ""),
     "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg",
     "/opt/homebrew/bin/ffmpeg",
     "/usr/local/bin/ffmpeg",
@@ -20,7 +21,7 @@ FFMPEG = None
 FFPROBE = None
 
 for _p in FFMPEG_CANDIDATES:
-    if os.path.exists(_p):
+    if _p and os.path.exists(_p):
         FFMPEG = _p
         FFPROBE = _p.replace("ffmpeg", "ffprobe")
         if not os.path.exists(FFPROBE):

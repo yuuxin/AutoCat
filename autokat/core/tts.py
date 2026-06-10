@@ -15,8 +15,9 @@ from typing import Optional
 import edge_tts
 
 from autokat.models.db import get_conn
+from autokat.core.paths import ASSETS_ROOT
 
-TTS_DIR = Path(__file__).resolve().parent.parent.parent / "assets" / "tts"
+TTS_DIR = ASSETS_ROOT / "tts"
 TTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
