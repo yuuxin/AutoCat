@@ -6,6 +6,7 @@
 
 import json
 import os
+import re
 import time
 from datetime import datetime
 import subprocess
@@ -18,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from autokat.models.db import (
     add_clip, update_clip_status, get_pending_clips,
     update_task_status, get_task, init_db, update_clip_progress,
+    get_task_clip_counts,
 )
 from autokat.core.tts import generate_narration
 from autokat.core.editor import (
@@ -27,10 +29,17 @@ from autokat.core.material import build_material_pool
 from autokat.core.paths import OUTPUT_ROOT, TASKS_ROOT
 
 # ── FFmpeg 路径（统一从 ffmpeg_utils 导入） ──
-from autokat.core.ffmpeg_utils import FFMPEG, FFPROBE, run_ffmpeg, get_media_duration
+from autokat.core.ffmpeg_utils import (
+    FFMPEG, FFPROBE, run_ffmpeg, get_media_duration, get_media_info,
+)
 from autokat.core.perturbation import build_perturbation, is_level_enabled
 from autokat.core.sync_check import verify_sync, parse_srt_last_end
 from autokat.core.progress_log import emit as _log_emit
+from autokat.core.timeline import (
+    SAMPLE_RATE, SYNC_TOLERANCE_SECONDS, apply_integer_timeline,
+    build_target_clock, frames_to_seconds,
+)
+from autokat.core.subtitle_sync import audio_onset
 import random
 
 _STOP_EVENT = threading.Event()
@@ -60,22 +69,6 @@ def _fmt_size(n_bytes: int) -> str:
     return f"{n_bytes/(1024*1024):.1f}MB"
 
 
-def _get_encoder_label() -> str:
-    """探测当前 ffmpeg 编码器（h264_videotoolbox = macOS GPU 加速）"""
-    try:
-        out = subprocess.run(
-            [FFMPEG, "-hide_banner", "-encoders"],
-            capture_output=True, text=True, timeout=3,
-        )
-        if "h264_videotoolbox" in out.stdout:
-            return "h264_videotoolbox（GPU 加速）"
-        if "h264_nvenc" in out.stdout:
-            return "h264_nvenc（NVIDIA GPU）"
-    except Exception:
-        pass
-    return "libx264（CPU）"
-
-
 def _dir_size(path: Path) -> int:
     """目录里所有文件总字节数（递归）"""
     total = 0
@@ -87,43 +80,31 @@ def _dir_size(path: Path) -> int:
         pass
     return total
 
-# ── 硬件 H.264 编码器探测 ──
-# macOS ffmpeg-full 自带 h264_videotoolbox（Apple Silicon 硬编，5-10x 提速）。
-# 用 libx264 兜底。一次性探测，结果缓存。
-_HAS_VT = False
-try:
-    _enc = subprocess.run(
-        [FFMPEG, "-hide_banner", "-encoders"],
-        capture_output=True, text=True, timeout=10,
-    )
-    _HAS_VT = "h264_videotoolbox" in _enc.stdout
-    print(f"[编码器] {'h264_videotoolbox（GPU 加速）' if _HAS_VT else 'libx264（CPU）'}")
-except Exception as e:
-    print(f"[编码器] 探测失败: {e}")
+def _get_encoder_label() -> str:
+    """探测当前 ffmpeg 编码器 (供 main_window wizard 日志显示用)
+
+    当前 _h264_encoder_args 已简化为只用 libx264 (CPU), 所以这里固定返回
+    libx264 标签, 避免误导用户以为在用 GPU 加速。保留函数名是因为
+    main_window.py:2857/2889 还在 import 它。
+    """
+    return "libx264（CPU）"
 
 
 def _h264_encoder_args(bitrate: str = "8M") -> list:
-    """返回当前平台最快的 H.264 编码参数。
-    优先 h264_videotoolbox（Apple Silicon 硬编，5-10x 提速），否则 libx264 veryfast。
-    """
-    if _HAS_VT:
-        # 新版 ffmpeg 的 h264_videotoolbox 默认就是软兜底，不需要 -allow_sw_enc
-        # -movflags +faststart 强制 mp4 muxer 在编码结束后把 moov atom 写完整
-        # 修 macOS h264_videotoolbox 偶发返回 0 但文件被截断到 ~1/3 长度的问题
-        return ["-c:v", "h264_videotoolbox", "-b:v", bitrate, "-movflags", "+faststart"]
+    """Return the stable, color-consistent H.264 encoder settings."""
     return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]
 
 # ── 59 种 xfade 转场效果 ──
 XFADE_TRANSITIONS = [
     "fade", "wipeleft", "wiperight", "wipeup", "wipedown",
     "slideleft", "slideright", "slideup", "slidedown",
-    "circlecrop", "rectcrop", "distance", "fadeblack", "fadewhite",
+    "circlecrop", "rectcrop", "distance",
     "radial", "smoothleft", "smoothright", "smoothup", "smoothdown",
     "circleopen", "circleclose", "vertopen", "vertclose",
     "horzopen", "horzclose", "dissolve", "pixelize",
     "diagtl", "diagtr", "diagbl", "diagbr",
     "hlslice", "hrslice", "vuslice", "vdslice",
-    "hblur", "fadegrays",
+    "hblur",
     "wipetl", "wipetr", "wipebl", "wipebr",
     "squeezeh", "squeezev", "zoomin", "fadefast", "fadeslow",
     "hlwind", "hrwind", "vuwind", "vdwind",
@@ -133,6 +114,85 @@ XFADE_TRANSITIONS = [
 
 OUTPUT_DIR = OUTPUT_ROOT
 SCRIPTS_DIR = TASKS_ROOT / "scripts"
+_FINAL_CLIP_GUARD_FRAMES = 2
+
+
+def _needs_hdr_to_sdr(path: str) -> bool:
+    info = get_media_info(path)
+    streams = [s for s in info.get("streams", []) if s.get("codec_type") == "video"]
+    if not streams:
+        return False
+    stream = streams[0]
+    return (
+        stream.get("color_primaries") == "bt2020"
+        or stream.get("color_space") == "bt2020nc"
+        or stream.get("color_transfer") in {"arib-std-b67", "smpte2084"}
+    )
+
+
+def _tail_freeze_duration(path: str, threshold: float = 0.5) -> float:
+    """Return a freeze duration only when the freeze reaches the file tail."""
+    duration = get_media_duration(path)
+    try:
+        result = subprocess.run(
+            [FFMPEG, "-hide_banner", "-nostats", "-v", "info", "-i", path,
+             "-vf", f"freezedetect=n=-45dB:d={threshold}", "-an", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=120,
+        )
+        starts = [
+            float(value) for value in re.findall(
+                r"lavfi\.freezedetect\.freeze_start: ([0-9.]+)", result.stderr
+            )
+        ]
+        ends = [
+            float(value) for value in re.findall(
+                r"lavfi\.freezedetect\.freeze_end: ([0-9.]+)", result.stderr
+            )
+        ]
+        if starts and len(starts) > len(ends):
+            return max(0.0, duration - starts[-1])
+    except Exception:
+        pass
+    return 0.0
+
+
+def _resolve_target_clock(script: dict, audio_duration: float, fps: int) -> dict:
+    """Return one authoritative, frame-aligned video/audio clock."""
+    target_frames = int(script.get("target_video_frames") or 0)
+    target_samples = int(script.get("target_audio_samples") or 0)
+    if target_frames > 0 and target_samples > 0:
+        return {
+            "sample_rate": int(script.get("sample_rate") or SAMPLE_RATE),
+            "target_video_frames": target_frames,
+            "target_audio_samples": target_samples,
+            "final_duration": frames_to_seconds(target_frames, fps),
+        }
+    return build_target_clock(
+        audio_duration, fps, float(script.get("tail_duration", 0.5)),
+    )
+
+
+def _resolve_final_duration(script: dict, audio_duration: float) -> float:
+    """Compatibility helper; current rendering uses the integer target clock."""
+    fps = int(script.get("fps") or 30)
+    return _resolve_target_clock(script, audio_duration, fps)["final_duration"]
+
+
+def _duration_tolerance(fps: int) -> float:
+    """Public sync contract for final streams."""
+    del fps
+    return SYNC_TOLERANCE_SECONDS
+
+
+def _segment_render_frames(clip: dict, index: int, clip_count: int, fps: int) -> int:
+    """Render the final source a little long so xfade/concat cannot eat the tail."""
+    frames = int(
+        clip.get("duration_frames")
+        or round(float(clip["duration"]) * fps)
+    )
+    if index == clip_count - 1:
+        frames += _FINAL_CLIP_GUARD_FRAMES
+    return frames
 
 def _safe_progress(clip_id: Optional[int], detail: str,
                      log: bool = False, clip_idx: Optional[int] = None):
@@ -168,6 +228,15 @@ def _fmt_srt_time(seconds: float) -> str:
     s = int(seconds % 60)
     ms = int((seconds - int(seconds)) * 1000)
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def _fmt_ass_time(seconds: float) -> str:
+    """Format an ASS timestamp using its required centisecond precision."""
+    total_centiseconds = max(0, int(round(float(seconds) * 100)))
+    h, remainder = divmod(total_centiseconds, 360000)
+    m, remainder = divmod(remainder, 6000)
+    s, cs = divmod(remainder, 100)
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
 
 def _parse_margin_v(subtitle_position: Optional[str]) -> int:
@@ -286,8 +355,8 @@ def _make_ass(subtitles: list[dict], lang: str = "zh", subtitle_position: Option
         f.write("[Events]\n")
         f.write("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
         for sub in subtitles:
-            start = _fmt_srt_time(sub["start"]).replace(",", ".")
-            end = _fmt_srt_time(sub["end"]).replace(",", ".")
+            start = _fmt_ass_time(sub["start"])
+            end = _fmt_ass_time(sub["end"])
             text = sub["text"].replace("\n", "\\N")
             text = _ass_animate(text, animation or "none")
             f.write(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{text}\n")
@@ -308,22 +377,30 @@ def render_simple(script: dict, output_path: str, audio_path: str,
     Args:
         perturbation: 可选扰动 dict（由 perturbation.build_perturbation 生成）。
             None 时走旧管线（hardcoded 1080x1920 + 默认编码参数）。
-            给定时：scale/rotate/translate/hlip/nonstd_resolution/encoding jitter
+            给定时：应用 scale/rotate/translate/hflip/nonstd_resolution。
             全部应用。
 
     Returns:
         None=成功，str=错误信息（首行 ffmpeg 错误）。
     """
-    clips = script.get("clips", [])
-    subtitles = script.get("subtitles", [])
-    lang = script.get("lang", "zh")
-
-    if not clips:
-        print("[渲染错误] 没有 clip")
-        return "脚本无 clip 数据（编排脚本里 clips 字段为空）"
     if not os.path.exists(audio_path):
         print(f"[渲染错误] 配音文件不存在: {audio_path}")
         return f"配音文件缺失: {audio_path}"
+    source_audio_duration = get_media_duration(audio_path)
+    if source_audio_duration <= 0:
+        return "无法读取配音时长"
+    if not script.get("target_video_frames") or not script.get("target_audio_samples"):
+        apply_integer_timeline(
+            script, source_audio_duration, fps,
+            tail_duration=float(script.get("tail_duration", 0.5)),
+        )
+
+    clips = script.get("clips", [])
+    subtitles = script.get("subtitles", [])
+    lang = script.get("lang", "zh")
+    if not clips:
+        print("[渲染错误] 没有 clip")
+        return "脚本无 clip 数据（编排脚本里 clips 字段为空）"
 
         # 实时进度：开始准备
         if clip_id is not None:
@@ -339,10 +416,38 @@ def render_simple(script: dict, output_path: str, audio_path: str,
         if clip_id is not None:
             _safe_progress(clip_id, f"切分片段 0/{len(clips)}", log=True, clip_idx=script.get("index"))
 
+        def _src_color_args(path: str) -> list:
+            """从源片 probe 颜色元数据, 返回 ffmpeg 输出端显式 -color_* 参数.
+
+            不显式写的话 ffmpeg 默认会填 BT.709 (不限 source), HDR 源 (BT.2020+HLG)
+            在不显式写的情况下被 ffmpeg "默默" 改成 BT.709, 视觉上就过曝.
+            缓存避免每个 segment 重复 probe.
+            """
+            try:
+                info = get_media_info(path)
+                streams = [s for s in info.get("streams", []) if s.get("codec_type") == "video"]
+                if not streams:
+                    return []
+                s = streams[0]
+                cs = s.get("color_space") or "bt709"
+                cp = s.get("color_primaries") or "bt709"
+                ct = s.get("color_transfer") or "bt709"
+                cr = s.get("color_range") or "tv"
+                # ffmpeg 内部代号: bt2020nc -> bt2020_ncl 等; 保持原值即可
+                return [
+                    "-colorspace", cs,
+                    "-color_primaries", cp,
+                    "-color_trc", ct,
+                    "-color_range", cr,
+                ]
+            except Exception:
+                return []
+
         def _render_segment(i, clip):
             src = clip["source_path"]
             offset = clip.get("offset", 0)
-            dur = clip["duration"]
+            duration_frames = _segment_render_frames(clip, i, len(clips), fps)
+            dur = frames_to_seconds(duration_frames, fps)
             seg_file = os.path.join(tmpdir, f"seg{i:04d}.mp4")
 
             # 同步修复: 视觉时长严格等于音频时长 (dur = clip["duration"] 不再 ±0.3s 抖动)
@@ -353,6 +458,12 @@ def render_simple(script: dict, output_path: str, audio_path: str,
                 f"trim=start={offset}:duration={dur}",
                 "setpts=PTS-STARTPTS",
             ]
+            # v2.4: 禁止任何调色 / tonemap. 原素材是什么颜色元数据, 成片就是什么.
+            # 之前 _needs_hdr_to_sdr() 对 HDR 源 (BT.2020+HLG) 走 tonemap,
+            # 输出被强制成 BT.709/SDR, 在 SDR 显示器上看比原片"亮" (HLG 曲线
+            # 被截断到 0-1 范围, 亮部被拉伸). 用户要求"使用原片色调", 这里
+            # 不再做任何颜色转换, 由最终输出 -color_range/colorspace/primaries/trc auto
+            # 透传源片元数据.
 
             # --- 1) 水平翻转 (perturbation.flip) ---
             if perturbation and perturbation.get("hflip"):
@@ -392,33 +503,26 @@ def render_simple(script: dict, output_path: str, audio_path: str,
             # 没有这个 flag，seg 文件会包含源的全部内容（seg0000 请求 4.59s
             # 实际输出 5.184s，因为源是 5.182s），下游 xfade 用错时长，整条视频
             # 比脚本期望长几秒到十几秒。
-            # 编码参数按 perturbation 动态化（默认仍是原值，向后兼容）
-            crf_v = 23
-            gop_v = 60
-            if perturbation:
-                if perturbation.get("crf") is not None:
-                    crf_v = perturbation["crf"]
-                if perturbation.get("gop_size") is not None:
-                    gop_v = perturbation["gop_size"]
             cmd = [
                 FFMPEG, "-y", "-i", src, "-vf", vf,
-                "-t", str(dur),
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf_v),
-                "-g", str(gop_v),
+                "-frames:v", str(duration_frames),
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-g", "60",
                 "-pix_fmt", "yuv420p", "-r", str(fps),
+                # v2.4: 显式从源片 probe 颜色元数据, 避免 ffmpeg 默认填 BT.709
+                *_src_color_args(src),
                 seg_file,
             ]
             run_ffmpeg(cmd, desc=f"裁剪片段 {i}")
-            # ffprobe 获取实际生成文件的真实时长（素材可能被 -shortest 截断）
+            # ffprobe 获取实际生成文件的真实时长（素材或裁剪边界可能偏短）
             actual_dur = get_media_duration(seg_file) or dur
             # 实际输出 < 请求 × 50%，意味着 trim 越界（offset 超过素材结尾）
             # 或者源素材本身就比请求短。下游 concat+tpad 会把这一段冻结成静帧
             # 来补齐，但用户看到的就是一段死画面，必须显式告警以便排查
-            if actual_dur < dur * 0.5:
-                print(
-                    f"[渲染警告] segment {i} 实际输出 {actual_dur:.1f}s < "
-                    f"请求 {dur:.1f}s×50%，素材可能太短或offset越界 "
-                    f"(src={os.path.basename(src)} offset={offset:.2f}s)"
+            if actual_dur < dur - 0.10:
+                raise RuntimeError(
+                    f"segment {i} 实际输出 {actual_dur:.2f}s < 请求 {dur:.2f}s，"
+                    f"拒绝使用短素材 (src={os.path.basename(src)} offset={offset:.2f}s)"
                 )
             return seg_file, actual_dur
 
@@ -456,9 +560,7 @@ def render_simple(script: dict, output_path: str, audio_path: str,
                 short_segs.append((i_seg, actual_dur_seg, req_dur,
                                     os.path.basename(req_clip.get("source_path", "?"))))
         if short_segs:
-            print(f"[渲染警告] {len(short_segs)}/{len(clips)} 段实际时长不足请求 70%，下游 tpad 会冻结画面补齐：")
-            for i_seg, actual_dur_seg, req_dur, src_name in short_segs:
-                print(f"          段 {i_seg}: {actual_dur_seg:.1f}s / {req_dur:.1f}s  ({src_name})")
+            raise RuntimeError(f"{len(short_segs)} 个素材片段时长不足，拒绝冻结末帧补齐")
 
         # 实时进度：进入 xfade 拼接（这一步对 50+ 段输入很重，是主要等待点）
         if clip_id is not None and len(seg_files) > 1:
@@ -515,11 +617,17 @@ def render_simple(script: dict, output_path: str, audio_path: str,
                 cmd = [FFMPEG, "-y"]
                 for seg in seg_batch:
                     cmd.extend(["-i", seg])
+                # v2.4: xfade 组内输出, 用第一个 segment 源片颜色参数 (同 batch 同池共享)
+                nonlocal _batch_color_holder
+                _batch_color_holder = _src_color_args(seg_batch[0]) if seg_batch else _batch_color_holder
                 cmd.extend(_h264_encoder_args("4M"))
                 cmd.extend([
                     "-filter_complex", filter_complex,
                     "-map", f"[{current_label}]",
-                    "-pix_fmt", "yuv420p", "-r", str(fps), "-an", out_path,
+                    "-pix_fmt", "yuv420p", "-r", str(fps), "-an",
+                    *_batch_color_holder,
+                    # v2.4: 透传源片颜色元数据
+                    out_path,
                 ])
                 run_ffmpeg(cmd, desc=f"xfade 组{group_idx}({len(seg_batch)}段)", timeout=300)
                 # 读真实输出时长覆盖估算（关键修复）
@@ -532,6 +640,8 @@ def render_simple(script: dict, output_path: str, audio_path: str,
             # 分批 xfade，结果文件列表
             group_files = []
             group_durations = []
+            # v2.4: 同 batch 同池的源片颜色 (用 nonlocal 在 _xfade_group 里更新)
+            _batch_color_holder = []
             for gi in range(0, len(seg_files), GROUP_SIZE):
                 g_segs = seg_files[gi:gi+GROUP_SIZE]
                 g_durs = seg_durations[gi:gi+GROUP_SIZE]
@@ -568,6 +678,9 @@ def render_simple(script: dict, output_path: str, audio_path: str,
                     "-i", concat_list,
                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
                     "-pix_fmt", "yuv420p", "-r", str(fps), "-an",
+                    # v2.4: 组间 concat 透传源片颜色元数据 (复用 _batch_color 缓存)
+                    *_batch_color_holder,
+                    # v2.4: 透传源片颜色元数据
                     concat_video,
                 ]
                 run_ffmpeg(cmd_cat, desc="组合并concat(重编码)", timeout=120)
@@ -587,25 +700,35 @@ def render_simple(script: dict, output_path: str, audio_path: str,
             detail = f"合成最终视频 (字幕+配音{'+BGM' if bgm_path and os.path.exists(bgm_path) else ''}, 总时长 {total_video_dur:.1f}s)..."
             _safe_progress(clip_id, detail, log=True, clip_idx=script.get("index"))
 
-        # Step 3: 叠加字幕 + 配音 + BGM
+        # Step 3: subtitles + narration + BGM. The narration clock is authoritative.
         inputs = [concat_video, audio_path]
         bgm_seek = None
+        bgm_dur = None
+        audio_dur = get_media_duration(audio_path)
+        if audio_dur <= 0:
+            raise RuntimeError("无法读取配音时长")
+        clock = _resolve_target_clock(script, audio_dur, fps)
+        final_dur = clock["final_duration"]
+        target_frames = clock["target_video_frames"]
+        target_samples = clock["target_audio_samples"]
+        actual_video_frames = int(round(total_video_dur * fps))
+        if actual_video_frames < target_frames - 1:
+            raise RuntimeError(
+                f"动态画面 {total_video_dur:.3f}s < 目标 {final_dur:.3f}s，"
+                f"缺少 {target_frames - actual_video_frames} 帧，拒绝使用明显静止帧补齐"
+            )
         if bgm_path and os.path.exists(bgm_path):
-            # 随机化 BGM 起点：每条视频从不同位置开始，再交给 -shortest 截到视频时长
-            # 解决「100 条视频都从 0:00 开始」的重复感问题
             bgm_dur = get_media_duration(bgm_path)
-            if bgm_dur and bgm_dur > total_video_dur + 1.5:
-                # 至少留 1.5s 缓冲，避免 MP3 输入级 seek 的帧误差导致末尾音被截
-                max_start = max(0.0, bgm_dur - total_video_dur - 1.0)
+            if bgm_dur and bgm_dur > final_dur + 1.0:
+                max_start = max(0.0, bgm_dur - final_dur)
                 bgm_seek = random.uniform(0, max_start)
             inputs.append(bgm_path)
         cmd = [FFMPEG, "-y"]
         for i, inp in enumerate(inputs):
             if i == 2:
                 # BGM 是第三个输入（index 2）
-                if bgm_dur and bgm_dur < total_video_dur - 0.5:
-                    # BGM 时长不足视频时，用 stream_loop 循环续接到视频长度
-                    loop_count = max(1, int(total_video_dur / bgm_dur) + 2)
+                if bgm_dur and bgm_dur < final_dur:
+                    loop_count = max(1, int(final_dur / bgm_dur) + 2)
                     cmd.extend(["-stream_loop", str(loop_count), "-i", inp])
                 else:
                     if bgm_seek is not None:
@@ -616,87 +739,58 @@ def render_simple(script: dict, output_path: str, audio_path: str,
                 cmd.extend(["-i", inp])
         cmd.extend(["-map", "0:v:0"])
 
-        # 视频末尾保留 1.5s 无口播静帧（口播完了不黑屏，避免突然结束）
-        # xfade 后视频可能比配音短（每段转场重叠 0.3s），所以 tpad 时长要按"配音-视频+0.5s"动态算
-        TAIL_SILENCE = 0.5
-        try:
-            audio_dur = get_media_duration(audio_path) or total_video_dur
-        except Exception:
-            audio_dur = total_video_dur
-        # 关键修复: 统一 final 输出时长 = max(video, audio) + 0.5s 缓冲
-        # 之前 tpad_dur 只在 audio > video 时算正向 (audio - video + 0.5)，
-        # 当 video > audio 时只给 0.5s 静帧。但 audio 实际会被 apad 拉到 video 末尾
-        # （-shortest 在复杂 filter 链下行为不可预测），导致 tpad 静帧和
-        # apad 拉长后的 audio 时长不一致，画面冻结 8s 而 audio 还在走 8s。
-        # 修复: 双向都给缓冲 — video tpad 到 (audio + 0.5)，audio apad 到 (video + 0.5)
-        final_dur = max(audio_dur, total_video_dur) + TAIL_SILENCE
-        tpad_dur = max(TAIL_SILENCE, final_dur - total_video_dur)
-        audio_pad_dur = max(TAIL_SILENCE, final_dur - audio_dur)
-        # v2.4 同步修复: 当画面时长 < 配音时长 (xfade 累计重叠) 时, 用 setpts 把整段
-        # 视频减速, 让画面时长严格等于 audio_dur, 干掉尾部的 tpad 静帧。
-        # 用户要求"声音的字和字幕偏差 < 1s", 当前实现下音频/字幕始终对齐, 偏差
-        # 来自最后 1~2s 的 tpad 静帧。补偿后画面跟配音同步走完, 不再冻结。
-        # 上限 1.05 (减速 ≤ 5%): 超过则说明 xfade 段数过多, cap 后尾部仍有少量 tpad。
-        compensation_factor = 1.0
-        if total_video_dur > 0 and audio_dur > 0 and total_video_dur < audio_dur - 0.1:
-            _raw = audio_dur / total_video_dur
-            if _raw > 1.05:
-                print(f"[同步补偿] 视频 {total_video_dur:.2f}s < 配音 {audio_dur:.2f}s, "
-                      f"需要减速 {_raw:.4f}x 已 cap 到 1.05x (建议减少 xfade 段数)")
-                compensation_factor = 1.05
-            else:
-                compensation_factor = _raw
-                print(f"[同步补偿] 视频 {total_video_dur:.2f}s → {audio_dur:.2f}s, "
-                      f"减速 {compensation_factor:.4f}x")
-        # 字幕（如果启用）+ 视频末尾 tpad
         if subtitles:
-            # 修复: 让最后一条字幕的 end 对齐到视频末尾前 TAIL_SILENCE
-            # 避免 tpad 静帧段字幕已消失但视频还在播的问题
-            fixed_subs = [dict(s) for s in subtitles]
-            if fixed_subs:
-                fixed_subs[-1]["end"] = round(final_dur - TAIL_SILENCE, 3)
-            # ffmpeg subtitles= 滤镜需要 ASS 格式支持 MarginV（字幕位置控制）
-            # 旧的 _make_srt 实际生成 ASS，新拆成 _make_ass 后这里改用 _make_ass
             srt_path = _make_ass(
-                fixed_subs,
+                subtitles,
                 lang=script.get("lang", "zh"),
                 subtitle_position=script.get("subtitle_position"),
                 animation=script.get("subtitle_animation", "none"),
                 font_name=script.get("subtitle_font"),
                 font_size=script.get("font_size"),
             )
-            _vf_parts = [f"subtitles={srt_path}"]
+            _vf_parts = [
+                f"tpad=stop_mode=clone:stop_duration={1 / fps:.9f}",
+                f"trim=end_frame={target_frames}",
+                "setpts=PTS-STARTPTS",
+                f"subtitles={srt_path}",
+            ]
         else:
-            _vf_parts = []
-        # setpts 必须在 subtitles 之前 (这样字幕时间戳仍按 audio 时间读, 不会被自身减速影响)
-        if compensation_factor > 1.001:
-            _vf_parts.insert(0, f"setpts={compensation_factor:.4f}*PTS")
-        _vf_parts.append(f"tpad=stop_mode=clone:stop_duration={tpad_dur:.2f}")
+            _vf_parts = [
+                f"tpad=stop_mode=clone:stop_duration={1 / fps:.9f}",
+                f"trim=end_frame={target_frames}",
+                "setpts=PTS-STARTPTS",
+            ]
         cmd.extend(["-vf", ",".join(_vf_parts)])
 
-        # 音频：配音 + BGM 各自末尾都补 1.5s 静音/延续，amix 用 duration=longest
         if bgm_path and os.path.exists(bgm_path):
+            fade_start = max(0.0, final_dur - 0.5)
             cmd.extend([
                 "-filter_complex",
-                f"[1:a]volume=1.0,apad=pad_dur={TAIL_SILENCE}[a0];"
-                f"[2:a]volume=0.15,apad=pad_dur={TAIL_SILENCE}[a1];"
-                f"[a0][a1]amix=inputs=2:duration=longest[outa]",
+                f"[1:a]aresample={SAMPLE_RATE}:first_pts=0,volume=1.0,"
+                f"apad=whole_len={target_samples},atrim=end_sample={target_samples}[a0];"
+                f"[2:a]volume=0.15,afade=t=out:st={fade_start:.3f}:d=0.5,"
+                f"aresample={SAMPLE_RATE}:first_pts=0,apad=whole_len={target_samples},"
+                f"atrim=end_sample={target_samples}[a1];"
+                f"[a0][a1]amix=inputs=2:duration=first,"
+                f"atrim=end_sample={target_samples}[outa]",
                 "-map", "[outa]",
             ])
         else:
-            # 纯配音: 用 whole_dur 让 audio 精确到 final_dur（之前用 pad_dur 行为不一致）
-            # 不用 atrim（让 audio 精确延长），不再依赖 -shortest 截断
-            cmd.extend(["-af", f"apad=whole_dur={final_dur:.2f}", "-map", "1:a:0"])
+            cmd.extend([
+                "-af", f"aresample={SAMPLE_RATE}:first_pts=0,"
+                f"apad=whole_len={target_samples},atrim=end_sample={target_samples}",
+                "-map", "1:a:0",
+            ])
 
         enc_args = _h264_encoder_args(bitrate)
         cmd.extend(enc_args)
-        # 关键修复: 不再依赖 -shortest 截断。之前 -shortest 在 apad+atrim 复杂
-        # filter 链下行为不可预测，audio 实际拉到了 video 末尾 29.78s 而不是
-        # atrim 限制的 17.5s，导致 video 末尾 8s 是 tpad 静帧（用户说"画面不动"）
-        # 而 audio 还在播。现在用 apad=whole_dur={final_dur} + tpad=final_dur 双端精确对齐
+        # v2.4: 最终输出, 透传 _batch_color_holder (同 batch 同池共享)
         cmd.extend([
             "-pix_fmt", "yuv420p", "-r", str(fps),
+            *_batch_color_holder,
+            # v2.4: 透传源片颜色元数据, 不强制写成 bt709/tv (HDR 源会保留 BT.2020+HLG)
             "-c:a", "aac", "-b:a", "192k",
+            "-ar", str(SAMPLE_RATE),
             output_path,
         ])
         # 诊断日志：把最终 ffmpeg 命令的关键参数打印出来
@@ -704,120 +798,71 @@ def render_simple(script: dict, output_path: str, audio_path: str,
         try:
             _log_cmd = " ".join(repr(x) if " " in str(x) else str(x) for x in cmd)
             # 截断过长的 log（不要把整个 ffmpeg 命令塞进日志）
-            print(f"[tpad 诊断] total_video_dur={total_video_dur:.2f}s "
-                  f"audio_dur={audio_dur:.2f}s tpad_dur={tpad_dur:.2f}s "
+            print(f"[时长诊断] script_final={script.get('final_duration')} "
+                  f"video={total_video_dur:.3f}s audio={audio_dur:.3f}s "
+                  f"target={final_dur:.6f}s frames={target_frames} "
+                  f"samples={target_samples} tolerance={SYNC_TOLERANCE_SECONDS:.3f}s "
                   f"bgm={'yes' if bgm_path and os.path.exists(bgm_path) else 'no'}")
         except Exception:
             pass
 
-        # ── 最终渲染：VT 失败自动降级 libx264 CPU 编码 ──
-        # macOS h264_videotoolbox 偶发 err=-12903 (kVTPropertyNotSupportedErr)，
-        # 之前会让整个 5 条任务 100% 失败。现在检测到 VT 错误就自动替换成
-        # libx264 CPU 编码重试一次，输出到 .retry.mp4 再覆盖回原文件。
-        try:
-            run_ffmpeg(cmd, desc="最终渲染(字幕+音频+BGM)", timeout=300)
-        except subprocess.CalledProcessError as _vt_exc:
-            _vt_err = _vt_exc.stderr.decode(errors="replace") if _vt_exc.stderr else ""
-            if "h264_videotoolbox" not in _vt_err or "err=-12903" not in _vt_err:
-                raise  # 非 VT 错误，让外层 except 统一处理
-            # 构造降级命令：h264_videotoolbox → libx264 veryfast
-            _retry_cmd = list(cmd)
-            for _i in range(len(_retry_cmd) - 1):
-                if _retry_cmd[_i] == "-c:v" and _retry_cmd[_i+1] == "h264_videotoolbox":
-                    _retry_cmd[_i:_i+2] = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]
-                    # 跳过紧跟的 -b:v <bitrate> 和 -movflags +faststart（libx264 不需要）
-                    if _i+2 < len(_retry_cmd) - 1 and _retry_cmd[_i+2] == "-b:v":
-                        _retry_cmd[_i+2:_i+4] = []
-                    if _i+2 < len(_retry_cmd) - 1 and _retry_cmd[_i+2] == "-movflags":
-                        _retry_cmd[_i+2:_i+4] = []
-                    break
-            _retry_path = output_path + ".retry.mp4"
-            if output_path in _retry_cmd:
-                _retry_cmd[_retry_cmd.index(output_path)] = _retry_path
-            if os.path.exists(_retry_path):
-                try: os.remove(_retry_path)
-                except Exception: pass
-            print(f"[VT fallback] h264_videotoolbox 失败 (err=-12903)，降级 libx264 CPU 编码重试")
-            run_ffmpeg(_retry_cmd, desc="最终渲染(libx264 VT-fallback)", timeout=600)
-            if os.path.exists(_retry_path):
-                os.replace(_retry_path, output_path)
-                print(f"[VT fallback] 成功，已用 libx264 输出覆盖")
-            # 后续 duration check 继续执行（如果 libx264 输出也短，仍会触发下面的充底）
-        # macOS h264_videotoolbox 已知会偶发返回 0 但只写了一半的 moov atom（文件被截断到 ~1/3 ~ 4/5）
-        # 验证一下实际时长，丢太多就用 libx264 靠不重编码完整覆盖
-        try:
-            expected_dur = total_video_dur + tpad_dur
-            actual_dur = get_media_duration(output_path) if os.path.exists(output_path) else 0.0
-        except Exception:
-            expected_dur, actual_dur = 0.0, 0.0
-        # 严重失败：最终成片比配音短一半，说明 ffmpeg 早早停止、moov 截断
-        # 或者 -shortest 错误对齐到了静音轨。配音是用户付费/最在意的资产，
-        # 输出还不足配音一半时必须刺眼地报错，不能只 print 一行 warning
-        if audio_dur > 0 and actual_dur > 0 and actual_dur < audio_dur * 0.5:
-            print("!" * 70)
-            print(f"[渲染错误] 严重截断：最终输出 {actual_dur:.1f}s < 配音 {audio_dur:.1f}s × 50%")
-            print(f"           expected={expected_dur:.1f}s, 文件={output_path}")
-            print(f"           可能原因：ffmpeg 提前退出 / VT 编码器 moov 截断 / 素材源时长不足导致 -shortest 提前对齐")
-            print("!" * 70)
-        if expected_dur > 0 and actual_dur > 0 and actual_dur < expected_dur * 0.8:
-            print("=" * 70)
-            print(f"[渲染警告] 输出 {actual_dur:.1f}s < 预期 {expected_dur:.1f}s × 0.8，触发充底重编码")
-            print("=" * 70)
-            # 先删掉被截断的文件，避免 ffmpeg 看到存在但读写不一致
-            try:
-                if os.path.exists(output_path):
-                    os.remove(output_path)
-            except Exception:
-                pass
-            # 在原文件基础上加 .retry 后缀，重试成功后用 mv 覆盖
-            retry_path = output_path + ".retry.mp4"
-            if os.path.exists(retry_path):
-                try: os.remove(retry_path)
-                except Exception: pass
-            replaced = False
-            for i in range(len(cmd) - len(enc_args) + 1):
-                if cmd[i:i+len(enc_args)] == enc_args:
-                    cmd[i:i+len(enc_args)] = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]
-                    # 同时把 output_path 改为 .retry.mp4
-                    if output_path in cmd:
-                        cmd[cmd.index(output_path)] = retry_path
-                    replaced = True
-                    break
-            if not replaced:
-                print(f"[渲染警告] 未找到 enc_args 段，跳过重试")
-                return "重试未生效：ffmpeg 命令里找不到 enc_args 段"
-            import time as _t
-            _rt0 = _t.time()
-            try:
-                run_ffmpeg(cmd, desc="最终渲染(libx264 充底)", timeout=300)
-            except Exception as e:
-                print(f"[渲染警告] 充底重编码也失败: {e}")
-                return f"充底重编码也失败: {type(e).__name__}: {str(e)[:200]}"
-            _rt_elapsed = _t.time() - _rt0
-            retry_dur = get_media_duration(retry_path) if os.path.exists(retry_path) else 0.0
-            print(f"[渲染警告] 充底重编码 wall={_rt_elapsed:.1f}s 输出={retry_dur:.1f}s (预期 {expected_dur:.1f}s)")
-            if retry_dur >= expected_dur * 0.9 and os.path.exists(retry_path):
-                os.replace(retry_path, output_path)
-                print(f"[渲染警告] 充底成功，已覆盖原文件")
-            else:
-                print(f"[渲染警告] 充底输出仍不足，保留原文件但质量低")
-                # 原文件已被删，移充底文件回原位
-                if os.path.exists(retry_path):
-                    os.replace(retry_path, output_path)
-        # v2.3: 渲染成功后做音/视/字时长一致性检查
-        try:
-            srt_path_guess = output_path + ".srt"
-            sync_warnings = verify_sync(
-                video_path=output_path,
-                audio_path=audio_path,
-                srt_path=srt_path_guess if os.path.exists(srt_path_guess) else None,
-                tolerance=0.1,
+        input_audio_onset = audio_onset(audio_path) if subtitles else None
+        run_ffmpeg(cmd, desc="最终渲染(字幕+音频+BGM)", timeout=600)
+        if subtitles and input_audio_onset is not None:
+            output_audio_onset = audio_onset(output_path)
+            encoding_shift = (
+                output_audio_onset - input_audio_onset
+                if output_audio_onset is not None else 0.0
             )
-            for w in sync_warnings:
-                print(w)
-        except Exception as _sy_exc:
-            pass
-        # v2.4: 不再落 *.metadata.json (改由 create_and_run_batch 收尾写一份 titles.txt)
+            if abs(encoding_shift) > 0.05:
+                for subtitle in subtitles:
+                    subtitle["start"] = round(max(0.0, subtitle["start"] + encoding_shift), 6)
+                    subtitle["end"] = round(min(final_dur, subtitle["end"] + encoding_shift), 6)
+                corrected_ass = _make_ass(
+                    subtitles,
+                    lang=script.get("lang", "zh"),
+                    subtitle_position=script.get("subtitle_position"),
+                    animation=script.get("subtitle_animation", "none"),
+                    font_name=script.get("subtitle_font"),
+                    font_size=script.get("font_size"),
+                )
+                vf_index = cmd.index("-vf") + 1
+                cmd[vf_index] = re.sub(r"subtitles=[^,]+", f"subtitles={corrected_ass}", cmd[vf_index])
+                script["subtitle_encoding_offset"] = round(encoding_shift, 6)
+                print(f"[字幕校准] 最终 AAC 起始偏移 {encoding_shift * 1000:.1f}ms，重新渲染字幕层")
+                run_ffmpeg(cmd, desc="最终渲染(编码偏移校准重试)", timeout=600)
+        probe = subprocess.run(
+            [FFPROBE, "-v", "error", "-show_entries",
+             "format=duration:stream=codec_type,duration", "-of", "json", output_path],
+            capture_output=True, text=True, timeout=30, check=True,
+        )
+        probe_data = json.loads(probe.stdout)
+        format_dur = float(probe_data.get("format", {}).get("duration") or 0)
+        stream_durs = {
+            stream.get("codec_type"): float(stream.get("duration") or 0)
+            for stream in probe_data.get("streams", [])
+        }
+        durations = [format_dur, stream_durs.get("video", 0), stream_durs.get("audio", 0)]
+        max_pair_diff = max(durations) - min(durations)
+        max_target_diff = max(abs(duration - final_dur) for duration in durations)
+        print(
+            f"[同步校验] format/video/audio={durations} "
+            f"pair_diff={max_pair_diff * 1000:.3f}ms "
+            f"target_diff={max_target_diff * 1000:.3f}ms"
+        )
+        if (
+            any(duration <= 0 for duration in durations)
+            or max_pair_diff > SYNC_TOLERANCE_SECONDS
+            or max_target_diff > SYNC_TOLERANCE_SECONDS
+        ):
+            raise RuntimeError(
+                f"最终时长不一致: target={final_dur:.3f}, "
+                f"format/video/audio={durations}, "
+                f"pair_diff={max_pair_diff * 1000:.1f}ms"
+            )
+        freeze_duration = _tail_freeze_duration(output_path)
+        if freeze_duration > 0.5:
+            raise RuntimeError(f"检测到尾部静止画面 {freeze_duration:.2f}s，拒绝输出")
         return None  # 成功
 
     except subprocess.CalledProcessError as e:
@@ -913,14 +958,19 @@ def create_and_run_batch(
             def _on_tts_sentence(done: int, total: int, sentence: str, _seg_idx: int = i) -> None:
                 preview = (sentence[:18] + "…") if len(sentence) > 18 else sentence
                 _set_stage(f"🎙️ 配音 · 段 {_seg_idx+1}/{len(parts)} · 句 {done}/{total}：{preview}")
-            seg = generate_narration(
-                part, voice=voice, rate=rate, pitch=pitch,
-                output_name=f"script_{name_hash}_{i}",
-                lang=lang,
-                on_sentence=_on_tts_sentence,
-            )
+            try:
+                seg = generate_narration(
+                    part, voice=voice, rate=rate, pitch=pitch,
+                    output_name=f"script_{name_hash}_{i}",
+                    lang=lang,
+                    on_sentence=_on_tts_sentence,
+                )
+            except Exception as exc:
+                raise RuntimeError(f"第 {i+1}/{len(parts)} 段配音或字幕时间轴失败: {exc}") from exc
             if not seg:
                 raise RuntimeError(f"第 {i+1} 段配音生成失败")
+            for sentence in seg["sentences"]:
+                sentence["_narration_duration"] = seg["total_duration"]
             audio_segments.append((seg["audio_path"], seg["sentences"], seg["total_duration"]))
             seg_name = Path(seg["audio_path"]).name
             seg_size = _fmt_size(os.path.getsize(seg["audio_path"])) if os.path.exists(seg["audio_path"]) else "?"
@@ -939,6 +989,8 @@ def create_and_run_batch(
         )
         if not seg:
             raise RuntimeError("配音生成失败，请检查语音是否支持当前文字内容")
+        for sentence in seg["sentences"]:
+            sentence["_narration_duration"] = seg["total_duration"]
         audio_segments = [(seg["audio_path"], seg["sentences"], seg["total_duration"])]
 
     total_audio_dur = sum(s[2] for s in audio_segments)
@@ -1032,6 +1084,9 @@ def create_and_run_batch(
         seg_idx = seg_for_clip[script["index"]] if seg_for_clip else 0
         seg_path, seg_sents, seg_dur = audio_segments[seg_idx]
         script["audio_path"] = seg_path
+        script["narration_text"] = parts[seg_idx]
+        apply_integer_timeline(script, seg_dur, fps, tail_duration=0.5)
+        script["color_processing"] = "bt709_passthrough_or_hdr_to_sdr_mobius"
         if enable_bgm:
             if bgm_files:
                 script["bgm_path"] = random.choice(bgm_files)
@@ -1148,7 +1203,7 @@ def _render_task(task_id: int, workers: int = 2, batch_cfg: Optional[dict] = Non
                 pass
         return err_msg is None
 
-    done_count = 0
+    done_count = get_task_clip_counts(task_id)["done"]
     def _task_stop_requested() -> bool:
         current = get_task(task_id)
         if stop_requested() and current and current["status"] == "running":
@@ -1186,11 +1241,13 @@ def _render_task(task_id: int, workers: int = 2, batch_cfg: Optional[dict] = Non
             update_task_status(task_id, "running", done=done_count)
             _set_stage(f"🎬 视频渲染中 · {done_count}/{_total_clips}")
 
-    final_status = "done" if done_count == len(clips) else "failed"
+    final_counts = get_task_clip_counts(task_id)
+    done_count = final_counts["done"]
+    final_status = "done" if done_count == final_counts["total"] else "failed"
     update_task_status(task_id, final_status, done=done_count)
     # ── Phase 5：渲染收尾 ──
     elapsed_total = time.time() - _render_start_ts
-    fail_count = len(clips) - done_count
+    fail_count = final_counts["failed"]
     out_size = _dir_size(task_dir)
     out_files = sum(1 for _ in task_dir.glob("*.mp4")) if task_dir.exists() else 0
     _log("─── 渲染收尾 ───")

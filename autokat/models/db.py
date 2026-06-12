@@ -381,6 +381,48 @@ def update_task_status(task_id: int, status: str, done: Optional[int] = None):
     conn.close()
 
 
+def prepare_task_retry(task_id: int) -> int:
+    """Reset failed/interrupted clips and task progress in one transaction."""
+    conn = get_conn()
+    try:
+        done = conn.execute(
+            "SELECT COUNT(*) AS c FROM clips WHERE task_id=? AND status='done'",
+            (task_id,),
+        ).fetchone()["c"]
+        cur = conn.execute(
+            "UPDATE clips SET status='pending', retry_count=retry_count+1, "
+            "error_msg=NULL, output_path=NULL, progress_detail='', progress_at='', "
+            "duration_seconds=NULL "
+            "WHERE task_id=? AND status IN ('failed','rendering')",
+            (task_id,),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='pending', done=? WHERE id=?",
+            (done, task_id),
+        )
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
+def get_task_clip_counts(task_id: int) -> dict:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT status, COUNT(*) AS c FROM clips WHERE task_id=? GROUP BY status",
+        (task_id,),
+    ).fetchall()
+    conn.close()
+    counts = {row["status"]: row["c"] for row in rows}
+    return {
+        "total": sum(counts.values()),
+        "done": counts.get("done", 0),
+        "failed": counts.get("failed", 0),
+        "pending": counts.get("pending", 0),
+        "rendering": counts.get("rendering", 0),
+    }
+
+
 def get_pending_tasks() -> list:
     """获取未完成的任务（用于中断续跑）"""
     conn = get_conn()

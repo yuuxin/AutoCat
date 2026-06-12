@@ -462,3 +462,12 @@ cd /Users/lilei/work/code/AutoCat
 4.任务要求的是20-30秒的视频好多视频都是 50秒至4分钟的，明显错误，且超过30秒部分都是黑屏幕，但是有BGM，应该是BGM截取的问题造成的。BGM超过音频时长，应该截取掉。
 5.例如配音音频时长是30秒，为了视频停止的不那么突兀，那么视频切片组合最后再截取的总长应该30-31秒左右，bgm应该完全等于成片视频的长度。你可以参考一下常用tiktok短视频的风格。
 已经处理了几次都没彻底解决，这次要深度检查并彻底解决以上问题，然后验证一批，选中100+切片素材，按照任务285的设置，随机BGMBGM，生成10条25-30秒的视频进行验证。
+
+wizard 阶段启动异常：
+
+ImportError: cannot import name '_get_encoder_label' from 'autokat.core.renderer' (/Users/lilei/work/code/AutoCat/autokat/core/renderer.py)
+
+脚本已入库（id=209），但 task 未创建。
+重启 GUI 后可以重新生成。
+
+完整 traceback 已打到终端。

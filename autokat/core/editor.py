@@ -16,18 +16,19 @@ from autokat.core.tagger import extract_keywords
 from autokat.core.diversity import (
     build_diversity_report, max_jaccard,
 )
+from autokat.core.timeline import apply_integer_timeline
 
 # ── 59 种 xfade 转场效果（与 renderer.py 一致） ──
 TRANSITIONS = [
     "fade", "wipeleft", "wiperight", "wipeup", "wipedown",
     "slideleft", "slideright", "slideup", "slidedown",
-    "circlecrop", "rectcrop", "distance", "fadeblack", "fadewhite",
+    "circlecrop", "rectcrop", "distance",
     "radial", "smoothleft", "smoothright", "smoothup", "smoothdown",
     "circleopen", "circleclose", "vertopen", "vertclose",
     "horzopen", "horzclose", "dissolve", "pixelize",
     "diagtl", "diagtr", "diagbl", "diagbr",
     "hlslice", "hrslice", "vuslice", "vdslice",
-    "hblur", "fadegrays",
+    "hblur",
     "wipetl", "wipetr", "wipebl", "wipebr",
     "squeezeh", "squeezev", "zoomin", "fadefast", "fadeslow",
     "hlwind", "hrwind", "vuwind", "vdwind",
@@ -115,6 +116,11 @@ def _random_transition() -> str:
     return random.choice(TRANSITIONS)
 
 
+def _transition_overhead(clip_index: int, transition_duration: float) -> float:
+    """Renderer applies xfade inside fixed groups of five clips."""
+    return transition_duration if clip_index % 5 != 0 else 0.0
+
+
 def _random_subtitle_pos() -> str:
     return random.choice(SUBTITLE_POSITIONS)
 
@@ -153,6 +159,7 @@ def generate_script(
     margin = cfg.get("subtitle_margin", 80)
     narration_text = cfg.get("narration_text", "")
     min_shot_duration = float(cfg.get("min_shot_duration", 2.0))  # 每镜头最短秒数
+    source_safety_margin = float(cfg.get("source_safety_margin", 0.35))
 
     # 素材池
     if material_pool is None:
@@ -165,12 +172,32 @@ def generate_script(
     # 文案关键词（用于智能匹配）
     keywords = extract_keywords(narration_text) if narration_text else None
 
+    # Subtitles keep exact TTS word-boundary times. Visual intervals fill pauses
+    # between captions and the trailing audio silence so the picture never ends early.
+    subtitle_sentences = [dict(sentence) for sentence in sentences]
+    narration_duration = float(
+        (sentences[0].get("_narration_duration") if sentences else 0)
+        or (sentences[-1]["end"] if sentences else 0)
+    )
+    visual_sentences = []
+    for index, sentence in enumerate(subtitle_sentences):
+        visual = dict(sentence)
+        visual["_subtitle_start"] = sentence["start"]
+        visual["_subtitle_end"] = sentence["end"]
+        visual["start"] = 0.0 if index == 0 else float(sentence["start"])
+        visual["end"] = (
+            float(subtitle_sentences[index + 1]["start"])
+            if index + 1 < len(subtitle_sentences)
+            else narration_duration
+        )
+        visual_sentences.append(visual)
+
     # ── 第一步：把句子聚成"镜头"（shot） ──
     # 累计到 >= min_shot_duration 就切下一个镜头；单个超长句单独成镜
     shots: list[list[dict]] = []
     cur_shot: list[dict] = []
     cur_dur = 0.0
-    for sent in sentences:
+    for sent in visual_sentences:
         seg_dur = sent["end"] - sent["start"]
         if seg_dur < 0.3:
             continue
@@ -202,8 +229,9 @@ def generate_script(
         acc_dur = 0.0
         while acc_dur < shot_dur - 0.05:
             remaining = shot_dur - acc_dur
+            overhead = _transition_overhead(len(clips), trans_dur)
             mat = _pick_material(
-                material_pool, used_ids, remaining, keywords,
+                material_pool, used_ids, remaining + overhead, keywords,
                 state=state, exclude_source_ids=used_source_ids,
             )
             if mat is None:
@@ -211,19 +239,20 @@ def generate_script(
             used_ids.add(int(mat["id"]))
             used_source_ids.add(_source_id(mat))
 
-            offset = _random_crop_offset(mat["duration"], remaining)
+            usable_duration = max(0.0, mat["duration"] - source_safety_margin)
+            content_dur = min(remaining, max(0.0, usable_duration - overhead))
+            if content_dur < 0.05:
+                break
+            render_dur = content_dur + overhead
+            offset = _random_crop_offset(usable_duration, render_dur)
             # 同步修复 v2: 末段 seg_dur 严格等于 remaining, 保证 visual 时长 == audio 时长。
             # 之前 max(0.3, seg_dur) 在 remaining < 0.3 时强行推到 0.3, 每段超 0.3s,
             # 5-6 段累计漂移 ±1.5s → 音轨和字幕/画面不同步 (用户反馈)。
             # 现在: 中间段 (raw_dur >= 0.3) 走原 min(remaining, mat_dur) 逻辑,
             # 末段 (raw_dur < 0.3) 严格等于 remaining, acc_dur 收尾必 == shot_dur。
             # 视觉差异度由 filter/rotate/flip/encoding 制造, 不依赖时长抖动。
-            raw_dur = min(remaining, mat["duration"] - offset)
-            if raw_dur < 0.3:
-                # 末段: 严格等于 remaining, 视觉总时长严格对齐音频总时长
-                seg_dur = remaining
-            else:
-                seg_dur = raw_dur
+            raw_dur = min(remaining, usable_duration - offset - overhead)
+            seg_dur = raw_dur
 
             clip = {
                 "material_id": mat["id"],
@@ -231,7 +260,7 @@ def generate_script(
                 "source_path": mat["path"],
                 "source_type": mat["type"],
                 "offset": round(offset, 2),
-                "duration": round(seg_dur, 2),
+                "duration": round(seg_dur + overhead, 2),
                 "transition": _random_transition(),
                 "transition_duration": trans_dur,
                 "subtitle_position": sub_pos,
@@ -245,8 +274,8 @@ def generate_script(
         for s in shot:
             subtitles.append({
                 "text": s["text"],
-                "start": s["start"],
-                "end": s["end"],
+                "start": s.get("_subtitle_start", s["start"]),
+                "end": s.get("_subtitle_end", s["end"]),
                 "position": sub_pos,
                 "margin": margin,
             })
@@ -268,8 +297,9 @@ def generate_script(
             acc_dur = 0.0
             while acc_dur < shot_dur - 0.05:
                 remaining = shot_dur - acc_dur
+                overhead = _transition_overhead(len(clips), trans_dur)
                 mat = _pick_material(
-                    material_pool, used_ids, remaining, keywords,
+                    material_pool, used_ids, remaining + overhead, keywords,
                     state=state, exclude_source_ids=used_source_ids,
                 )
                 if mat is None:
@@ -277,13 +307,15 @@ def generate_script(
                 used_ids.add(int(mat["id"]))
                 used_source_ids.add(_source_id(mat))
 
-                offset = _random_crop_offset(mat["duration"], remaining)
+                usable_duration = max(0.0, mat["duration"] - source_safety_margin)
+                content_dur = min(remaining, max(0.0, usable_duration - overhead))
+                if content_dur < 0.05:
+                    break
+                render_dur = content_dur + overhead
+                offset = _random_crop_offset(usable_duration, render_dur)
                 # 同步修复 v2: 末段严格等于 remaining, 保证 visual == audio
-                raw_dur = min(remaining, mat["duration"] - offset)
-                if raw_dur < 0.3:
-                    seg_dur = remaining
-                else:
-                    seg_dur = raw_dur
+                raw_dur = min(remaining, usable_duration - offset - overhead)
+                seg_dur = raw_dur
 
                 clip = {
                     "material_id": mat["id"],
@@ -291,7 +323,7 @@ def generate_script(
                     "source_path": mat["path"],
                     "source_type": mat["type"],
                     "offset": round(offset, 2),
-                    "duration": round(seg_dur, 2),
+                    "duration": round(seg_dur + overhead, 2),
                         "transition": _random_transition(),
                     "transition_duration": trans_dur,
                     "subtitle_position": sub_pos,
@@ -304,20 +336,61 @@ def generate_script(
             for s in shot:
                 subtitles.append({
                     "text": s["text"],
-                    "start": s["start"],
-                    "end": s["end"],
+                    "start": s.get("_subtitle_start", s["start"]),
+                    "end": s.get("_subtitle_end", s["end"]),
                     "position": sub_pos,
                     "margin": margin,
                 })
 
-    return {
+    tail_duration = float(cfg.get("tail_duration", 0.5))
+    if clips and tail_duration > 0:
+        overhead = _transition_overhead(len(clips), trans_dur)
+        tail_pool = [
+            material for material in material_pool
+            if float(material.get("duration") or 0) - source_safety_margin
+            >= tail_duration + overhead
+        ]
+        used_tail_pool = [
+            material for material in tail_pool if int(material["id"]) in used_ids
+        ]
+        if used_tail_pool:
+            tail_pool = used_tail_pool
+        tail_mat = _pick_material(
+            tail_pool, set(), tail_duration + overhead, keywords,
+            state=state, exclude_source_ids=used_source_ids,
+        )
+        if tail_mat is not None and tail_mat["duration"] >= tail_duration + overhead:
+            offset = _random_crop_offset(
+                tail_mat["duration"] - source_safety_margin,
+                tail_duration + overhead,
+            )
+            clips.append({
+                "material_id": tail_mat["id"],
+                "source_id": _source_id(tail_mat),
+                "source_path": tail_mat["path"],
+                "source_type": tail_mat["type"],
+                "offset": round(offset, 2),
+                "duration": round(tail_duration + overhead, 2),
+                "transition": _random_transition(),
+                "transition_duration": trans_dur,
+                "subtitle_position": sub_pos,
+                "start_time": round(narration_duration, 3),
+                "end_time": round(narration_duration + tail_duration, 3),
+                "is_tail": True,
+            })
+
+    script = {
         "fps": fps,
-        "total_duration": round(clips[-1]["end_time"], 3) if clips else 0,
+        "transition_duration": trans_dur,
         "clips": clips,
         "subtitles": subtitles,
         "audio_path": None,
         "bgm_path": None,
     }
+    return apply_integer_timeline(
+        script, narration_duration=narration_duration, fps=fps,
+        tail_duration=tail_duration,
+    )
 
 
 def generate_batch(
@@ -375,12 +448,12 @@ def generate_batch(
             )
             slice_set = {
                 int(c["material_id"]) for c in candidate.get("clips", [])
-                if c.get("material_id") is not None
+                if c.get("material_id") is not None and not c.get("is_tail")
             }
             source_set = {
                 int(c.get("source_id") or c["material_id"])
                 for c in candidate.get("clips", [])
-                if c.get("material_id") is not None
+                if c.get("material_id") is not None and not c.get("is_tail")
             }
             slice_similarity = max_jaccard(slice_set, state["recent_sets"])
             source_similarity = max_jaccard(source_set, state["recent_source_sets"])
@@ -392,7 +465,10 @@ def generate_batch(
         script["index"] = i
 
         if enable_diversity:
-            used_mats = [c.get("material_id") for c in script.get("clips", [])]
+            used_mats = [
+                c.get("material_id") for c in script.get("clips", [])
+                if not c.get("is_tail")
+            ]
             used_mats = [m for m in used_mats if m is not None]
             if used_mats:
                 state["recent_sets"].append(used_set)
@@ -405,7 +481,7 @@ def generate_batch(
                 for source_id in [
                     c.get("source_id") or c.get("material_id")
                     for c in script.get("clips", [])
-                    if c.get("material_id") is not None
+                    if c.get("material_id") is not None and not c.get("is_tail")
                 ]:
                     state["source_usage_count"][source_id] = (
                         state["source_usage_count"].get(source_id, 0) + 1

@@ -21,7 +21,7 @@ from autokat.models.db import (
     init_db, get_all_materials, get_pending_tasks, get_conn,
     get_all_tasks, get_tasks_by_status, get_clips_by_task,
     get_task_stats, delete_task, get_script_by_id, get_task, get_latest_task,
-    get_rendering_clips, get_clips_by_task,
+    get_rendering_clips, get_clips_by_task, prepare_task_retry,
 )
 from autokat.core.progress_log import drain as _log_drain, clear as _log_clear
 from autokat.core.progress_log import get_stage as _log_get_stage, emit as _log_emit, emit
@@ -35,7 +35,11 @@ from autokat.core.perturbation import LEVELS as PERT_LEVELS, build_perturbation
 from autokat.core.bgm import get_bgm_files, pick_random_bgm, detect_bpm, download_sample_bgm
 from autokat.core.bgm import get_bgm_duration, split_bgm_to_segments
 from autokat.core.bgm import get_bgm_duration, split_bgm_to_segments
-from autokat.core.writer import generate_script_by_topic, list_styles, check_deepseek_available, set_deepseek_key
+from autokat.core.writer import (
+    generate_script_by_topic, generate_script_by_topic_detailed,
+    validate_script_quality, estimate_chars_for_lang, estimate_chars_for_duration_range,
+    list_styles, check_deepseek_available, set_deepseek_key,
+)
 from autokat.core.paths import DATA_ROOT
 _env_path = DATA_ROOT / ".env"
 if _env_path.exists():
@@ -989,6 +993,8 @@ class MainWindow(QMainWindow):
         threading.Thread(target=lambda: resume_pending_tasks(workers=2), daemon=True).start()
         QTimer.singleShot(2000, self._refresh_dashboard)
     def _retry_task(self, task_id):
+        reset_count = prepare_task_retry(task_id)
+        self._log(f"🔄 任务 #{task_id} 已准备重试（重置 {reset_count} 条失败成片）")
         self._resume_task(task_id)
     def _replay_task(self, task_id):
         """复现任务：读取配置，预填向导"""
@@ -1698,6 +1704,8 @@ class MainWindow(QMainWindow):
             elif "失败" in status:
                 ai_progress_bar.setVisible(False)
                 ai_status_label.setText(f"❌ {status}")
+            else:
+                ai_status_label.setText(status)
         # 生成逻辑 - 后台线程执行
         def _do_generate():
             topic = topic_input.text().strip()
@@ -1716,8 +1724,9 @@ class MainWindow(QMainWindow):
             result_area.setText("正在生成中...")
             # 后台线程生成
             ai_results = []
+            ai_result_meta = []
             class GenWorker(QThread):
-                result_signal = Signal(int, str)
+                result_signal = Signal(int, str, str, int, float)
                 error_signal = Signal(str)
                 progress_signal = Signal(int, int, str)
                 def run(self):
@@ -1736,36 +1745,61 @@ class MainWindow(QMainWindow):
                             dmax = dur_max.value()
                             rate = ai_rate.value()
                             # 按语言+语速+目标时长算字数范围，注入到 prompt 强约束
-                            from autokat.core.writer import estimate_chars_for_lang
-                            _mn, _mx, _ideal = estimate_chars_for_lang(ai_lang, (dmin + dmax) / 2.0, rate)
-                            target_min = max(1, int(_mn * 0.9))
-                            target_max = int(_mx * 1.1)
+                            target_min, target_max = estimate_chars_for_duration_range(
+                                ai_lang, dmin, dmax, rate,
+                            )
+                            accepted = []
                             for gi in range(ai_cnt):
                                 extra = f"，第{gi+1}条，目标时长{dmin}-{dmax}秒（{ai_lang}，语速{rate:+d}%）"
-                                txt = generate_script_by_topic(
+                                def quality_progress(backend, attempt, total_attempts, message, _gi=gi):
+                                    self.progress_signal.emit(
+                                        _gi, ai_cnt,
+                                        f"第 {_gi + 1} 条 · {backend} 第 {attempt}/{total_attempts} 次：{message}",
+                                    )
+                                generated = generate_script_by_topic_detailed(
                                     topic, style, detail, features,
                                     lang=ai_lang, extra_instruction=extra,
                                     target_chars_min=target_min,
                                     target_chars_max=target_max,
+                                    accepted_texts=accepted,
+                                    progress_callback=quality_progress,
                                 )
-                                self.result_signal.emit(gi, txt)
+                                accepted.append(generated["text"])
+                                quality = generated["quality"]
+                                self.result_signal.emit(
+                                    gi, generated["text"], generated["source"],
+                                    quality["char_count"], quality["max_similarity"],
+                                )
                         finally:
                             _wr._LOAD_PROGRESS_CALLBACK = old_cb
                     except Exception as e:
                         self.error_signal.emit(str(e))
             worker = GenWorker()
             worker.progress_signal.connect(_update_progress)
-            worker.result_signal.connect(lambda idx, txt: (
-                ai_results.append(txt),
-                setattr(dlg, "_ai_results", ai_results),
-                self._ai_results_list.addItem(f"📄 文案 #{len(ai_results)}"),
-                ai_status_label.setText(f"✅ 已生成 {len(ai_results)}/{count_input.value()} 条"),
-                ai_progress_bar.setValue(len(ai_results)),
-                gen_btn.setEnabled(len(ai_results) < count_input.value()),
-                use_btn.setEnabled(len(ai_results) >= count_input.value()),
-                result_area.setText(txt),
-                result_area.setVisible(True),
-            ))
+            def _accept_generated(idx, txt, source, char_count, similarity):
+                ai_results.append(txt)
+                ai_result_meta.append({
+                    "source": source, "char_count": char_count,
+                    "max_similarity": similarity,
+                })
+                dlg._ai_results = ai_results
+                dlg._ai_result_meta = ai_result_meta
+                cps = estimate_chars_for_lang(
+                    ["zh", "th", "en"][lang_input.currentIndex()], 1, ai_rate.value(),
+                    margin=0,
+                )[2]
+                estimated_seconds = char_count / max(1, cps)
+                self._ai_results_list.addItem(
+                    f"📄 文案 #{len(ai_results)} · {char_count}字符 · "
+                    f"约{estimated_seconds:.1f}s · {source} · 相似度{similarity:.0%}"
+                )
+                ai_status_label.setText(f"✅ 已生成 {len(ai_results)}/{count_input.value()} 条合格文案")
+                ai_progress_bar.setValue(len(ai_results))
+                gen_btn.setEnabled(len(ai_results) < count_input.value())
+                use_btn.setEnabled(len(ai_results) >= count_input.value())
+                result_area.setText(txt)
+                result_area.setVisible(True)
+            worker.result_signal.connect(_accept_generated)
             worker.error_signal.connect(lambda err: (
                 result_area.setText("❌ " + err),
                 ai_status_label.setText("❌ 生成失败"),
@@ -1788,6 +1822,29 @@ class MainWindow(QMainWindow):
                 if text and "正在生成" not in text and "生成失败" not in text:
                     texts = [text]
             if texts:
+                lang_map = {"中文": "zh", "泰文": "th", "英文": "en"}
+                ai_lang = lang_map.get(lang_input.currentText(), "zh")
+                target_min, target_max = estimate_chars_for_duration_range(
+                    ai_lang, dur_min.value(), dur_max.value(), ai_rate.value(),
+                )
+                accepted = []
+                for index, text in enumerate(texts):
+                    quality = validate_script_quality(
+                        text, topic_input.text().strip(), lang=ai_lang,
+                        target_chars_min=target_min, target_chars_max=target_max,
+                        detail=detail_input.text().strip() or None,
+                        features=feature_input.text().strip() or None,
+                        accepted_texts=accepted,
+                        require_topic=ai_lang == "zh",
+                    )
+                    if not quality["valid"]:
+                        QMessageBox.warning(
+                            dlg, "文案质量校验失败",
+                            f"第 {index + 1} 条未通过最终校验：\n"
+                            + "\n".join(quality["reasons"]),
+                        )
+                        return
+                    accepted.append(text)
                 combined = "\n---\n".join(texts)
                 self._wiz_script_editor.setText(combined)
                 # Auto-set voice based on AI dialog language
@@ -3277,9 +3334,9 @@ class MainWindow(QMainWindow):
     def _on_wizard_gen_error(self, msg):
         self._wizard_gen_done_flag = True
         # 同 _on_wizard_gen_done：错误前 worker 推的进度消息也要 drain 出来
-        for msg in _log_drain():
+        for pending_log in _log_drain():
             try:
-                self._handle_render_log(msg)
+                self._handle_render_log(pending_log)
             except Exception:
                 pass
         if self._wiz_poll_timer:
@@ -3622,7 +3679,9 @@ class MainWindow(QMainWindow):
             self._resume_task(self._detail_task_id)
             QTimer.singleShot(2000, lambda: self._refresh_task_detail(self._detail_task_id))
     def _on_detail_retry(self):
-        self._on_detail_resume()
+        if hasattr(self, "_detail_task_id"):
+            self._retry_task(self._detail_task_id)
+            QTimer.singleShot(2000, lambda: self._refresh_task_detail(self._detail_task_id))
     def _on_detail_replay(self):
         if hasattr(self, "_detail_task_id"):
             self._replay_task(self._detail_task_id)
@@ -4524,6 +4583,9 @@ def run_ui():
     ensure_dirs()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     app = QApplication(sys.argv)
+    app_icon_path = os.environ.get("AUTOKAT_APP_ICON")
+    if app_icon_path and Path(app_icon_path).exists():
+        app.setWindowIcon(QIcon(app_icon_path))
     try:
         app.setStyle("Fusion")
     except Exception:

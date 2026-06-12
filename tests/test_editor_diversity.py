@@ -41,7 +41,9 @@ class EditorDiversityTests(unittest.TestCase):
             sentences,
             count=2,
             material_pool=pool,
-            config={"min_shot_duration": 6, "enable_diversity": True},
+            config={"min_shot_duration": 6, "enable_diversity": True,
+                    "transition_duration": 0, "tail_duration": 0,
+                    "source_safety_margin": 0},
         )
         first = {c["material_id"] for c in batch[0]["clips"]}
         second = {c["material_id"] for c in batch[1]["clips"]}
@@ -62,7 +64,9 @@ class EditorDiversityTests(unittest.TestCase):
             sentences,
             count=1,
             material_pool=pool,
-            config={"min_shot_duration": 4, "enable_diversity": True},
+            config={"min_shot_duration": 4, "enable_diversity": True,
+                    "transition_duration": 0, "tail_duration": 0,
+                    "source_safety_margin": 0},
         )
         sources = {c["source_id"] for c in batch[0]["clips"]}
         self.assertEqual(len(sources), 4)
@@ -79,7 +83,9 @@ class EditorDiversityTests(unittest.TestCase):
             count=2,
             material_pool=pool,
             sentence_groups=groups,
-            config={"min_shot_duration": 4, "enable_diversity": True},
+            config={"min_shot_duration": 4, "enable_diversity": True,
+                    "transition_duration": 0, "tail_duration": 0,
+                    "source_safety_margin": 0},
         )
         first = {c["material_id"] for c in batch[0]["clips"]}
         second = {c["material_id"] for c in batch[1]["clips"]}
@@ -93,7 +99,9 @@ class EditorDiversityTests(unittest.TestCase):
             sentences,
             count=8,
             material_pool=pool,
-            config={"min_shot_duration": 5, "enable_diversity": True},
+            config={"min_shot_duration": 5, "enable_diversity": True,
+                    "transition_duration": 0, "tail_duration": 0,
+                    "source_safety_margin": 0},
         )
         usage = {}
         for script in batch:
@@ -117,6 +125,9 @@ class EditorDiversityTests(unittest.TestCase):
                 "enable_diversity": True,
                 "diversity_retry_attempts": 6,
                 "diversity_jaccard_target": 0.5,
+                "transition_duration": 0,
+                "tail_duration": 0,
+                "source_safety_margin": 0,
             },
         )
         report = batch[0]["diversity_report"]

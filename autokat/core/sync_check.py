@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 from autokat.core.ffmpeg_utils import get_media_duration
+from autokat.core.timeline import SYNC_TOLERANCE_SECONDS
 
 
 def parse_srt_last_end(srt_path: str) -> Optional[float]:
@@ -50,7 +51,7 @@ def verify_sync(
     audio_path: Optional[str] = None,
     srt_last_end: Optional[float] = None,
     srt_path: Optional[str] = None,
-    tolerance: float = 0.1,
+    tolerance: float = SYNC_TOLERANCE_SECONDS,
 ) -> list:
     """检查视频/音频/字幕三者时长一致性。
 

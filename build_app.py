@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import stat
 import json
+import platform
 from pathlib import Path
 
 APP_NAME = "AutoCat"
@@ -32,6 +33,8 @@ def build_app(create_dmg: bool = False):
         print(f"❌ 未找到虚拟环境: {VENV_DIR}")
         print("请先运行: python3 -m venv .venv && source .venv/bin/activate && pip install -e .")
         sys.exit(1)
+
+    _require_apple_silicon()
 
     # 获取 site-packages 路径
     result = subprocess.run(
@@ -140,6 +143,10 @@ export PYTHONPATH="$RESOURCES/lib/python{py_ver}/site-packages:$PYTHONPATH"
 export AUTOKAT_DATA_DIR="$HOME/Library/Application Support/AutoCat"
 export AUTOKAT_BUNDLED_ASSETS_DIR="$RESOURCES/assets"
 export AUTOKAT_FFMPEG="$RESOURCES/ffmpeg"
+export AUTOKAT_APP_ICON="$RESOURCES/autokat.icns"
+export DYLD_FRAMEWORK_PATH="$RESOURCES${{DYLD_FRAMEWORK_PATH:+:$DYLD_FRAMEWORK_PATH}}"
+export DYLD_LIBRARY_PATH="$RESOURCES/native_libs${{DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}}"
+export PYTHONDONTWRITEBYTECODE=1
 mkdir -p "$AUTOKAT_DATA_DIR"
 
 # DeepSeek API Key
@@ -148,7 +155,7 @@ if [ -f "$ENV_FILE" ]; then
     source "$ENV_FILE"
 fi
 
-exec "$PYTHON_BIN" << PYEOF
+exec "$PYTHON_BIN" -B << PYEOF
 import sys
 sys.path.insert(0, "$RESOURCES/lib/python{py_ver}/site-packages")
 from autokat.models.db import init_db
@@ -267,10 +274,12 @@ def _embed_code(resources_dir: Path, site_packages: str, py_ver: str):
             os.chmod(str(ffmpeg_dst), 0o755)
             print(f"      FFmpeg: {src}")
             # 也复制 ffprobe
-            src_probe = src.replace("ffmpeg", "ffprobe")
-            if os.path.exists(src_probe):
-                _sh.copy2(src_probe, str(ffprobe_dst))
-                os.chmod(str(ffprobe_dst), 0o755)
+            src_probe = str(Path(src).with_name("ffprobe"))
+            if not os.path.exists(src_probe):
+                raise RuntimeError(f"未找到与 FFmpeg 配套的 ffprobe: {src_probe}")
+            _sh.copy2(src_probe, str(ffprobe_dst))
+            os.chmod(str(ffprobe_dst), 0o755)
+            _bundle_macho_dependencies([Path(src), Path(src_probe)], resources_dir / "native_libs")
             break
     else:
         print(f"      ⚠️ 未找到 FFmpeg（用户需自行安装）")
@@ -292,38 +301,60 @@ def _embed_code(resources_dir: Path, site_packages: str, py_ver: str):
 
 
 def _create_icon(resources_dir: Path):
-    """创建应用图标 - 使用预设科技感图标"""
+    """复制应用的正式 macOS 图标。"""
     icon_dst = resources_dir / "autokat.icns"
-    # 使用预先生成的科技感图标
-    import shutil
     src_icon = PROJECT_DIR / "dist" / "autokat.icns"
     if src_icon.exists():
         shutil.copy2(str(src_icon), str(icon_dst))
-        print(f"   ✅ 已使用科技感图标: {icon_dst}")
-    else:
-        # 回退生成默认图标
-        try:
-            from PIL import Image, ImageDraw
-            img = Image.new("RGBA", (1024, 1024), (0, 0, 0, 0))
-            draw = ImageDraw.Draw(img)
-            draw.rounded_rectangle([(50, 50), (974, 974)], radius=180, fill="#4A90D9")
-            draw.ellipse([(250, 200), (774, 550)], fill="white")
-            draw.polygon([(350, 600), (674, 600), (512, 800)], fill="white")
-            img.save(str(icon_dst), format="PNG")
-            print(f"   已生成默认图标(回退)")
-        except Exception as e:
-            print(f"   图标生成跳过: {e}")
+        print(f"   ✅ 已使用 AutoCat 图标: {icon_dst}")
+        return
+
+    source_png = PROJECT_DIR / "design" / "icon_candidates" / "06-light-tech-timeline-cat.png"
+    if not source_png.exists():
+        raise RuntimeError(f"缺少应用图标源文件: {source_png}")
+
+    iconset = resources_dir / "autokat.iconset"
+    iconset.mkdir(parents=True, exist_ok=True)
+    sizes = {
+        "icon_16x16.png": 16,
+        "icon_16x16@2x.png": 32,
+        "icon_32x32.png": 32,
+        "icon_32x32@2x.png": 64,
+        "icon_128x128.png": 128,
+        "icon_128x128@2x.png": 256,
+        "icon_256x256.png": 256,
+        "icon_256x256@2x.png": 512,
+        "icon_512x512.png": 512,
+        "icon_512x512@2x.png": 1024,
+    }
+    for name, size in sizes.items():
+        subprocess.run(
+            ["sips", "-z", str(size), str(size), str(source_png), "--out", str(iconset / name)],
+            check=True, capture_output=True,
+        )
+    subprocess.run(["iconutil", "-c", "icns", str(iconset), "-o", str(icon_dst)], check=True)
+    shutil.rmtree(iconset)
+    print(f"   ✅ 已从 06 图标源文件生成 ICNS: {icon_dst}")
 
 
 def _try_sign(app_dir: Path):
     try:
+        # install_name_tool 会使原签名失效，必须先逐一重签所有 Mach-O，再签应用 bundle。
+        for path in sorted((p for p in app_dir.rglob("*") if p.is_file()), key=lambda p: len(p.parts), reverse=True):
+            probe = subprocess.run(["file", str(path)], capture_output=True, text=True)
+            if "Mach-O" not in probe.stdout:
+                continue
+            subprocess.run(
+                ["codesign", "--force", "--sign", "-", str(path)],
+                check=True, capture_output=True, text=True, timeout=30,
+            )
         subprocess.run(
             ["codesign", "--force", "--deep", "--sign", "-", str(app_dir)],
-            capture_output=True, timeout=30,
+            check=True, capture_output=True, text=True, timeout=180,
         )
         print(f"   ✅ 已签名")
-    except Exception:
-        print(f"   ⚠️ 未签名（首次打开需在系统设置中允许运行）")
+    except Exception as e:
+        raise RuntimeError(f"应用签名失败: {e}") from e
 
 
 def _build_dmg(app_dir: Path):
@@ -360,7 +391,7 @@ def _build_dmg(app_dir: Path):
 
     except subprocess.CalledProcessError as e:
         err = e.stderr.decode()[:300]
-        print(f"❌ DMG 创建失败: {err}")
+        raise RuntimeError(f"DMG 创建失败: {err}") from e
     finally:
         shutil.rmtree(dmg_dir, ignore_errors=True)
 
@@ -393,7 +424,11 @@ def _copy_python_with_deps(python_bin: str, dst_dir: Path, py_ver: str):
     print(f"      Python.framework: {framework_root}")
     
     fw_ver = fw_dst / "Versions" / py_ver
-    for sub_dir in ["bin", "lib"]:
+    framework_binary = Path(framework_root) / "Versions" / py_ver / "Python"
+    if framework_binary.exists():
+        fw_ver.mkdir(parents=True, exist_ok=True)
+        _sh.copy2(str(framework_binary), str(fw_ver / "Python"))
+    for sub_dir in ["bin", "lib", "Resources"]:
         src = Path(framework_root) / "Versions" / py_ver / sub_dir
         dst = fw_ver / sub_dir
         if src.exists():
@@ -402,6 +437,11 @@ def _copy_python_with_deps(python_bin: str, dst_dir: Path, py_ver: str):
                                                     "tkinter", "idlelib", "lib2to3",
                                                     "turtledemo", "ensurepip", "venv",
                                                     "distutils", "pydoc_data"))
+
+    embedded_site_packages = fw_ver / "lib" / f"python{py_ver}" / "site-packages"
+    if embedded_site_packages.is_symlink() or embedded_site_packages.exists():
+        embedded_site_packages.unlink()
+    embedded_site_packages.symlink_to(Path("../../../../../lib") / f"python{py_ver}" / "site-packages")
     
     # 创建 Current 符号链接
     (fw_dst / "Versions" / "Current").symlink_to(py_ver)
@@ -415,8 +455,81 @@ def _copy_python_with_deps(python_bin: str, dst_dir: Path, py_ver: str):
             if f.name.startswith("python3."):
                 python3_bin.symlink_to(f.name)
                 break
+
+    # Homebrew 的 python 启动器默认引用 Cellar 路径，改为包内 Framework。
+    for candidate in bin_dir.iterdir():
+        if candidate.is_symlink() or not candidate.is_file():
+            continue
+        deps = _macho_dependencies(candidate)
+        for dep in deps:
+            if dep.endswith(f"/Python.framework/Versions/{py_ver}/Python"):
+                subprocess.run(
+                    ["install_name_tool", "-change", dep, "@executable_path/../Python", str(candidate)],
+                    check=True, capture_output=True,
+                )
     
     print(f"      ✅ Python.framework 已嵌入（含标准库）")
+
+
+def _macho_dependencies(binary: Path) -> list[str]:
+    result = subprocess.run(["otool", "-L", str(binary)], capture_output=True, text=True)
+    if result.returncode != 0:
+        return []
+    deps = []
+    for line in result.stdout.splitlines()[1:]:
+        dep = line.strip().split(" (", 1)[0]
+        if dep:
+            deps.append(dep)
+    return deps
+
+
+def _bundle_macho_dependencies(binaries: list[Path], destination: Path):
+    """递归收集 Homebrew 动态库，避免安装端依赖本机 Homebrew。"""
+    destination.mkdir(parents=True, exist_ok=True)
+    queue = list(binaries)
+    copied: dict[str, Path] = {}
+
+    while queue:
+        binary = queue.pop(0)
+        for dep in _macho_dependencies(binary):
+            if not dep.startswith(("/opt/homebrew/", "/usr/local/")):
+                continue
+            source = Path(dep).resolve()
+            if not source.exists():
+                raise RuntimeError(f"缺少动态库依赖: {dep}")
+            existing = copied.get(source.name)
+            if existing and existing != source:
+                raise RuntimeError(f"动态库文件名冲突: {existing} / {source}")
+            if existing:
+                continue
+            target = destination / source.name
+            shutil.copy2(str(source), str(target))
+            target.chmod(target.stat().st_mode | stat.S_IWRITE)
+            copied[source.name] = source
+            queue.append(target)
+
+    print(f"      ✅ 已嵌入 {len(copied)} 个 FFmpeg 动态库")
+
+
+def _require_apple_silicon():
+    """拒绝从非 Apple Silicon 环境生成错误架构的安装包。"""
+    if platform.machine() != "arm64":
+        raise RuntimeError(f"当前构建机架构为 {platform.machine()}，必须使用 arm64 构建 Apple Silicon 安装包")
+
+    python_bin = VENV_DIR / "bin" / "python3"
+    result = subprocess.run(["file", str(python_bin)], capture_output=True, text=True, check=True)
+    if "arm64" not in result.stdout:
+        raise RuntimeError(f"虚拟环境 Python 不是 arm64: {result.stdout.strip()}")
+
+    ffmpeg = Path("/opt/homebrew/bin/ffmpeg")
+    if ffmpeg.exists():
+        result = subprocess.run(["file", str(ffmpeg)], capture_output=True, text=True, check=True)
+        if "arm64" not in result.stdout:
+            raise RuntimeError(f"FFmpeg 不是 arm64: {result.stdout.strip()}")
+
+    print("✅ Apple Silicon 架构检查通过 (arm64)")
+
+
 if __name__ == "__main__":
     create_dmg = "--dmg" in sys.argv
     build_app(create_dmg=create_dmg)

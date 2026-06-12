@@ -8,6 +8,8 @@ import re
 import asyncio
 import subprocess
 import tempfile
+import time
+import unicodedata
 from pathlib import Path
 from autokat.core.ffmpeg_utils import FFPROBE
 from typing import Optional
@@ -16,6 +18,10 @@ import edge_tts
 
 from autokat.models.db import get_conn
 from autokat.core.paths import ASSETS_ROOT
+from autokat.core.subtitle_sync import (
+    MAX_CAPTION_CHARS, prepare_pcm_and_calibrate, semantic_unit_chunks,
+    split_punctuation_clauses,
+)
 
 TTS_DIR = ASSETS_ROOT / "tts"
 TTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -114,19 +120,9 @@ def split_sentences(text: str, lang: str = "zh") -> list[str]:
             else:
                 sentences.append(s)
     else:
-        # 中文：按句号、问号、感叹号、分句、换行切分
-        raw = re.split(r'(?<=[。！？\n])\s*', text)
-        sentences = []
-        for s in raw:
-            s = s.strip()
-            if not s:
-                continue
-            # 如果句子超过 30 个字，按逗号再分
-            if len(s) > 30:
-                sub = re.split(r'(?<=[，；、])\s*', s)
-                sentences.extend([x.strip() for x in sub if x.strip()])
-            else:
-                sentences.append(s)
+        # 中文：目标标点始终断句，标点保留在上一条字幕。
+        raw = re.split(r'(?<=[，；：。！？\n])\s*', text)
+        sentences = [s.strip() for s in raw if s.strip()]
     return sentences
 
 
@@ -141,7 +137,9 @@ async def _generate_tts(text: str, output_path: str,
     如果 Edge-TTS 失败（网络/语音不匹配），会抛出异常由调用方处理回退。
     """
     import os
-    communicate = edge_tts.Communicate(text, voice=voice, rate=rate, pitch=pitch)
+    communicate = edge_tts.Communicate(
+        text, voice=voice, rate=rate, pitch=pitch, boundary="WordBoundary"
+    )
     await communicate.save(output_path)
 
     # 用 ffprobe 获取时长
@@ -166,6 +164,166 @@ async def _generate_tts(text: str, output_path: str,
     except Exception:
         pass
     return None
+
+
+def _probe_audio_duration(output_path: str) -> Optional[float]:
+    try:
+        result = subprocess.run(
+            [FFPROBE, "-v", "quiet", "-show_entries", "format=duration",
+             "-of", "csv=p=0", output_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        duration = float(result.stdout.strip())
+        return duration if duration > 0 else None
+    except Exception:
+        return None
+
+
+_ZH_BREAK_PUNCTUATION = set("，；：。！？")
+_TTS_ATTEMPTS_PER_VOICE = 3
+
+
+def _spoken_text(text: str) -> str:
+    """Normalize text to characters Edge TTS can emit as WordBoundary content."""
+    return "".join(
+        char for char in str(text)
+        if not char.isspace() and not unicodedata.category(char).startswith("P")
+    )
+
+
+def _display_chunks(clause: str, chunks: list[list[dict]]) -> list[str]:
+    """Restore all original punctuation while keeping spoken-unit chunk boundaries."""
+    if len(chunks) <= 1:
+        return [clause.strip()]
+    ends = []
+    cumulative = 0
+    for chunk in chunks:
+        cumulative += sum(unit["chars"] for unit in chunk)
+        ends.append(cumulative)
+    result = []
+    start = 0
+    spoken_count = 0
+    end_index = 0
+    for index, char in enumerate(clause):
+        if _spoken_text(char):
+            spoken_count += 1
+        if end_index < len(ends) - 1 and spoken_count == ends[end_index]:
+            next_index = index + 1
+            while next_index < len(clause) and not _spoken_text(clause[next_index]):
+                next_index += 1
+            result.append(clause[start:next_index].strip())
+            start = next_index
+            end_index += 1
+    result.append(clause[start:].strip())
+    return result
+
+
+def build_phrase_timings(boundaries: list[dict], source_text: Optional[str] = None,
+                         max_chars: int = MAX_CAPTION_CHARS) -> list[dict]:
+    """Build punctuation-first captions using only real TTS boundary times."""
+    units = []
+    for boundary in boundaries:
+        spoken = _spoken_text(boundary.get("text", ""))
+        if not spoken:
+            continue
+        units.append({
+            "text": spoken,
+            "chars": len(spoken),
+            "start": float(boundary["start"]),
+            "end": float(boundary["end"]),
+        })
+    if not units:
+        raise ValueError("TTS 未返回可用 WordBoundary")
+
+    if source_text is None:
+        source_text = "".join(str(boundary.get("text", "")) for boundary in boundaries)
+    source_spoken = _spoken_text(source_text)
+    boundary_spoken = "".join(unit["text"] for unit in units)
+    if source_spoken != boundary_spoken:
+        raise ValueError(
+            "WordBoundary 与原始文案无法完整对齐: "
+            f"source={source_spoken!r}, boundaries={boundary_spoken!r}"
+        )
+
+    clauses = split_punctuation_clauses(source_text)
+    phrases = []
+    unit_index = 0
+    for clause in clauses:
+        wanted_chars = len(_spoken_text(clause))
+        clause_units = []
+        consumed = 0
+        while unit_index < len(units) and consumed < wanted_chars:
+            unit = units[unit_index]
+            if consumed + unit["chars"] > wanted_chars:
+                raise ValueError(f"WordBoundary 跨越标点断句边界: {clause!r}")
+            clause_units.append(unit)
+            consumed += unit["chars"]
+            unit_index += 1
+        if consumed != wanted_chars:
+            raise ValueError(f"WordBoundary 未覆盖完整标点短句: {clause!r}")
+
+        chunks = semantic_unit_chunks(clause_units, clause, max_chars=max_chars)
+        display_chunks = _display_chunks(clause, chunks)
+        for chunk_index, chunk in enumerate(chunks):
+            phrases.append({
+                "index": len(phrases),
+                "text": display_chunks[chunk_index],
+                "start": chunk[0]["start"],
+                "end": chunk[-1]["end"],
+                "timing_source": "word_boundary",
+            })
+
+    if unit_index != len(units):
+        raise ValueError("存在未映射到字幕的 WordBoundary")
+    for index, phrase in enumerate(phrases):
+        phrase["index"] = index
+        phrase["start"] = round(phrase["start"], 6)
+        phrase["end"] = round(phrase["end"], 6)
+    return phrases
+
+
+async def _generate_tts_with_boundaries(text: str, output_path: str,
+                                        voice: str, rate: str,
+                                        pitch: str) -> tuple[Optional[float], list[dict]]:
+    """Generate one continuous audio file and collect real WordBoundary times."""
+    communicate = edge_tts.Communicate(
+        text, voice=voice, rate=rate, pitch=pitch, boundary="WordBoundary"
+    )
+    boundaries = []
+    with open(output_path, "wb") as audio_file:
+        async for chunk in communicate.stream():
+            chunk_type = chunk.get("type")
+            if chunk_type == "audio":
+                audio_file.write(chunk["data"])
+            elif chunk_type == "WordBoundary":
+                start = float(chunk.get("offset", 0)) / 10_000_000
+                duration = float(chunk.get("duration", 0)) / 10_000_000
+                boundaries.append({
+                    "text": chunk.get("text", ""),
+                    "start": start,
+                    "end": start + duration,
+                })
+    return _probe_audio_duration(output_path), boundaries
+
+
+def _fallback_sentence_timings(text: str, duration: float, lang: str) -> list[dict]:
+    sentences = split_sentences(text, lang=lang)
+    if not sentences or duration <= 0:
+        return []
+    weights = [max(1, len(sentence.replace(" ", ""))) for sentence in sentences]
+    total_weight = sum(weights)
+    current = 0.0
+    timings = []
+    for index, (sentence, weight) in enumerate(zip(sentences, weights)):
+        end = duration if index == len(sentences) - 1 else current + duration * weight / total_weight
+        timings.append({
+            "index": index,
+            "text": sentence,
+            "start": round(current, 3),
+            "end": round(end, 3),
+        })
+        current = end
+    return timings
 
 
 def generate_narration(text: str,
@@ -202,8 +360,6 @@ def generate_narration(text: str,
     if pitch is None:
         pitch = cfg["pitch"]
 
-    sentences = split_sentences(text, lang=lang)
-
     if output_name:
         audio_path = str(TTS_DIR / f"{output_name}.mp3")
     else:
@@ -212,23 +368,6 @@ def generate_narration(text: str,
         h = hashlib.md5(text.encode()).hexdigest()[:12]
         audio_path = str(TTS_DIR / f"narration_{h}.mp3")
 
-    # 整体生成配音（Edge-TTS 支持 SSML，但不支持逐句精准时间戳）
-    # 方案：逐句生成，用 ffmpeg 拼接，记录每句起止时间
-    seg_dir = TTS_DIR / "segments"
-    seg_dir.mkdir(parents=True, exist_ok=True)
-
-    sentence_timings = []
-    seg_files = []
-    current_time = 0.0
-
-    import hashlib
-    h = hashlib.md5(text.encode()).hexdigest()[:12]
-
-    # 尝试首选语音，失败时回退（梯度尝试：首选 → 语言默认 → 中文语音兜底）
-    _voice = voice
-    _voice_fallback = cfg["voice"]
-    # 尝试首选语音，失败时回退到同语言的其他语音
-    _voice = voice
     # 同语言备用语音列表（按可靠性排序）
     _fallback_voices = {
         "zh": ["zh-CN-XiaoxiaoNeural", "zh-CN-YunxiNeural", "zh-CN-XiaohanNeural"],
@@ -237,93 +376,69 @@ def generate_narration(text: str,
     _lang_voices = _fallback_voices.get(lang, [])
     # 构建去重尝试列表：首选 → 同语言备选
     _candidates = []
-    for v in [_voice] + _lang_voices:
+    for v in [voice] + _lang_voices:
         if v not in _candidates:
             _candidates.append(v)
 
-    for i, sent in enumerate(sentences):
-        if not sent.strip():
-            continue
-        seg_path = str(seg_dir / f"{h}_seg{i:03d}.mp3")
-        dur = None
-        last_exc = None
-        for cv in _candidates:
+    total_duration = None
+    word_boundaries = []
+    sentence_timings = []
+    last_exc = None
+    for candidate in _candidates:
+        for attempt in range(1, _TTS_ATTEMPTS_PER_VOICE + 1):
             try:
-                dur = asyncio.run(_generate_tts(sent, seg_path, cv, rate, pitch))
-                if dur is not None and dur >= 0.1:
-                    break
-                err_msg = f"Audio too short ({dur}s)" if dur is not None else "Returned None"
-                print(f"[TTS] Voice {cv} problem: {err_msg}")
-            except Exception as e:
-                print(f"[TTS] Voice {cv} failed: {e}")
-                last_exc = e
-            dur = None
-        if dur is None or dur < 0.1:
-            # 所有语音都失败了，记录具体的失败原因
-            err_detail = str(last_exc) if last_exc else "Unknown error"
-            print(f"[TTS] All voices failed for sentence {i}: {err_detail}")
-            continue
-            continue
+                total_duration, word_boundaries = asyncio.run(
+                    _generate_tts_with_boundaries(text, audio_path, candidate, rate, pitch)
+                )
+                if not total_duration or total_duration < 0.1:
+                    raise RuntimeError(f"音频时长异常: {total_duration}")
+                if not word_boundaries:
+                    raise RuntimeError("TTS 未返回 WordBoundary")
+                sentence_timings = build_phrase_timings(
+                    word_boundaries,
+                    source_text=text if lang == "zh" else None,
+                    max_chars=MAX_CAPTION_CHARS if lang == "zh" else 20,
+                )
+                break
+            except Exception as exc:
+                last_exc = exc
+                total_duration, word_boundaries, sentence_timings = None, [], []
+                print(
+                    f"[TTS] Voice {candidate} attempt "
+                    f"{attempt}/{_TTS_ATTEMPTS_PER_VOICE} failed: {exc}"
+                )
+                if attempt < _TTS_ATTEMPTS_PER_VOICE:
+                    time.sleep(0.5 * attempt)
+        if sentence_timings:
+            break
 
-        sentence_timings.append({
-            "index": i,
-            "text": sent,
-            "start": round(current_time, 3),
-            "end": round(current_time + dur, 3),
-        })
-        seg_files.append(seg_path)
-        current_time += dur
-        # 逐句进度回调：调用方传了 on_sentence 就通知它 "第 i+1 句完成"，
-        # 让 UI 端的"当前活动"标签持续刷新，避免 TTS 期间界面静止
-        if on_sentence is not None:
+    if not total_duration or total_duration < 0.1:
+        raise RuntimeError(
+            f"TTS 在 {len(_candidates) * _TTS_ATTEMPTS_PER_VOICE} 次尝试后仍失败: "
+            f"{last_exc or 'unknown error'}"
+        ) from last_exc
+    if lang == "zh":
+        try:
+            audio_path, sentence_timings, total_duration = prepare_pcm_and_calibrate(
+                audio_path, sentence_timings, total_duration,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"PCM/VAD 字幕校准失败: {exc}") from exc
+    if on_sentence is not None:
+        for index, timing in enumerate(sentence_timings, 1):
             try:
-                on_sentence(i + 1, len(sentences), sent)
+                on_sentence(index, len(sentence_timings), timing["text"])
             except Exception:
-                # 回调失败不影响 TTS 主体
                 pass
-
-    if not seg_files:
-        return None
-
-    # 拼接所有音频片段
-    filelist_path = str(seg_dir / f"{h}_filelist.txt")
-    with open(filelist_path, "w") as f:
-        for sf in seg_files:
-            f.write(f"file '{sf}'\n")
-
-    from autokat.core.ffmpeg_utils import FFMPEG as _FF
-    cmd = [
-        _FF, "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", filelist_path,
-        "-c", "copy",
-        audio_path
-    ]
-    try:
-        subprocess.run(cmd, check=True, capture_output=True, timeout=120)
-    except subprocess.CalledProcessError as e:
-        print(f"[TTS 拼接失败] {e.stderr.decode(errors='replace')[:200]}")
-        # 如果拼接失败，直接用最后一段单独生成一个完整音频
-        asyncio.run(_generate_tts(text, audio_path, voice, rate, pitch))
-        # 此时没有逐句时间戳，按总时长均匀分句
-        total_dur = current_time
-        sentence_timings = []
-        avg_dur = total_dur / len(sentences)
-        for i, sent in enumerate(sentences):
-            sentence_timings.append({
-                "index": i,
-                "text": sent,
-                "start": round(i * avg_dur, 3),
-                "end": round((i + 1) * avg_dur, 3),
-            })
-
-    total_duration = sentence_timings[-1]["end"] if sentence_timings else 0
 
     return {
         "audio_path": audio_path,
-        "total_duration": total_duration,
+        "total_duration": round(total_duration, 3),
         "sentences": sentence_timings,
+        "timing_source": (
+            "word_boundary+pcm_vad"
+            if lang == "zh" else ("word_boundary" if word_boundaries else "estimated")
+        ),
     }
 
 

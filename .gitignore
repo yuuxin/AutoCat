@@ -9,6 +9,10 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
+.validation-venv/
+outputs/content_sync_models/
+outputs/
+presentations/
 .ruff_cache/
 .pytest_cache/
 

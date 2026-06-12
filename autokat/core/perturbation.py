@@ -29,25 +29,25 @@ DEFAULT_RISK_THRESHOLDS = {
 # off=全关, low=低（仅必要维度）, med=中（推荐默认）, high=高（全开）
 LEVEL_CONFIG = {
     "off": {
-        "encoding": False, "subtitle_style": False,
+        "subtitle_style": False,
         "scale_rotate": False, "flip": False, "nonstd_resolution": False,
         "quota_enforce": False, "jaccard_soft": False,
         "tts_diversity": False, "bgm_jitter": False, "subtitle_position": False,
     },
     "low": {
-        "encoding": True, "subtitle_style": True,
+        "subtitle_style": True,
         "scale_rotate": False, "flip": False, "nonstd_resolution": False,
         "quota_enforce": True, "jaccard_soft": False,
         "tts_diversity": False, "bgm_jitter": False, "subtitle_position": False,
     },
     "med": {  # 默认
-        "encoding": True, "subtitle_style": True,
+        "subtitle_style": True,
         "scale_rotate": True, "flip": True, "nonstd_resolution": True,
         "quota_enforce": True, "jaccard_soft": True,
         "tts_diversity": False, "bgm_jitter": False, "subtitle_position": False,
     },
     "high": {
-        "encoding": True, "subtitle_style": True,
+        "subtitle_style": True,
         "scale_rotate": True, "flip": True, "nonstd_resolution": True,
         "quota_enforce": True, "jaccard_soft": True,
         "tts_diversity": True, "bgm_jitter": True, "subtitle_position": True,
@@ -60,9 +60,6 @@ DEFAULT_RANGES = {
     "scale": (0.94, 1.06),
     "rotate_deg": (-2.0, 2.0),
     "translate_px": (-30, 30),
-    "crf_choices": [19, 21, 23, 25],
-    "bitrate_mbps_choices": [6, 8, 10, 12],
-    "gop_size_choices": [48, 60, 72],
     "hflip_prob": 0.3,  # 水平翻转概率（无字幕段）
     "nonstd_resolution_pool": [
         (1080, 1920), (1072, 1920), (1088, 1920),
@@ -92,10 +89,6 @@ def build_perturbation(level: str = "med", rng: Optional[random.Random] = None) 
     r = DEFAULT_RANGES
     p: dict = {"level": level}
 
-    if cfg["encoding"]:
-        p["crf"] = rng.choice(r["crf_choices"])
-        p["bitrate_mbps"] = rng.choice(r["bitrate_mbps_choices"])
-        p["gop_size"] = rng.choice(r["gop_size_choices"])
     if cfg["scale_rotate"]:
         p["scale"] = rng.uniform(*r["scale"])
         p["rotate_deg"] = rng.uniform(*r["rotate_deg"])

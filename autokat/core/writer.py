@@ -52,6 +52,15 @@ def estimate_chars_for_lang(
     chars_max = int(ideal * (1 + margin))
     return chars_min, chars_max, ideal
 
+
+def estimate_chars_for_duration_range(
+    lang: str, duration_min: float, duration_max: float, rate_pct: int = 0,
+) -> tuple[int, int]:
+    """Return a hard character range whose estimated duration stays in range."""
+    min_ideal = estimate_chars_for_lang(lang, duration_min, rate_pct, margin=0)[2]
+    max_ideal = estimate_chars_for_lang(lang, duration_max, rate_pct, margin=0)[2]
+    return min(min_ideal, max_ideal), max(min_ideal, max_ideal)
+
 from pathlib import Path
 from typing import Optional
 
@@ -436,6 +445,58 @@ def _dedup_intra_phrase(s: str) -> str:
     return out
 
 
+# --- v2.4: 元描述前缀剥除 (模块级预编译, 单条覆盖度高的正则 + chr() 构造中文括号) ---
+# 覆盖 '当然可以!以下是...' / '以下是...' / '好的, 以下是...' / '文案:' 等。
+# 关键改动 (相对 v2.4 上一版):
+#   1) 关键 keywords 用 + 替代 ? (允许 '短视频带货文案' 这种多关键词组合)
+#   2) 收尾的冒号 [：:]? 设为可选 (用户报 '以下是围绕XX的短视频带货文案' 没冒号也能剥)
+#   3) 中文括号「」/《》用 chr() 拼, 避免 raw string 中文括号在某些编辑器/Python 版本下解析问题
+_LDQ = chr(0x300C)  # 「
+_RDQ = chr(0x300D)  # 」
+_LDB = chr(0x300A)  # 《
+_RDB = chr(0x300B)  # 》
+_SEP = r'[\s,，。!！?？~～]*'
+_TOPIC_RE = (
+    r'(?:'
+    + _LDQ + r'[^' + _RDQ + r'\n]*' + _RDQ   # 「...」
+    + r'|"[^"\n]*"'                            # "..."
+    + r'|' + _LDB + r'[^' + _RDB + r'\n]*' + _RDB   # 《...》
+    + r'|[^' + _LDQ + chr(34) + _LDB + r'\s,，。!！?？~～\n]{1,40}'   # 普通 1-40 字
+    + r')?'
+)
+
+_META_PREFIX_PATTERNS = [
+    re.compile(
+        r'^'
+        + r'(?:当然可以?|当然|可以|好的|没问题|收到|OK)?' + _SEP
+        + r'(?:以下是?)?' + _SEP
+        + r'(?:一段|一个|一些|份)?' + _SEP
+        + r'(?:关于|围绕|有关|针对|描述)?' + _SEP
+        + _TOPIC_RE + _SEP
+        + r'(?:的)?' + _SEP
+        + r'(?:短视频|带货|口播|种草|文案|广告|内容|话术|开场|标题)+' + _SEP
+        + r'[：:]?' + _SEP
+    ),
+]
+
+# v2.4 补充: 纯元描述兜底 — 整段文本从开头到结尾都没有真实产品内容的元回复
+# (如 '好的, 以下是文案:' / '以下是文案' 这种只回元描述没产品内容的整段污染)
+_PURE_META_RE = re.compile(
+    r'^' + _SEP
+    + r'(?:当然可以?|当然|可以|好的|没问题|收到|OK)' + _SEP
+    + r'(?:以下是?)?' + _SEP
+    + r'(?:一段|一个|一些|份)?' + _SEP
+    + r'(?:关于|围绕|有关|针对|描述)?' + _SEP
+    + _TOPIC_RE + _SEP
+    + r'(?:的)?' + _SEP
+    + r'(?:短视频|带货|口播|种草|文案|广告|内容|话术|开场|标题)*' + _SEP
+    + r'[：:]?' + _SEP
+    + r'$'
+)
+
+
+
+
 def _collapse_runs(s: str) -> str:
     """扫描字符串, 折叠连续重复的短语 (2-6 字)"""
     # 中文 2-6 字 + 可选标点
@@ -454,10 +515,17 @@ def _clean_result(text: str) -> str:
     """AI 文案后处理: 清洗模型常见的污染输出 (元描述/emoji/markdown/前缀)"""
     if not text:
         return ""
-    # 0. 剥常见复合前缀 (干净源头, 如 "好的，以下是文案：")
-    text = re.sub(r'^好的[,，:.。：]?\s*(?:以下是?\s*)?(?:文案\s*[:：]?\s*)?', '', text.strip(), count=1)
-    # 1. 去除模型自加的前缀标签 ("文案:"/"好的, 以下是..."等)
-    text = re.sub(r'^(文案|好的|当然|来|以下是|给你|请查收|这是一段)[：:]\s*', '', text.strip())
+    text = text.strip()
+    # 0. 剥"先感叹/确认 → 再元描述"复合前缀 (如 "当然可以！以下是一段围绕XX的短视频带货文案：实际内容")
+    #    v2.4: 用 re.match + 切片替代 re.sub, 绕开 Python regex 在多步回溯时静默不匹配的坑
+    # v2.4: 用多条小正则逐个试, 绕开 Python regex 多步嵌套回溯时静默不匹配的坑
+    for _meta_pat in _META_PREFIX_PATTERNS:
+        _m = _meta_pat.match(text)
+        if _m:
+            text = text[_m.end():]
+            break
+    # 1. 剥单行元描述前缀 (如 "文案:"/"以下是:" 等)
+    text = re.sub(r'^(文案|好的|当然|来|以下是|给你|请查收|这是一段)[：:]\s*', '', text)
     # 2. 去除任何中文方括号【...】和英文方括号 [...] 元描述 (如 【惊讶式】【BGM:】【超现实】)
     text = re.sub(r'【[^】\n]*】', '', text)
     text = re.sub(r'\[[^]\n]*\]', '', text)
@@ -491,6 +559,12 @@ def _clean_result(text: str) -> str:
     # 8. 复读机式重复去重 (放最后, 看到的是最干净的文本, 整句对比更准)
     #    例: "限时特惠！限时特惠！限时优惠！" -> "限时特惠！限时优惠！"
     text = _dedup_repetitions(text)
+    # 9. v2.4: 纯元描述兜底 — 剥了前缀后整段如果仍是纯元描述 (整段匹配 _PURE_META_RE),
+    #    直接返回空串让上层 fallback. 之前用 "< 6 中文字 + 无内容动词" 太激进,
+    #    把 "今天" / "实际内容" 这种短但真实的内容也删了.
+    _stripped = text.strip()
+    if _stripped and _PURE_META_RE.match(_stripped):
+        return ""
     return text.strip()
 
 
@@ -518,6 +592,159 @@ def _enforce_char_limit(text: str, min_chars=None, max_chars=None) -> str:
     return text
 
 
+_META_REPLY_PATTERNS = (
+    "请告诉我", "请提供", "需要更多信息", "需要您提供", "想要的主题",
+    "我可以为您", "我能为您", "这样我就能", "作为ai", "作为 AI",
+    "无法生成", "不能生成", "抱歉",
+)
+_UNSUPPORTED_PRODUCT_CLAIMS = (
+    "面料", "材质", "环保", "透气", "透湿", "防水", "真皮", "皮革",
+    "棉质", "颜色", "黑色", "白色", "红色", "高跟鞋", "平底鞋",
+    "增高", "防滑", "耐磨", "矫正", "按摩", "抗菌",
+)
+_PROMOTION_WORDS = ("限时", "抢购", "特价", "特惠", "优惠", "秒杀", "直降", "折扣")
+
+
+def _content_char_count(text: str) -> int:
+    return len(re.sub(r"\s+", "", text or ""))
+
+
+def _topic_terms(topic: str) -> list[str]:
+    compact = re.sub(r"\s+", "", topic or "")
+    terms = [compact] if compact else []
+    terms.extend(
+        part for part in re.findall(r"[\u4e00-\u9fff]{2,}", compact)
+        if part not in terms
+    )
+    if len(compact) >= 4:
+        terms.extend(compact[index:index + 2] for index in range(len(compact) - 1))
+    return list(dict.fromkeys(term for term in terms if len(term) >= 2))
+
+
+def script_similarity(left: str, right: str, ngram: int = 3) -> float:
+    """Character n-gram Jaccard similarity for batch quality gating."""
+    def grams(text: str) -> set[str]:
+        compact = re.sub(r"[\s，。！？!?、；;：:,.]+", "", text or "")
+        if len(compact) < ngram:
+            return {compact} if compact else set()
+        return {compact[index:index + ngram] for index in range(len(compact) - ngram + 1)}
+    a, b = grams(left), grams(right)
+    return len(a & b) / len(a | b) if a or b else 0.0
+
+
+def validate_script_quality(
+    text: str,
+    topic: str,
+    lang: str = "zh",
+    target_chars_min: Optional[int] = None,
+    target_chars_max: Optional[int] = None,
+    detail: Optional[str] = None,
+    features: Optional[str] = None,
+    accepted_texts: Optional[list[str]] = None,
+    similarity_threshold: float = 0.70,
+    require_topic: bool = True,
+) -> dict:
+    """Validate one generated script before it is exposed to the UI."""
+    text = (text or "").strip()
+    reasons = []
+    char_count = _content_char_count(text)
+    lower = text.lower()
+    if not text:
+        reasons.append("空文案")
+    if any(pattern.lower() in lower for pattern in _META_REPLY_PATTERNS):
+        reasons.append("检测到追问、拒答或元回复")
+    if require_topic and not any(term in text for term in _topic_terms(topic)):
+        reasons.append("正文未围绕选题")
+    if target_chars_min and char_count < target_chars_min:
+        reasons.append(f"字数不足: {char_count} < {target_chars_min}")
+    if target_chars_max and char_count > target_chars_max:
+        reasons.append(f"字数超限: {char_count} > {target_chars_max}")
+    if re.search(r"[{【\[][^}\]】]*[}】\]]|(?:xx|XX)", text):
+        reasons.append("包含占位符或元描述")
+    if re.search(r"(?:—{2,}|-{2,})\s*[！!。.]|[——-]{2,}\s*$", text):
+        reasons.append("包含残缺标题或句子")
+    promo_count = sum(text.count(word) for word in _PROMOTION_WORDS)
+    if promo_count > 2:
+        reasons.append(f"促销词堆叠: {promo_count} 次")
+    if not detail and not features:
+        claims = [
+            claim for claim in _UNSUPPORTED_PRODUCT_CLAIMS
+            if claim in text and claim not in topic
+        ]
+        if claims:
+            reasons.append("包含未提供的具体属性: " + "、".join(claims[:5]))
+    if lang == "zh":
+        zh_count = sum("\u4e00" <= char <= "\u9fff" for char in text)
+        foreign_count = sum(char.isalpha() and not ("\u4e00" <= char <= "\u9fff") for char in text)
+        if zh_count == 0 or foreign_count > max(20, zh_count):
+            reasons.append("输出语言不是中文")
+    elif lang == "en":
+        if sum(char.isascii() and char.isalpha() for char in text) < char_count * 0.45:
+            reasons.append("输出语言不是英文")
+    elif lang == "th":
+        if sum("\u0e00" <= char <= "\u0e7f" for char in text) < char_count * 0.35:
+            reasons.append("输出语言不是泰文")
+    similarities = [script_similarity(text, previous) for previous in (accepted_texts or [])]
+    max_similarity = max(similarities, default=0.0)
+    if max_similarity > similarity_threshold:
+        reasons.append(f"与同批文案过于相似: {max_similarity:.2f} > {similarity_threshold:.2f}")
+    return {
+        "valid": not reasons,
+        "reasons": reasons,
+        "char_count": char_count,
+        "max_similarity": round(max_similarity, 4),
+    }
+
+
+_SAFE_OPENERS = [
+    "想让日常穿搭更有记忆点，可以先从一双时尚女鞋开始。",
+    "衣柜里的搭配总觉得少点感觉？时尚女鞋往往就是点亮造型的关键。",
+    "通勤、逛街或朋友聚会，一双时尚女鞋都能让整体状态更利落。",
+    "真正省心的穿搭，不是堆很多单品，而是选对一双时尚女鞋。",
+    "今天不聊复杂搭配，只聊时尚女鞋怎样帮你轻松切换不同场景。",
+    "如果你也在寻找日常造型的新灵感，不妨把目光放到时尚女鞋上。",
+    "穿搭想显得更完整，时尚女鞋是一个简单又直接的切入点。",
+    "从早上的通勤到晚上的聚会，时尚女鞋能陪你找到自己的节奏。",
+]
+_SAFE_BODIES = [
+    "它适合放进日常搭配思路里，让普通造型多一点个人表达。出门前不用反复纠结，也能更快找到舒服自在的状态。",
+    "你可以根据当天的心情调整整体风格，让每次出门都有一点新鲜感。重点不是追赶潮流，而是穿出属于自己的自信。",
+    "它能自然融入不同生活场景，让你的步伐和气质都更从容。简单搭配也可以有层次，日常记录更容易留下亮点。",
+    "选鞋时可以先想想自己的生活节奏，再决定今天想表达怎样的感觉。适合自己的选择，往往更容易带来长期的愉悦。",
+    "无论今天安排紧凑还是轻松随性，都可以用它完成造型上的呼应。穿搭不必复杂，清晰的个人风格就很有吸引力。",
+    "它给日常造型增加了更多组合空间，也让你在不同场合保持自然。每一次出门，都是重新表达自己的机会。",
+    "把注意力放回自己的感受，穿搭就会变得更轻松。它不需要喧宾夺主，也能帮助整体造型找到合适的重点。",
+    "当你想改变状态时，可以先从脚下的选择开始。小小的搭配变化，也能让普通一天多一点仪式感。",
+]
+_SAFE_ENDINGS = [
+    "如果你喜欢轻松又有个人感的穿搭，时尚女鞋值得加入你的日常选择。",
+    "找到适合自己的搭配节奏，让时尚女鞋陪你自信走进每一个场景。",
+    "不必复制别人的答案，用时尚女鞋穿出你自己的日常风格。",
+    "把喜欢的感觉穿在身上，让时尚女鞋成为你表达自己的方式。",
+]
+
+
+def build_safe_script(topic: str, variation_index: int = 0,
+                      target_chars_min: Optional[int] = None,
+                      target_chars_max: Optional[int] = None) -> str:
+    """Build a deterministic, claim-free script that still passes quality gates."""
+    topic = topic.strip()
+    opener = _SAFE_OPENERS[variation_index % len(_SAFE_OPENERS)].replace("时尚女鞋", topic)
+    body = _SAFE_BODIES[variation_index % len(_SAFE_BODIES)]
+    ending = _SAFE_ENDINGS[variation_index % len(_SAFE_ENDINGS)].replace("时尚女鞋", topic)
+    text = opener + body + ending
+    fillers = [
+        "真正适合日常的穿搭灵感，会让你更愿意记录生活里的每一步。",
+        "当整体造型和自己的状态互相呼应，自信也会自然流露出来。",
+        "不用刻意迎合固定答案，舒服地表达自己就是很好的风格。",
+    ]
+    index = 0
+    while target_chars_min and _content_char_count(text) < target_chars_min:
+        text += fillers[(variation_index + index) % len(fillers)]
+        index += 1
+    return _enforce_char_limit(text, target_chars_min, target_chars_max)
+
+
 def _translate_if_needed(text: str, target_lang: str) -> str:
     """将文本翻译为目标语言，失败时返回原文"""
     if target_lang == "zh":
@@ -527,6 +754,130 @@ def _translate_if_needed(text: str, target_lang: str) -> str:
     except Exception as e:
         print(f"[文案] 翻译失败（将返回原文）: {e}")
         return text
+
+
+def generate_script_by_topic_detailed(
+    topic: str,
+    style: str = "生活技巧",
+    detail: Optional[str] = None,
+    features: Optional[str] = None,
+    lang: str = "zh",
+    extra_instruction: Optional[str] = None,
+    target_chars_min: Optional[int] = None,
+    target_chars_max: Optional[int] = None,
+    accepted_texts: Optional[list[str]] = None,
+    progress_callback=None,
+    max_attempts: int = 3,
+) -> dict:
+    """Generate one quality-gated script and return text plus diagnostics."""
+    # 非中文时先生成中文，再翻译（Qwen/DeepSeek 对"请使用XX语输出"指令遵从不稳定）
+    _target_lang = lang if lang and lang != "zh" else None
+
+    # 从 extra_instruction 的"第N条"中解析 variation_index，让 batch 中每条角度不同
+    _variation_index = 0
+    if extra_instruction:
+        _m_idx = re.search(r"第(\d+)条", extra_instruction)
+        if _m_idx:
+            _variation_index = int(_m_idx.group(1)) - 1  # 0-based
+
+    _max_tokens = 512
+    if target_chars_max:
+        _max_tokens = max(512, min(2048, int(target_chars_max * 2)))
+
+    last_reasons = []
+    backends = []
+    if DEEPSEEK_API_KEY:
+        backends.append(("DeepSeek", lambda prompt: _call_deepseek_api(prompt, max_tokens=_max_tokens)))
+    backends.append(("本地 Qwen", lambda prompt: _call_local_model(prompt, max_length=_max_tokens)))
+
+    for backend_name, call_backend in backends:
+        for attempt in range(1, max(1, max_attempts) + 1):
+            retry_hint = ""
+            if last_reasons:
+                retry_hint = (
+                    "\n上一版未通过质量校验，必须修正以下问题："
+                    + "；".join(last_reasons)
+                )
+            prompt = _build_prompt(
+                topic, style, detail, features, lang="zh",
+                extra_instruction=(extra_instruction or "") + retry_hint,
+                variation_index=_variation_index + attempt - 1,
+                target_chars_min=target_chars_min,
+                target_chars_max=target_chars_max,
+            )
+            if progress_callback:
+                progress_callback(
+                    backend_name, attempt, max_attempts,
+                    "正在生成" if not last_reasons else "；".join(last_reasons),
+                )
+            raw = call_backend(prompt)
+            result = _clean_result(raw) if raw else ""
+            if _target_lang:
+                source_quality = validate_script_quality(
+                    result, topic, lang="zh", detail=detail, features=features,
+                )
+                if source_quality["valid"]:
+                    result = _translate_if_needed(result, _target_lang)
+                    quality = validate_script_quality(
+                        result, topic, lang=lang,
+                        target_chars_min=target_chars_min,
+                        target_chars_max=target_chars_max,
+                        detail=detail, features=features,
+                        accepted_texts=accepted_texts, require_topic=False,
+                    )
+                else:
+                    quality = source_quality
+            else:
+                quality = validate_script_quality(
+                    result, topic, lang=lang,
+                    target_chars_min=target_chars_min,
+                    target_chars_max=target_chars_max,
+                    detail=detail, features=features,
+                    accepted_texts=accepted_texts,
+                )
+            if quality["valid"]:
+                return {"text": result, "source": backend_name, "quality": quality}
+            last_reasons = quality["reasons"] or ["模型未返回有效正文"]
+            print(
+                f"[文案质量] {backend_name} 第 {attempt}/{max_attempts} 次不合格: "
+                + "；".join(last_reasons)
+            )
+
+    # Deterministic safe templates rotate until one is sufficiently different.
+    for offset in range(max(8, len(accepted_texts or []) + 1)):
+        fallback = build_safe_script(
+            topic, _variation_index + offset,
+            target_chars_min=target_chars_min,
+            target_chars_max=target_chars_max,
+        )
+        if _target_lang:
+            source_quality = validate_script_quality(
+                fallback, topic, lang="zh", detail=detail, features=features,
+            )
+            fallback = _translate_if_needed(fallback, _target_lang)
+            quality = validate_script_quality(
+                fallback, topic, lang=lang,
+                target_chars_min=target_chars_min,
+                target_chars_max=target_chars_max,
+                detail=detail, features=features,
+                accepted_texts=accepted_texts, require_topic=False,
+            )
+            if not source_quality["valid"]:
+                quality["valid"] = False
+                quality["reasons"] = source_quality["reasons"] + quality["reasons"]
+        else:
+            quality = validate_script_quality(
+                fallback, topic, lang=lang,
+                target_chars_min=target_chars_min,
+                target_chars_max=target_chars_max,
+                detail=detail, features=features,
+                accepted_texts=accepted_texts,
+            )
+        if quality["valid"]:
+            if progress_callback:
+                progress_callback("安全模板", 1, 1, "AI 重试耗尽，已使用安全模板补齐")
+            return {"text": fallback, "source": "安全模板", "quality": quality}
+    raise RuntimeError("安全模板未通过质量校验: " + "；".join(quality["reasons"]))
 
 
 def generate_script_by_topic(
@@ -539,94 +890,13 @@ def generate_script_by_topic(
     target_chars_min: Optional[int] = None,
     target_chars_max: Optional[int] = None,
 ) -> str:
-    """根据选题生成口播文案
-
-    自动选择后端：
-    1. 如果设置了 DEEPSEEK_API_KEY 环境变量 → 调用 DeepSeek API
-    2. 否则 → 使用本地 Qwen-0.5B 模型
-    3. 都不可用 → 回退模板文案
-
-    Args:
-        topic: 选题/标题，如 "厨房收纳"
-        style: 文案风格
-        detail: 选题细节（可选）
-        features: 特性描述（可选）
-        lang: 语言 (zh/th/en)
-        extra_instruction: 额外指令（可选）
-
-    Returns:
-        生成的文案
-    """
-    # 非中文时先生成中文，再翻译（Qwen/DeepSeek 对"请使用XX语输出"指令遵从不稳定）
-    _target_lang = lang if lang and lang != "zh" else None
-
-    # 从 extra_instruction 的"第N条"中解析 variation_index，让 batch 中每条角度不同
-    _variation_index = 0
-    if extra_instruction:
-        _m_idx = re.search(r"第(\d+)条", extra_instruction)
-        if _m_idx:
-            _variation_index = int(_m_idx.group(1)) - 1  # 0-based
-
-    prompt = _build_prompt(
-        topic, style, detail, features,
-        lang="zh",
+    """Compatibility entrypoint returning only the quality-gated script text."""
+    return generate_script_by_topic_detailed(
+        topic, style, detail, features, lang=lang,
         extra_instruction=extra_instruction,
-        variation_index=_variation_index,
         target_chars_min=target_chars_min,
         target_chars_max=target_chars_max,
-    )
-
-    # 字数硬约束: max_tokens 按 target_chars_max * 2 给模型富余, 拿到结果后强制 trim
-    _max_tokens = 512
-    if target_chars_max:
-        _max_tokens = max(512, min(2048, int(target_chars_max * 2)))
-
-    # 模式 1: DeepSeek API (优先, 因为效果更好)
-    if DEEPSEEK_API_KEY:
-        result = _call_deepseek_api(prompt, max_tokens=_max_tokens)
-        if result:
-            result = _clean_result(result)
-            result = _enforce_char_limit(result, target_chars_min, target_chars_max)
-            if _target_lang:
-                result = _translate_if_needed(result, _target_lang)
-            return result
-
-    # 模式 2: 本地 Qwen
-    result = _call_local_model(prompt, max_length=_max_tokens)
-    if result:
-        result = _clean_result(result)
-        result = _enforce_char_limit(result, target_chars_min, target_chars_max)
-        if _target_lang:
-            result = _translate_if_needed(result, _target_lang)
-        return result
-
-    # 模式 3：模板回退（带多语言翻译+多样性）
-    style_info = STYLES.get(style, STYLES["生活技巧"])
-    tpl = style_info["template"]
-    fmt = {"topic": topic}
-    if detail:
-        fmt["topic_detail"] = detail
-    else:
-        # 移除模板中所有 {topic_detail} 引用，避免 "时尚女鞋最大的亮点就是时尚女鞋" 这种病句
-        tpl = tpl.replace("{topic_detail}", topic)
-    if features:
-        fmt["topic_features"] = features
-    else:
-        tpl = tpl.replace("{topic_features}", topic)
-    fallback = tpl.format(**fmt)
-    # 根据 extra_instruction 制造差异（解析"第N条"）
-    if extra_instruction:
-        _m = re.search(r"第(\d+)条", extra_instruction)
-        if _m:
-            _idx = int(_m.group(1))
-            _prefixes = ["家人们，", "朋友们，", "大家好，", "小伙伴们，", "亲爱的们，",
-                          "各位注意啦，", "哈喽，", "宝宝们，", "集美们，", "宝子们，"]
-            _prefix = _prefixes[_idx % len(_prefixes)]
-            fallback = f"{_prefix}{fallback}（第{_idx}条）"
-    # 非中文则翻译（统一使用 _translate_if_needed）
-    if _target_lang:
-        fallback = _translate_if_needed(fallback, _target_lang)
-    return fallback
+    )["text"]
 
 
 def list_styles() -> list[str]:
@@ -717,7 +987,12 @@ def set_deepseek_key(api_key: str):
     # 也可以通过写入 .env 文件持久化
     from autokat.core.paths import DATA_ROOT
     env_path = DATA_ROOT / ".env"
-    env_path.write_text(f"DEEPSEEK_API_KEY={api_key}\n")
+    try:
+        env_path.write_text(f"DEEPSEEK_API_KEY={api_key}\n")
+    except OSError as _e:
+        # v2.4: .env 不可写时 (sandbox 只读 / 权限不够) 不中断主流程,
+        # 内存里的 DEEPSEEK_API_KEY 已生效, 当前进程仍可用
+        print(f"[文案] .env 持久化失败 (当前进程 key 仍生效): {_e}")
     print("[文案] DeepSeek API Key 已设置")
 
 

@@ -57,6 +57,8 @@ def build_diversity_report(scripts: list[dict], material_pool: list[dict]) -> di
         script_ids = []
         script_sources = []
         for clip in script.get("clips", []):
+            if clip.get("is_tail"):
+                continue
             mid = clip.get("material_id")
             if mid is None:
                 continue
