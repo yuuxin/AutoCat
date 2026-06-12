@@ -18,7 +18,7 @@ import platform
 from pathlib import Path
 
 APP_NAME = "AutoCat"
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.0.1"
 PROJECT_DIR = Path(__file__).resolve().parent
 VENV_DIR = PROJECT_DIR / ".venv"
 DIST_DIR = PROJECT_DIR / "dist"
@@ -78,6 +78,7 @@ def build_app(create_dmg: bool = False):
 
     # 签名
     _try_sign(app_dir)
+    _validate_embedded_runtime(app_dir, py_ver)
 
     total_size = sum(f.stat().st_size for f in app_dir.rglob("*") if f.is_file())
     print(f"\n✅ .app 构建完成：{app_dir}")
@@ -147,7 +148,8 @@ export AUTOKAT_APP_ICON="$RESOURCES/autokat.icns"
 export DYLD_FRAMEWORK_PATH="$RESOURCES${{DYLD_FRAMEWORK_PATH:+:$DYLD_FRAMEWORK_PATH}}"
 export DYLD_LIBRARY_PATH="$RESOURCES/native_libs${{DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}}"
 export PYTHONDONTWRITEBYTECODE=1
-mkdir -p "$AUTOKAT_DATA_DIR"
+export NUMBA_CACHE_DIR="$AUTOKAT_DATA_DIR/cache/numba"
+mkdir -p "$AUTOKAT_DATA_DIR" "$NUMBA_CACHE_DIR"
 
 # DeepSeek API Key
 ENV_FILE="$RESOURCES/.env"
@@ -201,6 +203,18 @@ def _embed_code(resources_dir: Path, site_packages: str, py_ver: str):
         "PyWavelets",
         "scipy",
         "librosa",
+        "soxr",
+        "numba",
+        "llvmlite",
+        "joblib",
+        "msgpack",
+        "sklearn",
+        "threadpoolctl",
+        "narwhals",
+        "aifc",
+        "sunau",
+        "chunk",
+        "audioop",
         "lazy_loader",
         "audioread",
         "decorator",
@@ -355,6 +369,56 @@ def _try_sign(app_dir: Path):
         print(f"   ✅ 已签名")
     except Exception as e:
         raise RuntimeError(f"应用签名失败: {e}") from e
+
+
+def _validate_embedded_runtime(app_dir: Path, py_ver: str):
+    """在包内真实执行 PCM/VAD 路径，防止懒加载依赖漏打包。"""
+    resources = app_dir / "Contents" / "Resources"
+    python_bin = resources / "Python.framework" / "Versions" / "Current" / "bin" / "python3"
+    validation_code = r"""
+import math
+import struct
+import tempfile
+import wave
+from pathlib import Path
+
+from autokat.core.subtitle_sync import detect_speech_intervals
+
+path = Path(tempfile.gettempdir()) / "autokat_packaged_vad_check.wav"
+with wave.open(str(path), "wb") as output:
+    output.setnchannels(1)
+    output.setsampwidth(2)
+    output.setframerate(48000)
+    output.writeframes(b"".join(
+        struct.pack("<h", int(10000 * math.sin(2 * math.pi * 440 * index / 48000)))
+        for index in range(48000)
+    ))
+intervals = detect_speech_intervals(str(path))
+if not intervals:
+    raise RuntimeError("包内 PCM/VAD 校准未检测到有效音频区间")
+print(f"PCM/VAD 校准通过: {intervals[0]}")
+"""
+    env = {
+        "HOME": str(Path("/tmp") / "autokat_packaged_runtime_home"),
+        "PATH": "/usr/bin:/bin",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": str(resources / "lib" / f"python{py_ver}" / "site-packages"),
+        "DYLD_FRAMEWORK_PATH": str(resources),
+        "DYLD_LIBRARY_PATH": str(resources / "native_libs"),
+        "AUTOKAT_FFMPEG": str(resources / "ffmpeg"),
+        "NUMBA_CACHE_DIR": str(Path("/tmp") / "autokat_packaged_runtime_home" / "numba_cache"),
+    }
+    result = subprocess.run(
+        [str(python_bin), "-B", "-c", validation_code],
+        env=env, capture_output=True, text=True, timeout=120,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"包内运行时验证失败:\n{result.stderr.strip()}")
+    subprocess.run(
+        ["codesign", "--verify", "--deep", "--strict", str(app_dir)],
+        check=True, capture_output=True, text=True, timeout=120,
+    )
+    print(f"   ✅ {result.stdout.strip()}")
 
 
 def _build_dmg(app_dir: Path):

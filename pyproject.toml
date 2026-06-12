@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta:__legacy__"
 
 [project]
 name = "autokat"
-version = "3.0.0"
+version = "3.0.1"
 description = "低成本单机智能批量混剪系统 — 基于 FFmpeg + AI 的短视频批量生产工具"
 readme = "README.md"
 authors = [{name = "AutoCat Team"}]
