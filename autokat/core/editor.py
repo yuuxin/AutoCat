@@ -41,6 +41,109 @@ SUBTITLE_POSITIONS = ["top", "middle", "bottom"]
 PLANNER_VERSION = "integer-rhythm-v1"
 INTENT_VERSION = "intent-v1"
 
+# -- Per video-type rhythm/transition profile table --
+# Each profile describes the visual cadence and transition taste for a
+# video type, so the planner can pick shot lengths and transitions
+# appropriate for product / talking-head / atmosphere / music / mix:
+#   shot_min / shot_max:        per-shot duration bounds (seconds)
+#   shots_per_minute:          target shot density (count / minute)
+#   transition_pool:           preferred xfade names
+#   transition_pick_prob:      probability of sampling from the pool
+#   min_subtitle_gap:          minimum gap between subtitles (seconds)
+#   semantic_weight:           keyword/capability match weight
+#   visual_weight:             visual variation weight
+PROFILE_VERSION = "rhythm-profile-v1"
+VIDEO_TYPE_PROFILES: dict = {
+    "product_recommendation": {
+        "shot_min": 2.0,
+        "shot_max": 4.0,
+        "shots_per_minute": 18.0,
+        "transition_pool": [
+            "fade", "dissolve", "fadefast", "fadeslow",
+            "smoothleft", "smoothright", "smoothup", "smoothdown",
+            "squeezeh", "squeezev", "zoomin",
+        ],
+        "transition_pick_prob": 0.75,
+        "min_subtitle_gap": 0.6,
+        "semantic_weight": 2.0,
+        "visual_weight": 1.0,
+    },
+    "talking_explanation": {
+        "shot_min": 3.0,
+        "shot_max": 6.0,
+        "shots_per_minute": 12.0,
+        "transition_pool": [
+            "fade", "dissolve", "fadefast", "fadeslow",
+            "smoothleft", "smoothright", "smoothup", "smoothdown",
+        ],
+        "transition_pick_prob": 0.85,
+        "min_subtitle_gap": 1.0,
+        "semantic_weight": 1.0,
+        "visual_weight": 0.6,
+    },
+    "atmosphere": {
+        "shot_min": 4.0,
+        "shot_max": 7.0,
+        "shots_per_minute": 10.0,
+        "transition_pool": [
+            "fade", "dissolve", "fadeslow",
+            "smoothleft", "smoothright", "smoothup", "smoothdown",
+            "circleopen", "circleclose", "vertopen", "vertclose",
+            "horzopen", "horzclose",
+        ],
+        "transition_pick_prob": 0.9,
+        "min_subtitle_gap": 1.2,
+        "semantic_weight": 0.8,
+        "visual_weight": 0.7,
+    },
+    "music_beat": {
+        "shot_min": 1.5,
+        "shot_max": 3.0,
+        "shots_per_minute": 28.0,
+        "transition_pool": [
+            "wipeleft", "wiperight", "wipeup", "wipedown",
+            "wipetl", "wipetr", "wipebl", "wipebr",
+            "slideleft", "slideright", "slideup", "slidedown",
+            "diagtl", "diagtr", "diagbl", "diagbr",
+            "coverleft", "coverright", "coverup", "coverdown",
+            "revealleft", "revealright", "revealup", "revealdown",
+            "zoomin", "hlslice", "hrslice", "vuslice", "vdslice",
+            "hlwind", "hrwind", "vuwind", "vdwind",
+        ],
+        "transition_pick_prob": 0.7,
+        "min_subtitle_gap": 0.4,
+        "semantic_weight": 0.5,
+        "visual_weight": 1.4,
+    },
+    "random_mix": {
+        "shot_min": 2.0,
+        "shot_max": 5.0,
+        "shots_per_minute": 16.0,
+        "transition_pool": [
+            "fade", "dissolve", "fadefast", "fadeslow",
+            "wipeleft", "wiperight", "slideleft", "slideright",
+            "smoothleft", "smoothright", "zoomin",
+        ],
+        "transition_pick_prob": 0.5,
+        "min_subtitle_gap": 0.8,
+        "semantic_weight": 1.0,
+        "visual_weight": 1.0,
+    },
+}
+# "auto" and unknown types fall back to random_mix for backward compat.
+VIDEO_TYPE_PROFILES["auto"] = VIDEO_TYPE_PROFILES["random_mix"]
+
+
+def video_type_profile(video_type: str) -> dict:
+    """Return the rhythm/transition profile for a video type, defaulting to random_mix.
+
+    Unrecognized or empty values fall back to random_mix so downstream
+    callers can always index into the result safely.
+    """
+    key = str(video_type or "").strip().lower()
+    return VIDEO_TYPE_PROFILES.get(key) or VIDEO_TYPE_PROFILES["random_mix"]
+
+
 
 
 def _source_id(mat: dict) -> int:
@@ -151,7 +254,17 @@ def _local_intent_keywords(text: str, global_keywords: Optional[list[str]] = Non
     return list(dict.fromkeys(values))
 
 
-def _random_transition() -> str:
+def _random_transition(profile: Optional[dict] = None) -> str:
+    """Pick a transition, weighted by the per-video-type profile when given.
+
+    Falls back to a uniform sample across the full TRANSITIONS list when no
+    profile is supplied so existing callers keep the same distribution.
+    """
+    if profile:
+        pool = profile.get("transition_pool") or TRANSITIONS
+        prob = float(profile.get("transition_pick_prob", 0.5) or 0.0)
+        if pool and random.random() < prob:
+            return random.choice(pool)
     return random.choice(TRANSITIONS)
 
 
@@ -187,12 +300,16 @@ def _plan_shots_by_frames(visual_sentences: list[dict], fps: int,
     if boundaries[-1] != total_frames:
         boundaries.append(total_frames)
 
-    long_form = narration_duration >= 30.0
-    preferred = (3.0, 6.0) if long_form else (2.0, 4.0)
-    if video_type == "music_beat":
-        preferred = (1.5, 3.0)
-    elif video_type == "atmosphere":
-        preferred = (4.0, 7.0)
+    # Pull shot duration bounds from the per-type rhythm profile, with
+    # a long-form safeguard so videos over 30s keep room for stable shots.
+    _profile = video_type_profile(video_type)
+    _long_form = narration_duration >= 30.0
+    _default_min = 3.0 if _long_form else 2.0
+    _default_max = 6.0 if _long_form else 4.0
+    preferred = (
+        float(_profile.get("shot_min", _default_min)),
+        float(_profile.get("shot_max", _default_max)),
+    )
     normal_min_frames = int(round(1.5 * fps))
     tail_fragment_frames = int(round(1.0 * fps))
     hook_end_frames = int(round(3.0 * fps))
@@ -324,6 +441,7 @@ def generate_script(
     video_type = str(cfg.get("video_type", "auto"))
     if video_type == "auto":
         video_type = detect_video_type(narration_text)
+    profile = video_type_profile(video_type)
 
     # 素材池
     if material_pool is None:
@@ -416,7 +534,7 @@ def generate_script(
                 "source_type": mat["type"],
                 "offset": round(offset, 2),
                 "duration": round(seg_dur + overhead, 2),
-                "transition": _random_transition(),
+                "transition": _random_transition(profile),
                 "transition_duration": trans_dur,
                 "subtitle_position": sub_pos,
                 "start_time": round(shot_start + acc_dur, 3),
@@ -487,7 +605,7 @@ def generate_script(
                     "source_type": mat["type"],
                     "offset": round(offset, 2),
                     "duration": round(seg_dur + overhead, 2),
-                        "transition": _random_transition(),
+                        "transition": _random_transition(profile),
                     "transition_duration": trans_dur,
                     "subtitle_position": sub_pos,
                     "start_time": round(shot_start + acc_dur, 3),
@@ -539,7 +657,7 @@ def generate_script(
                 "source_type": tail_mat["type"],
                 "offset": round(offset, 2),
                 "duration": round(tail_duration + overhead, 2),
-                "transition": _random_transition(),
+                "transition": _random_transition(profile),
                 "transition_duration": trans_dur,
                 "subtitle_position": sub_pos,
                 "start_time": round(narration_duration, 3),
@@ -551,6 +669,8 @@ def generate_script(
         "schema_version": 2,
         "planner_version": PLANNER_VERSION,
         "intent_version": INTENT_VERSION,
+        "profile_version": PROFILE_VERSION,
+        "active_profile": dict(profile),
         "video_type": video_type,
         "fps": fps,
         "transition_duration": trans_dur,
