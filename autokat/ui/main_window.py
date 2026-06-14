@@ -1843,6 +1843,15 @@ class MainWindow(QMainWindow):
             # 后台线程生成
             ai_results = []
             ai_result_meta = []
+            # 必须把 MainWindow 的属性在 worker 类定义之前捕获到闭包局部变量里，
+            # 否则 worker 里的 self 是 GenWorker 实例，访问 self._wiz_video_type_step2
+            # 会 AttributeError，访问 self._wiz_selected_materials 会因为 getattr 默认值
+            # 默默退化成空集合，AI 文案生成拿不到素材能力摘要。
+            _captured_video_type = self._wiz_video_type_step2.currentData() or "auto"
+            _captured_provider = provider_input.currentData()
+            _captured_selected_materials = list(
+                getattr(self, "_wiz_selected_materials", set()) or set()
+            )
             class GenWorker(QThread):
                 result_signal = Signal(int, str, str, int, float)
                 error_signal = Signal(str)
@@ -1881,12 +1890,12 @@ class MainWindow(QMainWindow):
                                     target_chars_max=target_max,
                                     accepted_texts=accepted,
                                     progress_callback=quality_progress,
-                                    provider=provider_input.currentData(),
-                                    video_type=self._wiz_video_type_step2.currentData() or "auto",
+                                    provider=_captured_provider,
+                                    video_type=_captured_video_type,
                                     material_capabilities=__import__(
                                         "autokat.core.material_analysis", fromlist=["capability_summary"]
                                     ).capability_summary(
-                                        list(getattr(self, "_wiz_selected_materials", set())) or None
+                                        _captured_selected_materials or None
                                     ),
                                 )
                                 accepted.append(generated["text"])
