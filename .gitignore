@@ -38,6 +38,7 @@ dist/
 export/
 logs/
 output/
+cache/
 tasks/
 test_output/
 

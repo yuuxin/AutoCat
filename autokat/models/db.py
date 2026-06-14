@@ -2,6 +2,7 @@
 
 import sqlite3
 import json
+import shutil
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -10,6 +11,7 @@ from autokat.core.paths import TASKS_ROOT
 
 DB_DIR = TASKS_ROOT
 DB_PATH = DB_DIR / "autokat.db"
+SCHEMA_VERSION = 3
 
 
 def get_conn() -> sqlite3.Connection:
@@ -21,6 +23,243 @@ def get_conn() -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _backup_database() -> Path:
+    backup_dir = DB_DIR / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    backup_path = backup_dir / f"autokat_pre_migration_{stamp}.db"
+    if DB_PATH.exists() and DB_PATH.stat().st_size:
+        shutil.copy2(DB_PATH, backup_path)
+    return backup_path
+
+
+def _execute_migration_script(conn: sqlite3.Connection, script: str) -> None:
+    """Execute DDL without sqlite3.executescript's implicit transaction commit."""
+    statement = ""
+    for line in script.splitlines():
+        statement += f"{line}\n"
+        if sqlite3.complete_statement(statement):
+            sql = statement.strip()
+            if sql:
+                conn.execute(sql)
+            statement = ""
+    if statement.strip():
+        raise sqlite3.OperationalError("incomplete migration statement")
+
+
+def _migration_v1(conn: sqlite3.Connection) -> None:
+    """Persistent jobs, virtual slices, cache, planning and QA foundations."""
+    _execute_migration_script(conn, """
+        CREATE TABLE IF NOT EXISTS import_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            status TEXT NOT NULL DEFAULT 'queued'
+                CHECK(status IN ('queued','running','paused','done','failed')),
+            total INTEGER NOT NULL DEFAULT 0,
+            done INTEGER NOT NULL DEFAULT 0,
+            error_msg TEXT DEFAULT NULL,
+            created_at TEXT DEFAULT (datetime('now','localtime')),
+            resumed_at TEXT DEFAULT NULL,
+            completed_at TEXT DEFAULT NULL
+        );
+        CREATE TABLE IF NOT EXISTS import_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id INTEGER NOT NULL,
+            source_path TEXT NOT NULL,
+            target_path TEXT DEFAULT NULL,
+            file_hash TEXT DEFAULT NULL,
+            status TEXT NOT NULL DEFAULT 'queued'
+                CHECK(status IN ('queued','processing','ready','done','failed')),
+            stage TEXT NOT NULL DEFAULT 'queued',
+            error_msg TEXT DEFAULT NULL,
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            material_id INTEGER DEFAULT NULL,
+            created_at TEXT DEFAULT (datetime('now','localtime')),
+            updated_at TEXT DEFAULT (datetime('now','localtime')),
+            FOREIGN KEY(job_id) REFERENCES import_jobs(id),
+            FOREIGN KEY(material_id) REFERENCES materials(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_import_items_job ON import_items(job_id);
+        CREATE INDEX IF NOT EXISTS idx_import_items_status ON import_items(status);
+
+        CREATE TABLE IF NOT EXISTS material_analysis (
+            material_id INTEGER PRIMARY KEY,
+            analysis_version TEXT NOT NULL DEFAULT 'v1',
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK(status IN ('pending','running','done','failed')),
+            subject TEXT DEFAULT '',
+            shot_type TEXT DEFAULT '',
+            action TEXT DEFAULT '',
+            scene TEXT DEFAULT '',
+            content_role TEXT DEFAULT '',
+            quality_score REAL DEFAULT 0,
+            capability_summary TEXT DEFAULT '',
+            embedding BLOB DEFAULT NULL,
+            error_msg TEXT DEFAULT NULL,
+            updated_at TEXT DEFAULT (datetime('now','localtime')),
+            FOREIGN KEY(material_id) REFERENCES materials(id)
+        );
+        CREATE TABLE IF NOT EXISTS virtual_slices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            material_id INTEGER NOT NULL,
+            start_frame INTEGER NOT NULL,
+            end_frame INTEGER NOT NULL,
+            duration_frames INTEGER NOT NULL,
+            fps REAL NOT NULL,
+            hotspot_score REAL DEFAULT 0,
+            capability_tags TEXT DEFAULT '[]',
+            analysis_version TEXT NOT NULL DEFAULT 'v1',
+            created_at TEXT DEFAULT (datetime('now','localtime')),
+            UNIQUE(material_id,start_frame,end_frame,analysis_version),
+            FOREIGN KEY(material_id) REFERENCES materials(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_virtual_slices_material ON virtual_slices(material_id);
+
+        CREATE TABLE IF NOT EXISTS cache_entries (
+            cache_key TEXT PRIMARY KEY,
+            cache_type TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK(status IN ('pending','building','ready','failed')),
+            size_bytes INTEGER DEFAULT 0,
+            hit_count INTEGER DEFAULT 0,
+            build_count INTEGER DEFAULT 0,
+            error_msg TEXT DEFAULT NULL,
+            last_accessed_at TEXT DEFAULT NULL,
+            created_at TEXT DEFAULT (datetime('now','localtime'))
+        );
+        CREATE TABLE IF NOT EXISTS task_materials (
+            task_id INTEGER NOT NULL,
+            material_id INTEGER NOT NULL,
+            PRIMARY KEY(task_id, material_id),
+            FOREIGN KEY(task_id) REFERENCES tasks(id),
+            FOREIGN KEY(material_id) REFERENCES materials(id)
+        );
+        CREATE TABLE IF NOT EXISTS task_plans (
+            task_id INTEGER PRIMARY KEY,
+            planner_version TEXT NOT NULL,
+            plan_json TEXT NOT NULL DEFAULT '{}',
+            prewarm_json TEXT NOT NULL DEFAULT '{}',
+            metrics_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT DEFAULT (datetime('now','localtime')),
+            updated_at TEXT DEFAULT (datetime('now','localtime')),
+            FOREIGN KEY(task_id) REFERENCES tasks(id)
+        );
+        CREATE TABLE IF NOT EXISTS quality_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id INTEGER NOT NULL,
+            level TEXT NOT NULL CHECK(level IN ('quick','sampled_deep','full_deep')),
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK(status IN ('pending','running','done','failed')),
+            report_path TEXT DEFAULT NULL,
+            metrics_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT DEFAULT (datetime('now','localtime')),
+            completed_at TEXT DEFAULT NULL,
+            FOREIGN KEY(task_id) REFERENCES tasks(id)
+        );
+        CREATE TABLE IF NOT EXISTS quality_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            clip_id INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            auto_fix_count INTEGER NOT NULL DEFAULT 0,
+            blocking_reason TEXT DEFAULT NULL,
+            metrics_json TEXT NOT NULL DEFAULT '{}',
+            report_path TEXT DEFAULT NULL,
+            FOREIGN KEY(run_id) REFERENCES quality_runs(id),
+            FOREIGN KEY(clip_id) REFERENCES clips(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_quality_results_run ON quality_results(run_id);
+        INSERT OR IGNORE INTO material_analysis(material_id,status)
+            SELECT id,'pending' FROM materials WHERE clip_parent IS NULL;
+    """)
+    mat_cols = _table_columns(conn, "materials")
+    for name, definition in (
+        ("status", "TEXT NOT NULL DEFAULT 'ready'"),
+        ("probe_json", "TEXT NOT NULL DEFAULT '{}'"),
+        ("thumbnail_path", "TEXT DEFAULT NULL"),
+        ("source_kind", "TEXT NOT NULL DEFAULT 'legacy'"),
+    ):
+        if name not in mat_cols:
+            conn.execute(f"ALTER TABLE materials ADD COLUMN {name} {definition}")
+
+
+def _migration_v2(conn: sqlite3.Connection) -> None:
+    """Backfill virtual slices for reusable legacy source videos."""
+    for material in conn.execute(
+        "SELECT id,duration FROM materials WHERE mat_type='video' AND clip_parent IS NULL "
+        "AND duration>0 AND NOT EXISTS("
+        "SELECT 1 FROM virtual_slices WHERE virtual_slices.material_id=materials.id)"
+    ).fetchall():
+        fps = 30.0
+        total_frames = int(round(float(material["duration"]) * fps))
+        window = int(round(5.0 * fps))
+        start = 0
+        while start < total_frames:
+            end = min(total_frames, start + window)
+            if total_frames - end < int(fps):
+                end = total_frames
+            conn.execute(
+                "INSERT OR IGNORE INTO virtual_slices"
+                "(material_id,start_frame,end_frame,duration_frames,fps,hotspot_score) "
+                "VALUES(?,?,?,?,?,?)",
+                (material["id"], start, end, end - start, fps, 0.5),
+            )
+            start = end
+
+
+def _migration_v3(conn: sqlite3.Connection) -> None:
+    """Classify legacy rows without changing their paths or rendering behavior."""
+    conn.execute(
+        "UPDATE materials SET source_kind='legacy_slice' "
+        "WHERE clip_parent IS NOT NULL AND source_kind='legacy'"
+    )
+    conn.execute(
+        "UPDATE materials SET source_kind='original' "
+        "WHERE clip_parent IS NULL AND source_kind='legacy'"
+    )
+
+
+MIGRATIONS = {
+    1: ("persistent library, planning, cache and QA foundations", _migration_v1),
+    2: ("backfill virtual slices for legacy source videos", _migration_v2),
+    3: ("classify legacy original materials and physical slices", _migration_v3),
+}
+
+
+def _apply_migrations(conn: sqlite3.Connection) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT DEFAULT (datetime('now','localtime')),
+            description TEXT NOT NULL
+        )
+    """)
+    applied = {
+        row["version"] for row in conn.execute("SELECT version FROM schema_migrations").fetchall()
+    }
+    pending = [version for version in sorted(MIGRATIONS) if version not in applied]
+    if not pending:
+        return
+    _backup_database()
+    for version in pending:
+        description, migrate = MIGRATIONS[version]
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            migrate(conn)
+            conn.execute(
+                "INSERT INTO schema_migrations(version, description) VALUES(?, ?)",
+                (version, description),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def init_db():
@@ -116,6 +355,7 @@ def init_db():
             stem = _os.path.splitext(_os.path.basename(row["file_path"]))[0]
             conn.execute("UPDATE materials SET display_name=? WHERE id=?", (stem, row["id"]))
     conn.commit()
+    _apply_migrations(conn)
     conn.close()
 
 

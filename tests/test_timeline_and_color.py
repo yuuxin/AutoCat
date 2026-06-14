@@ -206,6 +206,19 @@ class TimelineAndColorTests(unittest.TestCase):
     def test_renderer_does_not_use_shortest(self):
         self.assertNotIn("-shortest", inspect.getsource(render_simple))
 
+    def test_renderer_rejects_visual_plan_short_by_more_than_one_frame(self):
+        script = {
+            "target_video_frames": 300,
+            "target_audio_samples": 480000,
+            "final_duration": 10.0,
+            "clips": [{"duration_frames": 297, "transition_frames": 0}],
+        }
+        with patch("autokat.core.renderer.os.path.exists", return_value=True), patch(
+            "autokat.core.renderer.get_media_duration", return_value=9.5
+        ):
+            error = render_simple(script, "/tmp/out.mp4", "/tmp/audio.wav", fps=30)
+        self.assertIn("短于目标 3 帧", error)
+
     def test_ass_timestamp_uses_centiseconds_required_by_libass(self):
         self.assertEqual(_fmt_ass_time(0.106667), "0:00:00.11")
         self.assertEqual(_fmt_ass_time(62.248), "0:01:02.25")

@@ -352,49 +352,15 @@ def _split_video(filepath: str) -> list[dict]:
 def import_files(filepaths: list[str],
                  generate_kenburns: bool = True,
                  workers: int = 1) -> dict:
-    """批量导入文件"""
-    stats = {"images": 0, "videos": 0, "clips": 0, "kenburns": 0, "errors": []}
-    image_files = []
-    video_files = []
-
-    for fp in filepaths:
-        p = Path(fp)
-        if not p.exists():
-            stats["errors"].append(f"文件不存在: {fp}")
-            continue
-        suffix = p.suffix.lower()
-        if suffix in SUPPORTED_IMAGES:
-            image_files.append(fp)
-        elif suffix in SUPPORTED_VIDEOS:
-            video_files.append(fp)
-        else:
-            stats["errors"].append(f"不支持的格式: {fp}")
-
-    # 处理图片
-    for img_path in tqdm(image_files, desc="处理图片"):
-        result = _process_image(img_path)
-        if result:
-            stats["images"] += 1
-            if generate_kenburns:
-                _mid = _generate_kenburns(result["path"], ASSETS_KENBURNS)
-                if _mid:
-                    stats["kenburns"] += 1
-
-    # 处理视频
-    for vp in tqdm(video_files, desc="拆分视频"):
-        try:
-            clips = _split_video(vp)
-            if clips:
-                stats["videos"] += 1
-                stats["clips"] += len(clips)
-        except Exception as e:
-            stats["errors"].append(f"处理视频异常: {e}")
-
-    return stats
+    """快速登记原始素材；兼容旧调用签名，不再导入时转码或物理切片。"""
+    from autokat.core.import_jobs import ImportJobService
+    service = ImportJobService()
+    return service.process_job(service.create_job(filepaths))
 
 
 def build_material_pool(mat_types: Optional[list[str]] = None,
-                           mat_ids: Optional[list[int]] = None) -> list[dict]:
+                        mat_ids: Optional[list[int]] = None,
+                        include_legacy_slices: bool = False) -> list[dict]:
     """构建素材池
 
     只包含 video 类型（含 Ken Burns），因为 image 需要实时转 video。
@@ -408,37 +374,85 @@ def build_material_pool(mat_types: Optional[list[str]] = None,
         mat_ids: 按素材 ID 过滤，为 None 则不过滤
     """
     _key = (tuple(sorted(mat_types)) if mat_types else (),
-            tuple(sorted(mat_ids)) if mat_ids else ())
+            tuple(sorted(mat_ids)) if mat_ids else (),
+            bool(include_legacy_slices))
     pool = _build_material_pool_cached(_key)
     if mat_ids is not None:
         id_set = set(mat_ids)
-        pool = [m for m in pool if m["id"] in id_set]
+        pool = [m for m in pool if m["id"] in id_set or m["source_id"] in id_set]
     return pool
 
 
 @functools.lru_cache(maxsize=4)
 def _build_material_pool_cached(_key: tuple) -> list[dict]:
     pool = []
+    from autokat.models.db import get_conn
+    conn = get_conn()
+    virtual_by_material = {}
+    for row in conn.execute("SELECT * FROM virtual_slices ORDER BY material_id,start_frame").fetchall():
+        virtual_by_material.setdefault(row["material_id"], []).append(dict(row))
+    analysis_by_material = {
+        row["material_id"]: dict(row)
+        for row in conn.execute(
+            "SELECT * FROM material_analysis WHERE status='done'"
+        ).fetchall()
+    }
+    conn.close()
     for m in get_all_materials():
         if _key[0] and m["mat_type"] not in _key[0]:
             continue
-        if m["mat_type"] != "video":
+        if m["mat_type"] not in ("video", "image"):
             continue
-        if m["duration"] <= 0:
+        # Legacy physical slices remain readable by old scripts, but new tasks
+        # use original assets plus virtual slices to avoid short-shot and color
+        # artifacts from the retired import-time transcode path.
+        if m.get("source_kind") == "legacy_slice" and not _key[2]:
+            continue
+        if m["mat_type"] == "video" and m["duration"] <= 0:
             continue
         fp = m["file_path"]
         # 跳过文件不存在的素材（防渲染失败）
         if not __import__("os").path.exists(fp):
             print(f"[素材] 跳过: {fp} 文件不存在")
             continue
-        pool.append({
-            "id": m["id"],
-            "source_id": m["clip_parent"] or m["id"],
-            "path": fp,
-            "duration": m["duration"],
-            "type": m["mat_type"],
-            "tags": json.loads(m["tags"] or "[]"),
-        })
+        virtuals = virtual_by_material.get(m["id"], []) if not m.get("clip_parent") else []
+        analysis = analysis_by_material.get(m["clip_parent"] or m["id"], {})
+        analysis_tags = [
+            analysis.get(key) for key in ("subject", "shot_type", "action", "scene", "content_role")
+            if analysis.get(key)
+        ]
+        combined_tags = list(dict.fromkeys(json.loads(m["tags"] or "[]") + analysis_tags))
+        if virtuals:
+            for virtual in virtuals:
+                virtual_tags = json.loads(virtual.get("capability_tags") or "[]")
+                slice_tags = list(dict.fromkeys(combined_tags + virtual_tags))
+                pool.append({
+                    "id": -int(virtual["id"]),
+                    "virtual_slice_id": int(virtual["id"]),
+                    "source_id": m["id"],
+                    "path": fp,
+                    "duration": virtual["duration_frames"] / float(virtual["fps"]),
+                    "base_offset": virtual["start_frame"] / float(virtual["fps"]),
+                    "type": m["mat_type"],
+                    "tags": slice_tags,
+                    "quality_score": max(
+                        float(analysis.get("quality_score") or 0),
+                        float(virtual.get("hotspot_score") or 0),
+                    ),
+                    "hotspot_score": float(virtual.get("hotspot_score") or 0),
+                    "capability_summary": analysis.get("capability_summary") or "",
+                })
+        else:
+            pool.append({
+                "id": m["id"],
+                "source_id": m["clip_parent"] or m["id"],
+                "path": fp,
+                "duration": m["duration"] if m["mat_type"] == "video" else 30.0,
+                "type": m["mat_type"],
+                "tags": combined_tags,
+                "quality_score": float(analysis.get("quality_score") or 0),
+                "capability_summary": analysis.get("capability_summary") or "",
+            })
     return pool
 
 
@@ -453,64 +467,7 @@ def import_files_with_callback(
     on_progress: callable,
     generate_kenburns: bool = True,
 ) -> dict:
-    """批量导入文件，逐文件回调进度
-
-    on_progress 签名: (current: int, total: int, filename: str, status: str)
-    - status 取值: "processing", "done", "error"
-    """
-    stats = {"images": 0, "videos": 0, "clips": 0, "kenburns": 0, "errors": []}
-    image_files = []
-    video_files = []
-
-    for fp in filepaths:
-        p = Path(fp)
-        if not p.exists():
-            stats["errors"].append(f"文件不存在: {fp}")
-            continue
-        suffix = p.suffix.lower()
-        if suffix in SUPPORTED_IMAGES:
-            image_files.append(fp)
-        elif suffix in SUPPORTED_VIDEOS:
-            video_files.append(fp)
-        else:
-            stats["errors"].append(f"不支持的格式: {fp}")
-
-    total = len(image_files) + len(video_files)
-    done = 0
-
-    # 处理图片
-    for img_path in image_files:
-        fname = Path(img_path).name
-        on_progress(done, total, fname, "processing")
-        result = _process_image(img_path)
-        if result:
-            stats["images"] += 1
-            if generate_kenburns:
-                on_progress(done, total, fname, "generating kenburns")
-                kb = _generate_kenburns(result["path"], ASSETS_KENBURNS)
-                if kb:
-                    stats["kenburns"] += 1
-            done += 1
-            on_progress(done, total, fname, "done")
-        else:
-            stats["errors"].append(f"图片处理失败: {img_path}")
-            done += 1
-            on_progress(done, total, fname, "error")
-
-    # 处理视频
-    for vp in video_files:
-        fname = Path(vp).name
-        on_progress(done, total, fname, "processing")
-        try:
-            clips = _split_video(vp)
-            if clips:
-                stats["videos"] += 1
-                stats["clips"] += len(clips)
-            done += 1
-            on_progress(done, total, fname, "done")
-        except Exception as e:
-            stats["errors"].append(f"处理视频异常: {e}")
-            done += 1
-            on_progress(done, total, fname, "error")
-
-    return stats
+    """Create and process a persistent import job with UI-compatible callbacks."""
+    from autokat.core.import_jobs import ImportJobService
+    service = ImportJobService()
+    return service.process_job(service.create_job(filepaths), on_progress=on_progress)

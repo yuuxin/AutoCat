@@ -9,6 +9,7 @@ v2.3 增强：
 
 import json
 import random
+import copy
 from typing import Optional
 
 from autokat.core.material import build_material_pool
@@ -37,6 +38,8 @@ TRANSITIONS = [
 ]
 
 SUBTITLE_POSITIONS = ["top", "middle", "bottom"]
+PLANNER_VERSION = "integer-rhythm-v1"
+INTENT_VERSION = "intent-v1"
 
 
 
@@ -101,15 +104,51 @@ def _pick_material(pool: list[dict], exclude_ids: set,
     def soft_score(mat: dict) -> float:
         mid = int(mat["id"])
         source_id = _source_id(mat)
-        keyword_score = len(keyword_set & set(mat.get("tags", []))) * 2.0
+        semantic_score, _ = _semantic_match(mat, list(keyword_set))
+        keyword_score = semantic_score * 2.0
         recent_penalty = sum(mid in recent for recent in recent_sets)
         source_penalty = sum(source_id in recent for recent in recent_source_sets)
         duration_fit = min(float(mat["duration"]), float(requested_duration))
-        return keyword_score - recent_penalty - source_penalty * 0.5 + duration_fit * 0.01
+        quality_score = float(mat.get("quality_score") or 0)
+        return (
+            keyword_score - recent_penalty - source_penalty * 0.5
+            + duration_fit * 0.01 + quality_score * 0.25
+        )
 
     candidates.sort(key=soft_score, reverse=True)
     top_k = max(1, int(state.get("selection_top_k", 5)))
     return random.choice(candidates[:top_k])
+
+
+def _semantic_match(mat: dict, keywords: Optional[list[str]]) -> tuple[float, str]:
+    """Score persisted capabilities against one shot's local subtitle intent."""
+    wanted = {str(value).strip() for value in (keywords or []) if str(value).strip()}
+    tags = {str(value).strip() for value in mat.get("tags", []) if str(value).strip()}
+    direct = wanted & tags
+    if direct:
+        return float(len(direct)), "local_intent"
+    summary = str(mat.get("capability_summary") or "")
+    related = {word for word in wanted if word and word in summary}
+    if related:
+        return float(len(related)) * 0.5, "related_subject"
+    return 0.0, "quality_fallback"
+
+
+def _local_intent_keywords(text: str, global_keywords: Optional[list[str]] = None) -> list[str]:
+    """Map one subtitle group to the small persisted capability vocabulary."""
+    values = list(extract_keywords(text) or [])
+    for label, needles in (
+        ("女鞋", ("女鞋", "鞋子", "穿鞋", "双脚")),
+        ("商品", ("商品", "产品", "推荐", "入手", "好物")),
+        ("细节", ("细节", "局部", "设计", "做工")),
+        ("人物", ("穿搭", "上身", "模特", "姐妹")),
+        ("行走", ("走路", "步伐", "逛街", "通勤")),
+        ("展示", ("展示", "看看", "亮点")),
+    ):
+        if any(needle in text for needle in needles):
+            values.append(label)
+    values.extend(global_keywords or [])
+    return list(dict.fromkeys(values))
 
 
 def _random_transition() -> str:
@@ -133,6 +172,128 @@ def _random_crop_offset(mat_duration: float, clip_duration: float) -> float:
     return round(random.uniform(0, max_offset), 2)
 
 
+def _plan_shots_by_frames(visual_sentences: list[dict], fps: int,
+                          narration_duration: float,
+                          video_type: str = "auto") -> list[list[dict]]:
+    """Plan semantic shot groups in integer-frame space without touching captions."""
+    if not visual_sentences:
+        return []
+    total_frames = max(1, int(round(narration_duration * fps)))
+    boundaries = [0]
+    for sentence in visual_sentences:
+        boundary = max(0, min(total_frames, int(round(float(sentence["end"]) * fps))))
+        if boundary > boundaries[-1]:
+            boundaries.append(boundary)
+    if boundaries[-1] != total_frames:
+        boundaries.append(total_frames)
+
+    long_form = narration_duration >= 30.0
+    preferred = (3.0, 6.0) if long_form else (2.0, 4.0)
+    if video_type == "music_beat":
+        preferred = (1.5, 3.0)
+    elif video_type == "atmosphere":
+        preferred = (4.0, 7.0)
+    normal_min_frames = int(round(1.5 * fps))
+    tail_fragment_frames = int(round(1.0 * fps))
+    hook_end_frames = int(round(3.0 * fps))
+    hook_min_frames = int(round(1.0 * fps))
+    hook_max_frames = int(round(2.5 * fps))
+    preferred_min = int(round(preferred[0] * fps))
+    preferred_max = int(round(preferred[1] * fps))
+
+    # DP over caption boundaries. Cost strongly rejects abnormal short shots and
+    # sub-second trailing fragments, while allowing stable shots across captions.
+    count = len(boundaries)
+    best = [float("inf")] * count
+    prev = [-1] * count
+    best[0] = 0.0
+    for end_idx in range(1, count):
+        for start_idx in range(end_idx):
+            if best[start_idx] == float("inf"):
+                continue
+            start_frame, end_frame = boundaries[start_idx], boundaries[end_idx]
+            duration = end_frame - start_frame
+            is_hook = start_frame < hook_end_frames
+            min_frames = hook_min_frames if is_hook else normal_min_frames
+            max_frames = hook_max_frames if is_hook else preferred_max
+            cost = 0.0
+            if duration < min_frames:
+                cost += 1000.0 + (min_frames - duration) * 10.0
+            if end_idx == count - 1 and duration < tail_fragment_frames:
+                cost += 3000.0
+            if duration < preferred_min:
+                cost += (preferred_min - duration) / max(1, fps)
+            elif duration > max_frames:
+                cost += (duration - max_frames) / max(1, fps) * 0.35
+            target = (preferred_min + max_frames) / 2
+            cost += abs(duration - target) / max(1, fps) * 0.05
+            candidate = best[start_idx] + cost
+            if candidate < best[end_idx]:
+                best[end_idx], prev[end_idx] = candidate, start_idx
+
+    ranges = []
+    cursor = count - 1
+    while cursor > 0 and prev[cursor] >= 0:
+        ranges.append((boundaries[prev[cursor]], boundaries[cursor]))
+        cursor = prev[cursor]
+    ranges.reverse()
+    if not ranges:
+        ranges = [(0, total_frames)]
+
+    shots = []
+    for start_frame, end_frame in ranges:
+        shot = [
+            sentence for sentence in visual_sentences
+            if int(round(float(sentence["start"]) * fps)) < end_frame
+            and int(round(float(sentence["end"]) * fps)) > start_frame
+        ]
+        if shot:
+            shots.append(shot)
+    return shots
+
+
+def _script_signatures(script: dict, fps: int) -> dict:
+    clips = [clip for clip in script.get("clips", []) if not clip.get("is_tail")]
+    hook_limit = int(round(3.0 * fps))
+    hook = tuple(
+        int(clip.get("source_id") or clip.get("material_id"))
+        for clip in clips if int(clip.get("start_frame", 0)) < hook_limit
+    )
+    order = tuple(int(clip.get("source_id") or clip.get("material_id")) for clip in clips)
+    ending = tuple(order[-2:])
+    return {"hook": hook, "order": order, "ending": ending}
+
+
+def detect_video_type(narration_text: str) -> str:
+    text = narration_text or ""
+    if any(word in text for word in ("推荐", "入手", "搭配", "好物", "商品")):
+        return "product_recommendation"
+    if any(word in text for word in ("讲解", "教程", "步骤", "知识", "为什么")):
+        return "talking_explanation"
+    if any(word in text for word in ("氛围", "记录", "日常", "旅行", "治愈")):
+        return "atmosphere"
+    if any(word in text for word in ("卡点", "节奏", "音乐")):
+        return "music_beat"
+    return "random_mix"
+
+
+def _signature_similarity(signatures: dict, previous: list[dict]) -> float:
+    if not previous:
+        return 0.0
+    current_order = signatures["order"]
+    scores = []
+    for item in previous:
+        hook_same = float(signatures["hook"] == item["hook"] and bool(signatures["hook"]))
+        end_same = float(signatures["ending"] == item["ending"] and bool(signatures["ending"]))
+        limit = min(len(current_order), len(item["order"]))
+        order_same = (
+            sum(a == b for a, b in zip(current_order[:limit], item["order"][:limit]))
+            / max(1, limit)
+        )
+        scores.append(max(hook_same, end_same, order_same))
+    return max(scores)
+
+
 def generate_script(
     sentences: list[dict],
     material_pool: Optional[list[dict]] = None,
@@ -154,12 +315,15 @@ def generate_script(
       实现差异度调度。state=None 时与旧版完全一致（向后兼容）。
     """
     cfg = config or {}
+    original_sentences = copy.deepcopy(sentences)
     trans_dur = cfg.get("transition_duration", 0.3)
     fps = cfg.get("fps", 30)
     margin = cfg.get("subtitle_margin", 80)
     narration_text = cfg.get("narration_text", "")
-    min_shot_duration = float(cfg.get("min_shot_duration", 2.0))  # 每镜头最短秒数
     source_safety_margin = float(cfg.get("source_safety_margin", 0.35))
+    video_type = str(cfg.get("video_type", "auto"))
+    if video_type == "auto":
+        video_type = detect_video_type(narration_text)
 
     # 素材池
     if material_pool is None:
@@ -192,22 +356,8 @@ def generate_script(
         )
         visual_sentences.append(visual)
 
-    # ── 第一步：把句子聚成"镜头"（shot） ──
-    # 累计到 >= min_shot_duration 就切下一个镜头；单个超长句单独成镜
-    shots: list[list[dict]] = []
-    cur_shot: list[dict] = []
-    cur_dur = 0.0
-    for sent in visual_sentences:
-        seg_dur = sent["end"] - sent["start"]
-        if seg_dur < 0.3:
-            continue
-        if cur_dur + seg_dur >= min_shot_duration and cur_shot:
-            shots.append(cur_shot)
-            cur_shot, cur_dur = [], 0.0
-        cur_shot.append(sent)
-        cur_dur += seg_dur
-    if cur_shot:
-        shots.append(cur_shot)
+    # ── 第一步：整数帧动态镜头规划 ──
+    shots = _plan_shots_by_frames(visual_sentences, fps, narration_duration, video_type)
 
     # ── 第二步：每个镜头循环选多段素材填满时长；字幕仍按句对齐 ──
     # v2.3 简化：不再限制镜头数, 按 TTS 音轨时长自动填切片, 镜头内可拼接多段素材。
@@ -224,6 +374,9 @@ def generate_script(
         shot_dur = shot_end - shot_start
         if shot_dur < 0.5:
             continue
+        shot_keywords = _local_intent_keywords(
+            "".join(str(item.get("text", "")) for item in shot), keywords,
+        )
 
         # 循环选取素材填满 shot_dur
         acc_dur = 0.0
@@ -231,7 +384,7 @@ def generate_script(
             remaining = shot_dur - acc_dur
             overhead = _transition_overhead(len(clips), trans_dur)
             mat = _pick_material(
-                material_pool, used_ids, remaining + overhead, keywords,
+                material_pool, used_ids, remaining + overhead, shot_keywords,
                 state=state, exclude_source_ids=used_source_ids,
             )
             if mat is None:
@@ -244,18 +397,20 @@ def generate_script(
             if content_dur < 0.05:
                 break
             render_dur = content_dur + overhead
-            offset = _random_crop_offset(usable_duration, render_dur)
+            local_offset = _random_crop_offset(usable_duration, render_dur)
+            offset = local_offset + float(mat.get("base_offset", 0))
             # 同步修复 v2: 末段 seg_dur 严格等于 remaining, 保证 visual 时长 == audio 时长。
             # 之前 max(0.3, seg_dur) 在 remaining < 0.3 时强行推到 0.3, 每段超 0.3s,
             # 5-6 段累计漂移 ±1.5s → 音轨和字幕/画面不同步 (用户反馈)。
             # 现在: 中间段 (raw_dur >= 0.3) 走原 min(remaining, mat_dur) 逻辑,
             # 末段 (raw_dur < 0.3) 严格等于 remaining, acc_dur 收尾必 == shot_dur。
             # 视觉差异度由 filter/rotate/flip/encoding 制造, 不依赖时长抖动。
-            raw_dur = min(remaining, usable_duration - offset - overhead)
+            raw_dur = min(remaining, usable_duration - local_offset - overhead)
             seg_dur = raw_dur
 
             clip = {
                 "material_id": mat["id"],
+                "virtual_slice_id": mat.get("virtual_slice_id"),
                 "source_id": _source_id(mat),
                 "source_path": mat["path"],
                 "source_type": mat["type"],
@@ -267,6 +422,9 @@ def generate_script(
                 "start_time": round(shot_start + acc_dur, 3),
                 "end_time": round(shot_start + acc_dur + seg_dur, 3),
             }
+            clip["semantic_score"], clip["semantic_match_level"] = _semantic_match(
+                mat, shot_keywords,
+            )
             clips.append(clip)
             acc_dur += seg_dur
 
@@ -292,6 +450,9 @@ def generate_script(
             shot_dur = shot_end - shot_start
             if shot_dur < 0.5:
                 continue
+            shot_keywords = _local_intent_keywords(
+                "".join(str(item.get("text", "")) for item in shot), keywords,
+            )
 
             # 循环选取素材填满 shot_dur
             acc_dur = 0.0
@@ -299,7 +460,7 @@ def generate_script(
                 remaining = shot_dur - acc_dur
                 overhead = _transition_overhead(len(clips), trans_dur)
                 mat = _pick_material(
-                    material_pool, used_ids, remaining + overhead, keywords,
+                    material_pool, used_ids, remaining + overhead, shot_keywords,
                     state=state, exclude_source_ids=used_source_ids,
                 )
                 if mat is None:
@@ -312,13 +473,15 @@ def generate_script(
                 if content_dur < 0.05:
                     break
                 render_dur = content_dur + overhead
-                offset = _random_crop_offset(usable_duration, render_dur)
+                local_offset = _random_crop_offset(usable_duration, render_dur)
+                offset = local_offset + float(mat.get("base_offset", 0))
                 # 同步修复 v2: 末段严格等于 remaining, 保证 visual == audio
-                raw_dur = min(remaining, usable_duration - offset - overhead)
+                raw_dur = min(remaining, usable_duration - local_offset - overhead)
                 seg_dur = raw_dur
 
                 clip = {
                     "material_id": mat["id"],
+                    "virtual_slice_id": mat.get("virtual_slice_id"),
                     "source_id": _source_id(mat),
                     "source_path": mat["path"],
                     "source_type": mat["type"],
@@ -330,6 +493,9 @@ def generate_script(
                     "start_time": round(shot_start + acc_dur, 3),
                     "end_time": round(shot_start + acc_dur + seg_dur, 3),
                 }
+                clip["semantic_score"], clip["semantic_match_level"] = _semantic_match(
+                    mat, shot_keywords,
+                )
                 clips.append(clip)
                 acc_dur += seg_dur
 
@@ -364,8 +530,10 @@ def generate_script(
                 tail_mat["duration"] - source_safety_margin,
                 tail_duration + overhead,
             )
+            offset += float(tail_mat.get("base_offset", 0))
             clips.append({
                 "material_id": tail_mat["id"],
+                "virtual_slice_id": tail_mat.get("virtual_slice_id"),
                 "source_id": _source_id(tail_mat),
                 "source_path": tail_mat["path"],
                 "source_type": tail_mat["type"],
@@ -380,17 +548,32 @@ def generate_script(
             })
 
     script = {
+        "schema_version": 2,
+        "planner_version": PLANNER_VERSION,
+        "intent_version": INTENT_VERSION,
+        "video_type": video_type,
         "fps": fps,
         "transition_duration": trans_dur,
         "clips": clips,
         "subtitles": subtitles,
         "audio_path": None,
         "bgm_path": None,
+        "planned_shots": [
+            {
+                "start_frame": int(round(float(shot[0]["start"]) * fps)),
+                "end_frame": int(round(float(shot[-1]["end"]) * fps)),
+                "subtitle_count": len(shot),
+            }
+            for shot in shots
+        ],
     }
-    return apply_integer_timeline(
+    result = apply_integer_timeline(
         script, narration_duration=narration_duration, fps=fps,
         tail_duration=tail_duration,
     )
+    if sentences != original_sentences:
+        raise RuntimeError("镜头编排修改了受保护的字幕时间轴")
+    return result
 
 
 def generate_batch(
@@ -420,7 +603,7 @@ def generate_batch(
     enable_diversity = bool(cfg.get("enable_diversity", True))
     max_uses = int(cfg.get("max_uses_per_slice", 5))
     recent_window = int(cfg.get("diversity_recent_window", 3))
-    max_attempts = max(1, int(cfg.get("diversity_retry_attempts", 4)))
+    max_attempts = max(1, int(cfg.get("diversity_retry_attempts", 6)))
     jaccard_target = float(cfg.get("diversity_jaccard_target", 0.5))
     source_jaccard_target = float(cfg.get("diversity_source_jaccard_target", 0.6))
 
@@ -429,6 +612,9 @@ def generate_batch(
         "source_usage_count": {},
         "recent_sets": [],
         "recent_source_sets": [],
+        "recent_signatures": [],
+        "used_hook_signatures": set(),
+        "used_ending_signatures": set(),
         "max_uses": max_uses,
         "enable_diversity": enable_diversity,
         "min_segment_duration": float(cfg.get("min_segment_duration", 0.3)),
@@ -457,11 +643,26 @@ def generate_batch(
             }
             slice_similarity = max_jaccard(slice_set, state["recent_sets"])
             source_similarity = max_jaccard(source_set, state["recent_source_sets"])
-            attempts.append((max(slice_similarity, source_similarity), candidate, slice_set, source_set))
-            if slice_similarity <= jaccard_target and source_similarity <= source_jaccard_target:
+            signatures = _script_signatures(candidate, int(cfg.get("fps", 30)))
+            signature_similarity = _signature_similarity(signatures, state["recent_signatures"])
+            global_signature_penalty = (
+                0.6 * float(signatures["hook"] in state["used_hook_signatures"])
+                + 0.4 * float(signatures["ending"] in state["used_ending_signatures"])
+            )
+            attempts.append((
+                max(slice_similarity, source_similarity, signature_similarity)
+                + global_signature_penalty,
+                candidate, slice_set, source_set, signatures,
+            ))
+            if (
+                slice_similarity <= jaccard_target
+                and source_similarity <= source_jaccard_target
+                and signature_similarity < 1.0
+                and global_signature_penalty == 0
+            ):
                 break
 
-        _, script, used_set, used_source_set = min(attempts, key=lambda item: item[0])
+        _, script, used_set, used_source_set, signatures = min(attempts, key=lambda item: item[0])
         script["index"] = i
 
         if enable_diversity:
@@ -473,9 +674,13 @@ def generate_batch(
             if used_mats:
                 state["recent_sets"].append(used_set)
                 state["recent_source_sets"].append(used_source_set)
+                state["recent_signatures"].append(signatures)
+                state["used_hook_signatures"].add(signatures["hook"])
+                state["used_ending_signatures"].add(signatures["ending"])
                 if len(state["recent_sets"]) > recent_window:
                     state["recent_sets"].pop(0)
                     state["recent_source_sets"].pop(0)
+                    state["recent_signatures"].pop(0)
                 for mid in used_mats:
                     state["usage_count"][mid] = state["usage_count"].get(mid, 0) + 1
                 for source_id in [

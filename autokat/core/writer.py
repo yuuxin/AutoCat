@@ -4,7 +4,7 @@
 1. 根据选题/关键词自动生成短视频口播文案
 2. 支持多风格（种草、教程、测评、故事等）
 3. 默认本地 Qwen-0.5B 离线运行
-4. 配置 DeepSeek API Key 后自动切换云端模式
+4. 用户明确选择 DeepSeek 时使用云端模式
 
 硬件要求（本地模式）：
 - 最低 4GB 内存即可运行
@@ -116,7 +116,8 @@ def _build_prompt(topic: str, style: str,
                   extra_instruction: Optional[str] = None,
                   variation_index: int = 0,
                   target_chars_min: Optional[int] = None,
-                  target_chars_max: Optional[int] = None) -> str:
+                  target_chars_max: Optional[int] = None,
+                  video_type: Optional[str] = None) -> str:
     """构建 LLM prompt
 
     Args:
@@ -199,8 +200,14 @@ def _build_prompt(topic: str, style: str,
     else:
         length_hint = "\n文案长度：5-8 句话，100-200 字。"
 
+    video_type_hint = ""
+    if video_type:
+        from autokat.core.ai_providers import video_type_prompt_hint
+        video_type_hint = "\n" + video_type_prompt_hint(video_type) + "\n"
+
     return f"""{style_info['prompt']}
 
+{video_type_hint}
 {template_block}
 
 要求：
@@ -221,9 +228,18 @@ def _build_prompt(topic: str, style: str,
 
 # ── DeepSeek API 模式 ──
 
-def _call_deepseek_api(prompt: str, max_tokens: int = 512) -> Optional[str]:
-    """调用 DeepSeek API 生成文案"""
-    if not DEEPSEEK_API_KEY:
+def _call_deepseek_api(prompt: str, max_tokens: int = 512,
+                       *, api_key=None, api_url=None, model=None) -> Optional[str]:
+    """调用 DeepSeek API 生成文案
+
+    默认从模块级全局读取 DEEPSEEK_API_KEY / DEEPSEEK_API_URL / DEEPSEEK_MODEL；
+    显式传入 ``api_key`` / ``api_url`` / ``model`` 时使用调用方提供的值，
+    DeepSeekWriterProvider 通过这种方式注入 ai_settings 中的 URL 和模型名。
+    """
+    effective_key = (api_key if api_key is not None else DEEPSEEK_API_KEY) or ""
+    effective_url = api_url or DEEPSEEK_API_URL
+    effective_model = model or DEEPSEEK_MODEL
+    if not effective_key:
         return None
 
     try:
@@ -231,7 +247,7 @@ def _call_deepseek_api(prompt: str, max_tokens: int = 512) -> Optional[str]:
         import urllib.error
 
         data = json.dumps({
-            "model": DEEPSEEK_MODEL,
+            "model": effective_model,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens,
             "temperature": 0.7,
@@ -239,11 +255,11 @@ def _call_deepseek_api(prompt: str, max_tokens: int = 512) -> Optional[str]:
         }).encode("utf-8")
 
         req = urllib.request.Request(
-            DEEPSEEK_API_URL,
+            effective_url,
             data=data,
             headers={
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                "Authorization": f"Bearer {effective_key}",
             },
             method="POST",
         )
@@ -745,15 +761,11 @@ def build_safe_script(topic: str, variation_index: int = 0,
     return _enforce_char_limit(text, target_chars_min, target_chars_max)
 
 
-def _translate_if_needed(text: str, target_lang: str) -> str:
-    """将文本翻译为目标语言，失败时返回原文"""
+def _translate_if_needed(text: str, target_lang: str, provider: str = "local") -> str:
+    """Translate through the explicitly selected provider."""
     if target_lang == "zh":
         return text
-    try:
-        return translate_text(text, target_lang=target_lang)
-    except Exception as e:
-        print(f"[文案] 翻译失败（将返回原文）: {e}")
-        return text
+    return translate_text(text, target_lang=target_lang, provider=provider)
 
 
 def generate_script_by_topic_detailed(
@@ -768,6 +780,9 @@ def generate_script_by_topic_detailed(
     accepted_texts: Optional[list[str]] = None,
     progress_callback=None,
     max_attempts: int = 3,
+    provider: str = "local",
+    material_capabilities: Optional[str] = None,
+    video_type: Optional[str] = None,
 ) -> dict:
     """Generate one quality-gated script and return text plus diagnostics."""
     # 非中文时先生成中文，再翻译（Qwen/DeepSeek 对"请使用XX语输出"指令遵从不稳定）
@@ -784,11 +799,15 @@ def generate_script_by_topic_detailed(
     if target_chars_max:
         _max_tokens = max(512, min(2048, int(target_chars_max * 2)))
 
+    # Provider selection goes through ai_providers.build_writer_provider so
+    # the macOS Keychain and ai_settings.json are the single source of truth.
+    # A failed provider never silently switches to a different provider.
+    from autokat.core.ai_providers import build_writer_provider
+    provider_obj = build_writer_provider(provider)
+    backend_name = type(provider_obj).__name__
+    backends = [(backend_name, provider_obj.generate)]
+
     last_reasons = []
-    backends = []
-    if DEEPSEEK_API_KEY:
-        backends.append(("DeepSeek", lambda prompt: _call_deepseek_api(prompt, max_tokens=_max_tokens)))
-    backends.append(("本地 Qwen", lambda prompt: _call_local_model(prompt, max_length=_max_tokens)))
 
     for backend_name, call_backend in backends:
         for attempt in range(1, max(1, max_attempts) + 1):
@@ -804,20 +823,30 @@ def generate_script_by_topic_detailed(
                 variation_index=_variation_index + attempt - 1,
                 target_chars_min=target_chars_min,
                 target_chars_max=target_chars_max,
+                video_type=video_type,
             )
+            if material_capabilities:
+                prompt += (
+                    "\n已选素材能力摘要：" + material_capabilities
+                    + "\n文案只能围绕这些可展示能力组织表达，不得编造素材无法支持的画面。"
+                )
             if progress_callback:
                 progress_callback(
                     backend_name, attempt, max_attempts,
                     "正在生成" if not last_reasons else "；".join(last_reasons),
                 )
-            raw = call_backend(prompt)
+            try:
+                raw = provider_obj.generate(prompt, max_tokens=_max_tokens)
+            except Exception as _call_err:
+                raw = None
+                print(f"[文案质量] {backend_name} 调用失败: {_call_err}")
             result = _clean_result(raw) if raw else ""
             if _target_lang:
                 source_quality = validate_script_quality(
                     result, topic, lang="zh", detail=detail, features=features,
                 )
                 if source_quality["valid"]:
-                    result = _translate_if_needed(result, _target_lang)
+                    result = _translate_if_needed(result, _target_lang, provider=provider)
                     quality = validate_script_quality(
                         result, topic, lang=lang,
                         target_chars_min=target_chars_min,
@@ -854,7 +883,7 @@ def generate_script_by_topic_detailed(
             source_quality = validate_script_quality(
                 fallback, topic, lang="zh", detail=detail, features=features,
             )
-            fallback = _translate_if_needed(fallback, _target_lang)
+            fallback = _translate_if_needed(fallback, _target_lang, provider=provider)
             quality = validate_script_quality(
                 fallback, topic, lang=lang,
                 target_chars_min=target_chars_min,
@@ -889,6 +918,8 @@ def generate_script_by_topic(
     extra_instruction: Optional[str] = None,
     target_chars_min: Optional[int] = None,
     target_chars_max: Optional[int] = None,
+    provider: str = "local",
+    material_capabilities: Optional[str] = None,
 ) -> str:
     """Compatibility entrypoint returning only the quality-gated script text."""
     return generate_script_by_topic_detailed(
@@ -896,6 +927,8 @@ def generate_script_by_topic(
         extra_instruction=extra_instruction,
         target_chars_min=target_chars_min,
         target_chars_max=target_chars_max,
+        provider=provider,
+        material_capabilities=material_capabilities,
     )["text"]
 
 
@@ -905,13 +938,11 @@ def list_styles() -> list[str]:
 
 
 def generate_publish_title(narration: str, lang: str = "zh",
-                            max_chars: int = 20) -> str:
+                           max_chars: int = 20, provider: str = "local") -> str:
     """根据口播文案生成一句发布标题 (10~max_chars 字)
 
-    自动选择后端（与 generate_script_by_topic 一致）：
-    1. DEEPSEEK_API_KEY 设置 → DeepSeek API
-    2. 否则 → 本地 Qwen-0.5B
-    3. 全部失败 → 用 narration 首句前 max_chars 字 fallback
+    Only the explicitly selected provider is called. Failure uses a
+    deterministic first-sentence fallback and never switches provider.
 
     Args:
         narration: 口播文案（会被截取前 300 字给模型，避免超长输入）
@@ -943,32 +974,35 @@ def generate_publish_title(narration: str, lang: str = "zh",
         f"口播文案：{snippet}"
     )
 
-    # 模式 1: DeepSeek
-    if DEEPSEEK_API_KEY:
+    if provider not in ("local", "deepseek"):
+        raise ValueError(f"不支持的文案模型: {provider}")
+    if provider == "deepseek" and not DEEPSEEK_API_KEY:
+        raise RuntimeError("已选择 DeepSeek，但尚未配置有效 API Key")
+    if provider == "deepseek":
         try:
             result = _call_deepseek_api(prompt, max_tokens=128)
             if result:
                 result = _clean_result(result)
                 result = _enforce_char_limit(result, max_chars=max_chars)
                 if _target_lang:
-                    result = _translate_if_needed(result, _target_lang)
+                    result = _translate_if_needed(result, _target_lang, provider=provider)
                 if result:
                     return result
         except Exception as _e:
-            print(f"[标题] DeepSeek 生成失败, 走 Qwen/兜底: {_e}")
+            print(f"[标题] DeepSeek 生成失败, 使用确定性兜底: {_e}")
 
-    # 模式 2: 本地 Qwen
-    try:
-        result = _call_local_model(prompt, max_length=128)
-        if result:
-            result = _clean_result(result)
-            result = _enforce_char_limit(result, max_chars=max_chars)
-            if _target_lang:
-                result = _translate_if_needed(result, _target_lang)
+    if provider == "local":
+        try:
+            result = _call_local_model(prompt, max_length=128)
             if result:
-                return result
-    except Exception as _e:
-        print(f"[标题] Qwen 生成失败, 走兜底: {_e}")
+                result = _clean_result(result)
+                result = _enforce_char_limit(result, max_chars=max_chars)
+                if _target_lang:
+                    result = _translate_if_needed(result, _target_lang, provider=provider)
+                if result:
+                    return result
+        except Exception as _e:
+            print(f"[标题] Qwen 生成失败, 使用确定性兜底: {_e}")
 
     # 模式 3: 兜底 — 用 narration 第一句的前 max_chars 字
     import re as _re
@@ -981,19 +1015,23 @@ def generate_publish_title(narration: str, lang: str = "zh",
 
 
 def set_deepseek_key(api_key: str):
-    """动态设置 DeepSeek API Key（运行时配置）"""
+    """Set the legacy in-process key without writing secrets to disk."""
     global DEEPSEEK_API_KEY
     DEEPSEEK_API_KEY = api_key
-    # 也可以通过写入 .env 文件持久化
-    from autokat.core.paths import DATA_ROOT
-    env_path = DATA_ROOT / ".env"
-    try:
-        env_path.write_text(f"DEEPSEEK_API_KEY={api_key}\n")
-    except OSError as _e:
-        # v2.4: .env 不可写时 (sandbox 只读 / 权限不够) 不中断主流程,
-        # 内存里的 DEEPSEEK_API_KEY 已生效, 当前进程仍可用
-        print(f"[文案] .env 持久化失败 (当前进程 key 仍生效): {_e}")
     print("[文案] DeepSeek API Key 已设置")
+
+
+def set_deepseek_config(api_key: str, api_url: Optional[str] = None,
+                        model: Optional[str] = None, persist_legacy_env: bool = False):
+    """Configure DeepSeek explicitly; new UI stores the key in macOS Keychain."""
+    global DEEPSEEK_API_KEY, DEEPSEEK_API_URL, DEEPSEEK_MODEL
+    DEEPSEEK_API_KEY = api_key.strip()
+    if api_url:
+        DEEPSEEK_API_URL = api_url.strip()
+    if model:
+        DEEPSEEK_MODEL = model.strip()
+    if persist_legacy_env:
+        set_deepseek_key(DEEPSEEK_API_KEY)
 
 
 def check_deepseek_available() -> bool:
@@ -1019,93 +1057,39 @@ def generate_script_batch(topics: list[dict]) -> list[dict]:
                 style=item.get("style", "生活技巧"),
                 detail=item.get("detail"),
                 features=item.get("features"),
+                provider=item.get("provider", "local"),
             ),
         }
         for item in topics
     ]
 
-def translate_text(text: str, target_lang: str = "th", source_lang: str = "zh-CN") -> str:
-    """翻译文本（自动使用 DeepSeek 或 MyMemory 免费翻译）
+def translate_text(text: str, target_lang: str = "th", source_lang: str = "zh-CN",
+                   provider: str = "local") -> str:
+    """Translate using only the explicitly selected writer provider.
 
-    Args:
-        text: 源文本
-        target_lang: 目标语言代码
-        source_lang: 源语言代码
-
-    Returns:
-        翻译后的文本
-
-    Raises:
-        RuntimeError: 所有翻译方式均失败
+    配置从 ai_providers 单一来源读取（DeepSeek 时 Keychain + ai_settings.json），
+    选定 Provider 失败后不会静默切换到其他 Provider。
     """
-    import subprocess
-    import urllib.parse
-    import urllib.request
-
-    # 方案1: DeepSeek API（需要有效 Key）
-    if DEEPSEEK_API_KEY and DEEPSEEK_API_KEY not in ("", "test_key_12345"):
-        _lang_map = {
-            "th": "泰文", "en": "英文", "zh": "中文", "zh-CN": "中文",
-        }
-        target_name = _lang_map.get(target_lang, target_lang)
-        source_name = _lang_map.get(source_lang, source_lang)
-        prompt = (
-            f"请将以下{source_name}文本翻译成{target_name}。"
-            f"只返回翻译结果，不要添加任何解释、注释或额外内容。\n\n"
-            f"{text}"
-        )
-        try:
-            payload = {
-                "model": DEEPSEEK_MODEL,
-                "messages": [
-                    {"role": "system", "content": f"你是一个专业的翻译助手。将{source_name}翻译成{target_name}，只返回翻译结果。"},
-                    {"role": "user", "content": prompt},
-                ],
-                "max_tokens": max(1024, len(text) * 3),
-                "temperature": 0.3,
-            }
-            req = urllib.request.Request(
-                DEEPSEEK_API_URL,
-                data=json.dumps(payload).encode(),
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-                },
-                method="POST",
-            )
-            resp = urllib.request.urlopen(req, timeout=30)
-            result = json.loads(resp.read().decode())
-            translated = result["choices"][0]["message"]["content"].strip()
-            if translated:
-                return translated
-        except Exception as e:
-            print(f"[翻译] DeepSeek 失败: {e}，使用 MyMemory 备份...")
-
-    # 方案2: MyMemory 免费翻译（通过 curl 绕过 Python SSL 问题）
-    # MyMemory 只支持简化的语言代码，zh-CN → zh, zh-TW → zh
-    _mm_lang_map = {"zh-CN": "zh", "zh-TW": "zh", "zh-SG": "zh"}
-    _mm_source = _mm_lang_map.get(source_lang, source_lang)
-    _mm_target = _mm_lang_map.get(target_lang, target_lang)
-    try:
-        encoded_q = urllib.parse.quote(text, safe='')
-        result = subprocess.run(
-            ["curl", "-s", "-m", "5",
-             f"https://api.mymemory.translated.net/get?q={encoded_q}&langpair={_mm_source}|{_mm_target}"],
-            capture_output=True, text=True, timeout=8,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            data = json.loads(result.stdout)
-            translated = data.get("responseData", {}).get("translatedText", "")
-            if translated and data.get("responseData", {}).get("match", 0) > 0.5:
-                return translated
-            print(f"[翻译] MyMemory 结果质量过低: {data.get('responseData', {}).get('match', 0)}")
-        else:
-            print(f"[翻译] MyMemory curl 失败: rc={result.returncode}")
-    except Exception as e:
-        print(f"[翻译] MyMemory 失败: {e}")
-
-    raise RuntimeError(
-        "所有翻译方式均失败\n"
-        "请尝试: 1) 在 settings 中设置有效的 DeepSeek API Key\n"
-        "         2) 或检查网络连接"
+    if provider not in ("local", "deepseek"):
+        raise ValueError(f"不支持的文案模型: {provider}")
+    _lang_map = {"th": "泰文", "en": "英文", "zh": "中文", "zh-CN": "中文"}
+    target_name = _lang_map.get(target_lang, target_lang)
+    source_name = _lang_map.get(source_lang, source_lang)
+    prompt = (
+        f"请将以下{source_name}文本翻译成{target_name}。"
+        f"只返回翻译结果，不要添加任何解释、注释或额外内容。\n\n{text}"
     )
+    from autokat.core.ai_providers import build_writer_provider
+    provider_obj = build_writer_provider(provider)
+    try:
+        raw = provider_obj.generate(prompt, max_tokens=max(1024, len(text) * 3))
+    except Exception as e:
+        if provider == "deepseek":
+            raise RuntimeError(f"DeepSeek 翻译失败: {e}") from e
+        raise RuntimeError(f"本地模型翻译失败: {e}") from e
+    translated = _clean_result(raw) if raw else ""
+    if translated:
+        return translated
+    if provider == "deepseek":
+        raise RuntimeError("DeepSeek 未返回有效翻译")
+    raise RuntimeError(f"{provider} 未返回有效翻译")

@@ -1,6 +1,7 @@
 import unittest
+import copy
 
-from autokat.core.editor import _pick_material, generate_batch
+from autokat.core.editor import _pick_material, generate_batch, generate_script
 
 
 def material(mid, source_id=None, duration=1.0, tags=None):
@@ -15,6 +16,40 @@ def material(mid, source_id=None, duration=1.0, tags=None):
 
 
 class EditorDiversityTests(unittest.TestCase):
+    def test_integer_rhythm_planner_keeps_subtitle_input_immutable(self):
+        sentences = [
+            {"text": f"第{i}句，", "start": i * 2.5, "end": (i + 1) * 2.5}
+            for i in range(12)
+        ]
+        original = copy.deepcopy(sentences)
+        script = generate_script(
+            sentences,
+            material_pool=[material(i, duration=12) for i in range(1, 20)],
+            config={"fps": 30, "transition_duration": 0, "tail_duration": 0,
+                    "source_safety_margin": 0},
+        )
+        self.assertEqual(sentences, original)
+        self.assertEqual(script["planner_version"], "integer-rhythm-v1")
+        self.assertTrue(all(isinstance(shot["start_frame"], int) for shot in script["planned_shots"]))
+
+    def test_long_video_uses_stable_shots_and_no_subsecond_tail_fragment(self):
+        sentences = [
+            {"text": f"第{i}句，", "start": i * 1.2, "end": (i + 1) * 1.2}
+            for i in range(30)
+        ]
+        script = generate_script(
+            sentences,
+            material_pool=[material(i, duration=20) for i in range(1, 30)],
+            config={"fps": 30, "transition_duration": 0, "tail_duration": 0,
+                    "source_safety_margin": 0},
+        )
+        durations = [
+            (shot["end_frame"] - shot["start_frame"]) / 30
+            for shot in script["planned_shots"]
+        ]
+        self.assertTrue(any(duration >= 3 for duration in durations))
+        self.assertGreaterEqual(durations[-1], 1.0)
+
     def test_unused_short_slice_beats_reused_matching_long_slice(self):
         pool = [
             material(1, duration=10, tags=["match"]),
@@ -32,6 +67,41 @@ class EditorDiversityTests(unittest.TestCase):
         for _ in range(20):
             picked = _pick_material(pool, set(), 5, ["match"], state)
             self.assertEqual(picked["id"], 2)
+
+    def test_local_subtitle_intent_selects_matching_capability(self):
+        pool = [
+            material(1, duration=10, tags=["风景"]),
+            material(2, duration=10, tags=["女鞋", "细节"]),
+        ]
+        script = generate_script(
+            [{"text": "看看这双女鞋的设计细节。", "start": 0, "end": 3}],
+            material_pool=pool,
+            config={
+                "fps": 30, "transition_duration": 0, "tail_duration": 0,
+                "source_safety_margin": 0, "narration_text": "",
+            },
+            state={"selection_top_k": 1},
+        )
+        self.assertEqual(script["clips"][0]["material_id"], 2)
+        self.assertEqual(script["clips"][0]["semantic_match_level"], "local_intent")
+
+    def test_semantic_matching_falls_back_to_quality_without_changing_timeline(self):
+        pool = [
+            {**material(1, duration=10), "quality_score": 0.1},
+            {**material(2, duration=10), "quality_score": 0.9},
+        ]
+        script = generate_script(
+            [{"text": "完全未知的主题。", "start": 0, "end": 3}],
+            material_pool=pool,
+            config={
+                "fps": 30, "transition_duration": 0, "tail_duration": 0,
+                "source_safety_margin": 0,
+            },
+            state={"selection_top_k": 1},
+        )
+        self.assertEqual(script["clips"][0]["material_id"], 2)
+        self.assertEqual(script["clips"][0]["semantic_match_level"], "quality_fallback")
+        self.assertEqual(script["target_video_frames"], 90)
 
     def test_batch_covers_all_slices_before_reuse(self):
         pool = [material(i) for i in range(1, 13)]

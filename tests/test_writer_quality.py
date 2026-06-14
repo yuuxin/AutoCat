@@ -2,8 +2,9 @@ import unittest
 from unittest.mock import patch
 
 from autokat.core.writer import (
-    build_safe_script, estimate_chars_for_duration_range, generate_script_by_topic_detailed,
-    script_similarity, validate_script_quality,
+    build_safe_script, estimate_chars_for_duration_range, generate_publish_title,
+    generate_script_by_topic_detailed, script_similarity, translate_text,
+    validate_script_quality,
 )
 
 
@@ -80,8 +81,11 @@ class WriterQualityTests(unittest.TestCase):
         result = generate_script_by_topic_detailed(
             TOPIC, "种草推荐",
             target_chars_min=MIN_CHARS, target_chars_max=MAX_CHARS,
+            provider="deepseek",
         )
-        self.assertEqual(result["source"], "DeepSeek")
+        # After the ai_providers refactor the DeepSeek backend is now a
+        # named provider, so the source field carries the class name.
+        self.assertEqual(result["source"], "DeepSeekWriterProvider")
         self.assertEqual(deepseek.call_count, 3)
         self.assertTrue(result["quality"]["valid"])
 
@@ -95,6 +99,50 @@ class WriterQualityTests(unittest.TestCase):
         self.assertEqual(result["source"], "安全模板")
         self.assertEqual(local.call_count, 3)
         self.assertTrue(result["quality"]["valid"])
+
+    @patch("autokat.core.writer.DEEPSEEK_API_KEY", "configured")
+    @patch("autokat.core.writer._call_local_model")
+    @patch("autokat.core.writer._call_deepseek_api", return_value=None)
+    def test_explicit_deepseek_never_silently_calls_local(self, deepseek, local):
+        result = generate_script_by_topic_detailed(
+            TOPIC, "种草推荐", extra_instruction="第5条",
+            target_chars_min=MIN_CHARS, target_chars_max=MAX_CHARS,
+            provider="deepseek",
+        )
+        self.assertEqual(result["source"], "安全模板")
+        self.assertEqual(deepseek.call_count, 3)
+        local.assert_not_called()
+
+    @patch("autokat.core.writer.DEEPSEEK_API_KEY", "configured")
+    @patch("autokat.core.writer._call_local_model", return_value=None)
+    @patch("autokat.core.writer._call_deepseek_api")
+    def test_default_provider_is_local_even_when_deepseek_is_configured(
+        self, deepseek, local,
+    ):
+        result = generate_script_by_topic_detailed(
+            TOPIC, "种草推荐",
+            target_chars_min=MIN_CHARS, target_chars_max=MAX_CHARS,
+        )
+        self.assertEqual(result["source"], "安全模板")
+        self.assertEqual(local.call_count, 3)
+        deepseek.assert_not_called()
+
+    @patch("autokat.core.writer.DEEPSEEK_API_KEY", "configured")
+    @patch("autokat.core.writer._call_local_model")
+    @patch("autokat.core.writer._call_deepseek_api", return_value=None)
+    def test_explicit_deepseek_title_never_calls_local(self, deepseek, local):
+        title = generate_publish_title("时尚女鞋让日常搭配更有精神。", provider="deepseek")
+        self.assertTrue(title)
+        deepseek.assert_called_once()
+        local.assert_not_called()
+
+    @patch("autokat.core.writer.DEEPSEEK_API_KEY", "configured")
+    @patch("autokat.core.writer._call_local_model", return_value="local translation")
+    @patch("autokat.core.writer._call_deepseek_api")
+    def test_local_translation_never_calls_deepseek(self, deepseek, local):
+        self.assertEqual(translate_text("你好", "en", provider="local"), "local translation")
+        local.assert_called_once()
+        deepseek.assert_not_called()
 
 
 if __name__ == "__main__":

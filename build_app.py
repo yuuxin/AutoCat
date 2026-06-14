@@ -145,6 +145,7 @@ export AUTOKAT_DATA_DIR="$HOME/Library/Application Support/AutoCat"
 export AUTOKAT_BUNDLED_ASSETS_DIR="$RESOURCES/assets"
 export AUTOKAT_FFMPEG="$RESOURCES/ffmpeg"
 export AUTOKAT_APP_ICON="$RESOURCES/autokat.icns"
+export AUTOKAT_MODEL_DIR="$RESOURCES/models"
 export DYLD_FRAMEWORK_PATH="$RESOURCES${{DYLD_FRAMEWORK_PATH:+:$DYLD_FRAMEWORK_PATH}}"
 export DYLD_LIBRARY_PATH="$RESOURCES/native_libs${{DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}}"
 export PYTHONDONTWRITEBYTECODE=1
@@ -231,6 +232,7 @@ def _embed_code(resources_dir: Path, site_packages: str, py_ver: str):
         "cffi", "pycparser",
         "_cffi_backend",
         "tabulate",
+        "onnxruntime",
         "requests", "urllib3", "charset_normalizer",
     }
     src_site = Path(site_packages)
@@ -312,6 +314,17 @@ def _embed_code(resources_dir: Path, site_packages: str, py_ver: str):
                 import shutil as _sh
                 _sh.copy2(str(f), str(assets_dst / "bgm" / f.name))
         print(f"      BGM 已复制")
+    models_dst = resources_dir / "models"
+    models_dst.mkdir(parents=True, exist_ok=True)
+    visual_models = [
+        PROJECT_DIR / "models" / "mobileclip_s0_image.onnx",
+        PROJECT_DIR / "models" / "mobileclip_s0_labels.npz",
+    ]
+    for visual_model in visual_models:
+        if not visual_model.exists():
+            raise RuntimeError(f"缺少内置视觉模型资源: {visual_model}")
+        shutil.copy2(str(visual_model), str(models_dst / visual_model.name))
+    print(f"      内置 MobileCLIP-S0 图像塔和标签向量已复制")
 
 
 def _create_icon(resources_dir: Path):
@@ -383,6 +396,10 @@ import wave
 from pathlib import Path
 
 from autokat.core.subtitle_sync import detect_speech_intervals
+from autokat.core.material_analysis import VISUAL_MODEL
+import json
+import numpy as np
+import onnxruntime as ort
 
 path = Path(tempfile.gettempdir()) / "autokat_packaged_vad_check.wav"
 with wave.open(str(path), "wb") as output:
@@ -396,7 +413,15 @@ with wave.open(str(path), "wb") as output:
 intervals = detect_speech_intervals(str(path))
 if not intervals:
     raise RuntimeError("包内 PCM/VAD 校准未检测到有效音频区间")
-print(f"PCM/VAD 校准通过: {intervals[0]}")
+session = ort.InferenceSession(str(VISUAL_MODEL), providers=["CPUExecutionProvider"])
+embedding = session.run(None, {"pixel_values": np.ones((1,3,256,256), dtype=np.float32)})[0]
+if embedding.shape != (1, 512):
+    raise RuntimeError(f"包内 ONNX 视觉模型输出错误: {embedding.shape}")
+labels = np.load(str(VISUAL_MODEL.with_name("mobileclip_s0_labels.npz")))
+metadata = json.loads(str(labels["metadata"]))
+if labels["embeddings"].shape[1] != 512 or not metadata:
+    raise RuntimeError("包内 MobileCLIP 标签向量错误")
+print(f"PCM/VAD + MobileCLIP 校准通过: {intervals[0]}")
 """
     env = {
         "HOME": str(Path("/tmp") / "autokat_packaged_runtime_home"),
@@ -406,6 +431,7 @@ print(f"PCM/VAD 校准通过: {intervals[0]}")
         "DYLD_FRAMEWORK_PATH": str(resources),
         "DYLD_LIBRARY_PATH": str(resources / "native_libs"),
         "AUTOKAT_FFMPEG": str(resources / "ffmpeg"),
+        "AUTOKAT_MODEL_DIR": str(resources / "models"),
         "NUMBA_CACHE_DIR": str(Path("/tmp") / "autokat_packaged_runtime_home" / "numba_cache"),
     }
     result = subprocess.run(

@@ -116,25 +116,38 @@ def ocr_video(ocr, video: Path, subtitles: list[dict], duration: float) -> list[
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     crop_top, crop_bottom = int(height * 0.72), int(height * 0.92)
     fps = float(cap.get(cv2.CAP_PROP_FPS) or 30)
-    samples, crops = [], []
+    requested_by_frame = {}
     for timestamp in sample_times(subtitles, duration):
-        cap.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000)
+        frame_index = max(0, int(round(timestamp * fps)))
+        requested_by_frame.setdefault(frame_index, []).append(timestamp)
+    samples, crops = [], []
+    frame_index = 0
+    final_frame = max(requested_by_frame, default=-1)
+    while frame_index <= final_frame:
         ok, frame = cap.read()
         if not ok:
-            continue
-        actual_timestamp = max(0.0, (float(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1) / fps)
-        crop = frame[crop_top:crop_bottom, 0:width]
-        is_contact = any(
-            abs(timestamp - float(sub[key])) <= 0.201
-            for sub in subtitles for key in ("start", "end")
-        )
-        samples.append({
-            "time": round(actual_timestamp, 6),
-            "requested_time": timestamp,
-            "ocr_text": "",
-            "contact_point": is_contact,
-        })
-        crops.append(crop)
+            break
+        if frame_index in requested_by_frame:
+            actual_timestamp = frame_index / fps
+            crop = frame[crop_top:crop_bottom, 0:width]
+            if width > 720:
+                crop = cv2.resize(
+                    crop, (720, max(1, int(crop.shape[0] * 720 / width))),
+                    interpolation=cv2.INTER_AREA,
+                )
+            for timestamp in requested_by_frame[frame_index]:
+                is_contact = any(
+                    abs(timestamp - float(sub[key])) <= 0.201
+                    for sub in subtitles for key in ("start", "end")
+                )
+                samples.append({
+                    "time": round(actual_timestamp, 6),
+                    "requested_time": timestamp,
+                    "ocr_text": "",
+                    "contact_point": is_contact,
+                })
+                crops.append(crop)
+        frame_index += 1
     cap.release()
 
     for start in range(0, len(crops), 64):
@@ -348,6 +361,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--task-id", type=int, required=True)
     parser.add_argument("--output-dir", default="outputs/content_sync_validation")
+    parser.add_argument(
+        "--clip-indexes", default="",
+        help="Comma-separated clip indexes to validate; empty validates all clips.",
+    )
     args = parser.parse_args()
     import sqlite3
     conn = sqlite3.connect(ROOT / "tasks" / "autokat.db")
@@ -356,6 +373,9 @@ def main() -> None:
         "SELECT * FROM clips WHERE task_id=? ORDER BY idx", (args.task_id,),
     )]
     conn.close()
+    if args.clip_indexes:
+        selected = {int(value) for value in args.clip_indexes.split(",") if value.strip()}
+        clips = [clip for clip in clips if int(clip["idx"]) in selected]
     if not clips or any(clip["status"] != "done" for clip in clips):
         raise SystemExit("任务不存在或并非全部完成")
     asr, ocr = build_asr_model(), build_ocr()

@@ -130,6 +130,113 @@ def _needs_hdr_to_sdr(path: str) -> bool:
     )
 
 
+def _spatial_perturbation_filter(perturbation: dict | None) -> str:
+    perturbation = perturbation or {}
+    width, height = perturbation.get("resolution") or (1080, 1920)
+    filters = []
+    if perturbation.get("hflip"):
+        filters.append("hflip")
+    if perturbation.get("scale") is not None:
+        filters.append(f"scale=iw*{float(perturbation['scale']):.9f}:ih*{float(perturbation['scale']):.9f}")
+    if perturbation.get("rotate_deg") is not None:
+        filters.append(
+            f"rotate={float(perturbation['rotate_deg']):.9f}*PI/180:"
+            "fillcolor=0x000000@1"
+        )
+    tx, ty = int(perturbation.get("tx_px", 0)), int(perturbation.get("ty_px", 0))
+    filters.append(
+        f"scale={width}:{height}:force_original_aspect_ratio=1,"
+        f"pad={width}:{height}:({width}-iw)/2+{tx}:({height}-ih)/2+{ty}:black"
+    )
+    return ",".join(filters)
+
+
+def _compose_cached_segments(seg_files: list[str], seg_durations: list[float],
+                             clips: list[dict], fps: int, tmpdir: str,
+                             perturbation: dict | None = None) -> tuple[str, float]:
+    """Compose all cached slices in one FFmpeg graph and one encode."""
+    if len(seg_files) == 1 and not perturbation:
+        return seg_files[0], seg_durations[0]
+    filter_parts = [
+        f"[{index}:v]setpts=PTS-STARTPTS[s{index}]"
+        for index in range(len(seg_files))
+    ]
+    group_labels = []
+    group_durations = []
+    group_size = 5
+    for group_index, start in enumerate(range(0, len(seg_files), group_size)):
+        end = min(len(seg_files), start + group_size)
+        current = f"s{start}"
+        accumulated = float(seg_durations[start])
+        for index in range(start + 1, end):
+            transition_frames = int(
+                clips[index].get("transition_frames")
+                or round(float(clips[index].get("transition_duration", 0.3)) * fps)
+            )
+            transition_duration = transition_frames / fps
+            output_label = f"gx{group_index}_{index}"
+            transition = clips[index].get("transition") or "fade"
+            if transition not in XFADE_TRANSITIONS:
+                transition = "fade"
+            filter_parts.append(
+                f"[{current}][s{index}]xfade=transition={transition}:"
+                f"duration={transition_duration:.9f}:"
+                f"offset={max(0.0, accumulated - transition_duration):.9f}"
+                f"[{output_label}]"
+            )
+            current = output_label
+            accumulated += float(seg_durations[index]) - transition_duration
+        group_labels.append(current)
+        group_durations.append(accumulated)
+    if len(group_labels) == 1:
+        output_label = group_labels[0]
+    else:
+        output_label = "composed"
+        filter_parts.append(
+            "".join(f"[{label}]" for label in group_labels)
+            + f"concat=n={len(group_labels)}:v=1:a=0[{output_label}]"
+        )
+    spatial_filter = _spatial_perturbation_filter(perturbation)
+    if spatial_filter:
+        filter_parts.append(f"[{output_label}]{spatial_filter}[perturbed]")
+        output_label = "perturbed"
+    output = os.path.join(tmpdir, "composed.mp4")
+    command = [FFMPEG, "-y"]
+    for segment in seg_files:
+        command.extend(["-i", segment])
+    command.extend([
+        "-filter_complex", ";".join(filter_parts), "-map", f"[{output_label}]",
+        *_h264_encoder_args("4M"), "-pix_fmt", "yuv420p", "-r", str(fps), "-an",
+        "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
+        "-color_range", "tv", output,
+    ])
+    run_ffmpeg(command, desc=f"单次组合拼接({len(seg_files)}段)", timeout=600)
+    duration = get_media_duration(output) or sum(group_durations)
+    return output, duration
+
+
+def _adaptive_worker_count(task_size: int) -> tuple[int, str]:
+    """Choose conservative render concurrency and explain the decision."""
+    cpu_count = os.cpu_count() or 4
+    cpu_limit = max(1, min(4, cpu_count // 2))
+    memory_gb = 8.0
+    try:
+        memory_gb = int(subprocess.run(
+            ["sysctl", "-n", "hw.memsize"], check=True, capture_output=True,
+            text=True, timeout=3,
+        ).stdout.strip()) / (1024 ** 3)
+    except Exception:
+        pass
+    memory_limit = max(1, min(4, int(memory_gb // 5)))
+    task_limit = 1 if task_size <= 2 else 2 if task_size <= 10 else 4
+    workers = max(1, min(cpu_limit, memory_limit, task_limit))
+    reason = (
+        f"CPU {cpu_count}核→{cpu_limit}，内存 {memory_gb:.1f}GB→{memory_limit}，"
+        f"任务 {task_size} 条→{task_limit}"
+    )
+    return workers, reason
+
+
 def _tail_freeze_duration(path: str, threshold: float = 0.5) -> float:
     """Return a freeze duration only when the freeze reaches the file tail."""
     duration = get_media_duration(path)
@@ -401,6 +508,25 @@ def render_simple(script: dict, output_path: str, audio_path: str,
     if not clips:
         print("[渲染错误] 没有 clip")
         return "脚本无 clip 数据（编排脚本里 clips 字段为空）"
+    # Guard frames rendered for codec rounding must never hide a genuinely
+    # short visual plan. Validate requested post-xfade frames before encoding.
+    requested_visual_frames = 0
+    for index, clip in enumerate(clips):
+        requested_visual_frames += int(clip.get(
+            "duration_frames",
+            round(float(clip.get("duration", 0)) * fps),
+        ))
+        if index % 5 != 0:
+            requested_visual_frames -= int(clip.get(
+                "transition_frames",
+                round(float(clip.get("transition_duration", 0)) * fps),
+            ))
+    target_frames = int(script.get("target_video_frames") or 0)
+    if target_frames and requested_visual_frames < target_frames - 1:
+        return (
+            f"动态画面编排短于目标 {target_frames - requested_visual_frames} 帧，"
+            "超过一帧容差，拒绝静止补齐"
+        )
 
         # 实时进度：开始准备
         if clip_id is not None:
@@ -416,33 +542,6 @@ def render_simple(script: dict, output_path: str, audio_path: str,
         if clip_id is not None:
             _safe_progress(clip_id, f"切分片段 0/{len(clips)}", log=True, clip_idx=script.get("index"))
 
-        def _src_color_args(path: str) -> list:
-            """从源片 probe 颜色元数据, 返回 ffmpeg 输出端显式 -color_* 参数.
-
-            不显式写的话 ffmpeg 默认会填 BT.709 (不限 source), HDR 源 (BT.2020+HLG)
-            在不显式写的情况下被 ffmpeg "默默" 改成 BT.709, 视觉上就过曝.
-            缓存避免每个 segment 重复 probe.
-            """
-            try:
-                info = get_media_info(path)
-                streams = [s for s in info.get("streams", []) if s.get("codec_type") == "video"]
-                if not streams:
-                    return []
-                s = streams[0]
-                cs = s.get("color_space") or "bt709"
-                cp = s.get("color_primaries") or "bt709"
-                ct = s.get("color_transfer") or "bt709"
-                cr = s.get("color_range") or "tv"
-                # ffmpeg 内部代号: bt2020nc -> bt2020_ncl 等; 保持原值即可
-                return [
-                    "-colorspace", cs,
-                    "-color_primaries", cp,
-                    "-color_trc", ct,
-                    "-color_range", cr,
-                ]
-            except Exception:
-                return []
-
         def _render_segment(i, clip):
             src = clip["source_path"]
             offset = clip.get("offset", 0)
@@ -454,66 +553,12 @@ def render_simple(script: dict, output_path: str, audio_path: str,
             # 扰动参数只影响画面 (scale/rotate/translate/hflip/bg/encoding)，
             # 不动 dur 本身，保证下游 SRT/音轨/视频三者 end_time 一致。
 
-            filters = [
-                f"trim=start={offset}:duration={dur}",
-                "setpts=PTS-STARTPTS",
-            ]
-            # v2.4: 禁止任何调色 / tonemap. 原素材是什么颜色元数据, 成片就是什么.
-            # 之前 _needs_hdr_to_sdr() 对 HDR 源 (BT.2020+HLG) 走 tonemap,
-            # 输出被强制成 BT.709/SDR, 在 SDR 显示器上看比原片"亮" (HLG 曲线
-            # 被截断到 0-1 范围, 亮部被拉伸). 用户要求"使用原片色调", 这里
-            # 不再做任何颜色转换, 由最终输出 -color_range/colorspace/primaries/trc auto
-            # 透传源片元数据.
-
-            # --- 1) 水平翻转 (perturbation.flip) ---
-            if perturbation and perturbation.get("hflip"):
-                filters.append("hflip")
-
-            # --- 2) 缩放 / 旋转 / 平移 (perturbation.scale_rotate) ---
-            if perturbation and perturbation.get("scale") is not None:
-                scale = perturbation["scale"]
-                # 用 scale filter 缩放（保持原比例，force_original_aspect_ratio 由 pad 接管）
-                filters.append(f"scale=iw*{scale}:ih*{scale}")
-            if perturbation and perturbation.get("rotate_deg") is not None:
-                rot = perturbation["rotate_deg"]
-                # v2.4: 禁止调色, 旋转 fillcolor 写死 0x000000@1
-                filters.append(f"rotate={rot}*PI/180:fillcolor=0x000000@1")
-
-            # --- 4) 分辨率 + pad (perturbation.nonstd_resolution 决定目标尺寸) ---
-            if perturbation and perturbation.get("resolution"):
-                tw, th = perturbation["resolution"]
-            else:
-                tw, th = 1080, 1920
-            # v2.4: 禁止调色, pad 背景色永远固定为纯黑
-            pad_color = "black"
-            tx = perturbation.get("tx_px", 0) if perturbation else 0
-            ty = perturbation.get("ty_px", 0) if perturbation else 0
-            filters.append(
-                f"scale={tw}:{th}:force_original_aspect_ratio=1,"
-                f"pad={tw}:{th}:({tw}-iw)/2+{tx}:({th}-ih)/2+{ty}:{pad_color}"
+            from autokat.core.slice_cache import cached_segment
+            cached_path, cache_key = cached_segment(
+                clip, fps, perturbation=perturbation, render_frames=duration_frames,
             )
-            vf = ",".join(filters)
-
-            # segment 是中间产物，用 CPU veryfast（避免 6+ worker 争抢 VT 编码器导致失败）
-            # 4M 码率 + veryfast 编码速度极快，节省时间
-            # 关键：必须加 -t {dur} 严格限制输出时长！
-            # 当前 ffmpeg（/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg）的 trim filter 在
-            # 源比 duration 长时不严格截断（trim=start:duration 和 trim=start:end
-            # 都会输出到源结束），只有 -t flag 能保证精确时长。
-            # 没有这个 flag，seg 文件会包含源的全部内容（seg0000 请求 4.59s
-            # 实际输出 5.184s，因为源是 5.182s），下游 xfade 用错时长，整条视频
-            # 比脚本期望长几秒到十几秒。
-            cmd = [
-                FFMPEG, "-y", "-i", src, "-vf", vf,
-                "-frames:v", str(duration_frames),
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                "-g", "60",
-                "-pix_fmt", "yuv420p", "-r", str(fps),
-                # v2.4: 显式从源片 probe 颜色元数据, 避免 ffmpeg 默认填 BT.709
-                *_src_color_args(src),
-                seg_file,
-            ]
-            run_ffmpeg(cmd, desc=f"裁剪片段 {i}")
+            seg_file = str(cached_path)
+            clip["cache_key"] = cache_key
             # ffprobe 获取实际生成文件的真实时长（素材或裁剪边界可能偏短）
             actual_dur = get_media_duration(seg_file) or dur
             # 实际输出 < 请求 × 50%，意味着 trim 越界（offset 超过素材结尾）
@@ -569,130 +614,16 @@ def render_simple(script: dict, output_path: str, audio_path: str,
         elif clip_id is not None:
             _safe_progress(clip_id, "复制片段...", log=True, clip_idx=script.get("index"))
 
-        # Step 2: 用 xfade 滤镜拼接
-        # xfade 对同时输入的 filtergraph 节点数有限制（通常约 20-30 个输入标签），
-        # 段数过多时直接报 "Error binding filtergraph inputs/outputs"。
-        # 分批处理：每批最多 5 段，组内 xfade 串联，组间再 concat 合并。
-        # 例：11 段 → [1..5] xfade → [6..10] xfade → [组1, 组2, 段11] concat
-        if len(seg_files) == 1:
-            concat_video = seg_files[0]
-            total_video_dur = seg_durations[0]
-        else:
-            trans_dur = float(clips[0].get("transition_duration", 0.3))
-            GROUP_SIZE = 5  # 每批 xfade 输入上限
-
-            def _xfade_group(seg_batch, dur_batch, group_idx):
-                """对一批 segment 做链式 xfade，返回输出文件路径和总时长。
-
-                关键修复: 之前用估算的 accumulated 作为返回值，但 xfade filter
-                在某些 transition 上输出时长可能比请求短（特别是过渡偏移超
-                出已合成的范围时）。任务 223 之后 xfade_group 返回估算时长
-                后续 concat + tpad 都基于这个错的值，导致 0004 在 21.3s 后
-                冻结（实际视频 ~27s 但被估算成 21s）。
-                现在 xfade 跑完后用 get_media_duration(out_path) 读真实输出
-                覆盖估算值，确保下游 concat + tpad 用对的时长。
-                """
-                if len(seg_batch) == 1:
-                    return seg_batch[0], dur_batch[0]
-                filter_parts = []
-                input_labels = []
-                for i, seg in enumerate(seg_batch):
-                    label = f"g{group_idx}s{i}"
-                    input_labels.append(label)
-                    filter_parts.append(f"[{i}:v]setpts=PTS-STARTPTS[{label}]")
-                current_label = input_labels[0]
-                accumulated = dur_batch[0]
-                for i in range(1, len(seg_batch)):
-                    trans_val = random.choice(XFADE_TRANSITIONS)
-                    xfade_label = f"g{group_idx}x{i}"
-                    xfade_offset = max(0.0, accumulated - trans_dur)
-                    filter_parts.append(
-                        f"[{current_label}][{input_labels[i]}]"
-                        f"xfade=transition={trans_val}:duration={trans_dur}:offset={xfade_offset}[{xfade_label}]"
-                    )
-                    current_label = xfade_label
-                    accumulated = accumulated + dur_batch[i] - trans_dur
-                filter_complex = ";".join(filter_parts)
-                out_path = os.path.join(tmpdir, f"group{group_idx}.mp4")
-                cmd = [FFMPEG, "-y"]
-                for seg in seg_batch:
-                    cmd.extend(["-i", seg])
-                # v2.4: xfade 组内输出, 用第一个 segment 源片颜色参数 (同 batch 同池共享)
-                nonlocal _batch_color_holder
-                _batch_color_holder = _src_color_args(seg_batch[0]) if seg_batch else _batch_color_holder
-                cmd.extend(_h264_encoder_args("4M"))
-                cmd.extend([
-                    "-filter_complex", filter_complex,
-                    "-map", f"[{current_label}]",
-                    "-pix_fmt", "yuv420p", "-r", str(fps), "-an",
-                    *_batch_color_holder,
-                    # v2.4: 透传源片颜色元数据
-                    out_path,
-                ])
-                run_ffmpeg(cmd, desc=f"xfade 组{group_idx}({len(seg_batch)}段)", timeout=300)
-                # 读真实输出时长覆盖估算（关键修复）
-                actual_dur = get_media_duration(out_path) or accumulated
-                if abs(actual_dur - accumulated) > 0.3:
-                    print(f"[xfade 修复] 组{group_idx} 估算 {accumulated:.2f}s → 实际 {actual_dur:.2f}s，"
-                          f"差异 {abs(actual_dur - accumulated):.2f}s（xfade filter 边界情况）")
-                return out_path, actual_dur
-
-            # 分批 xfade，结果文件列表
-            group_files = []
-            group_durations = []
-            # v2.4: 同 batch 同池的源片颜色 (用 nonlocal 在 _xfade_group 里更新)
-            _batch_color_holder = []
-            for gi in range(0, len(seg_files), GROUP_SIZE):
-                g_segs = seg_files[gi:gi+GROUP_SIZE]
-                g_durs = seg_durations[gi:gi+GROUP_SIZE]
-                gout_path, gout_dur = _xfade_group(g_segs, g_durs, gi // GROUP_SIZE)
-                group_files.append(gout_path)
-                group_durations.append(gout_dur)
-
-            # 组间拼接：如果只有一组直接返回；多组用 concat+过渡视频方式合并
-            if len(group_files) == 1:
-                concat_video = group_files[0]
-                total_video_dur = group_durations[0]
-            else:
-                # 关键修复：之前把每组都 tpad 到 max_dur 再 concat，最终时长 = max_dur * n_groups
-                # （视频被拉长近一倍，例：2 组各 19s → concat 后 38s，但脚本期望 21s）。
-                # 改用 -c copy 的 concat demuxer 直接拼，每组保留原始时长，
-                # 总长 = sum(group_durations)，与脚本 total_duration 一致。
-                # 各组之间是硬切（无转场），但每个组内部已经有 xfade 转场，视觉上不突兀。
-                padded_groups = list(group_files)
-
-                # concat 拼接（用 filter_complex 方式，文件级 concat 更可靠）
-                concat_list = os.path.join(tmpdir, "group_concat_list.txt")
-                with open(concat_list, "w") as f:
-                    for pg in padded_groups:
-                        f.write(f"file '{pg}'\n")
-                concat_video = os.path.join(tmpdir, "concated.mp4")
-                # 之前用 `-c copy` 的 concat demuxer 在 xfade 输出后 moov atom 的
-                # duration 字段会被第一个 group 的 moov 覆盖，导致 get_media_duration
-                # 读出错的时长（如 21.3s），进而 total_video_dur 偏小、tpad_dur 算错，
-                # 画面在 21s 后就冻结（音频/字幕继续走）。改成 libx264 重新编码走
-                # concat demuxer（moov 由 ffmpeg 重新生成），多 1-2s 换稳定时长。
-                # 帧率/pix_fmt 与 xfade 输出保持一致，避免色彩空间被改。
-                cmd_cat = [
-                    FFMPEG, "-y", "-f", "concat", "-safe", "0",
-                    "-i", concat_list,
-                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                    "-pix_fmt", "yuv420p", "-r", str(fps), "-an",
-                    # v2.4: 组间 concat 透传源片颜色元数据 (复用 _batch_color 缓存)
-                    *_batch_color_holder,
-                    # v2.4: 透传源片颜色元数据
-                    concat_video,
-                ]
-                run_ffmpeg(cmd_cat, desc="组合并concat(重编码)", timeout=120)
-                # 关键修复：之前用 sum(group_durations) 算的是 padding 之前各组原始时长之和，
-                # 但每个组都被 tpad 到 max_dur 再 concat，真实视频时长是 max_dur * n_groups。
-                # 下面用 ffprobe 读真实文件时长，避免 tpad 算错导致视频=配音对不上。
-                _actual_concat_dur = get_media_duration(concat_video) or 0.0
-                if _actual_concat_dur > 0 and abs(_actual_concat_dur - sum(group_durations)) > 0.3:
-                    print(f"[tpad 修复] 真实 concat 时长 {_actual_concat_dur:.2f}s ≠ "
-                          f"sum(group_durations)={sum(group_durations):.2f}s，"
-                          f"采用真实值（max_dur * n_groups 的影响）")
-                total_video_dur = _actual_concat_dur or sum(group_durations)
+        # Step 2: all group xfade chains and hard group boundaries are resolved
+        # in one filter graph and one encode. This preserves the existing
+        # integer-frame timeline while removing per-group and concat re-encodes.
+        concat_video, total_video_dur = _compose_cached_segments(
+            seg_files, seg_durations, clips, fps, tmpdir, perturbation=perturbation,
+        )
+        _batch_color_holder = [
+            "-colorspace", "bt709", "-color_primaries", "bt709",
+            "-color_trc", "bt709", "-color_range", "tv",
+        ]
 
         # 实时进度：进入最终合成（字幕+音频+BGM）
         if clip_id is not None:
@@ -1053,6 +984,12 @@ def create_and_run_batch(
         audio_segments[0][1], count=count, material_pool=pool, config=batch_cfg,
         sentence_groups=sentence_groups,
     )
+    perturbation_level = batch_cfg.get("perturbation_level", "med")
+    for script in batch_scripts:
+        script["perturbation"] = (
+            build_perturbation(perturbation_level)
+            if is_level_enabled(perturbation_level) else None
+        )
     _div_report = batch_scripts[0].get("diversity_report", {}) if batch_scripts else {}
     if _div_report:
         _log(
@@ -1067,14 +1004,36 @@ def create_and_run_batch(
     # 统计 batch 里所有 script 的 clip 数（一次素材引用 = 一个 clip）
     _total_shot_refs = sum(len(s.get("clips", [])) for s in batch_scripts)
 
+    from autokat.core.material_analysis import analyze_text_intent
     config = {
         "fps": fps, "count": count, "voice": voice,
         "rate": rate, "pitch": pitch, "enable_bgm": enable_bgm,
         "lang": lang,
+        "planner_version": batch_scripts[0].get("planner_version", "legacy") if batch_scripts else "legacy",
+        "video_type": batch_cfg.get("video_type", "auto"),
+        "workers": workers,
+        "intent": analyze_text_intent(narration_text),
     }
     task_id = db_create_task(
         script_id=script_id, config=config,
         output_dir=str(OUTPUT_DIR), total=count,
+    )
+    from autokat.core.batch_planner import BatchPlanner
+    planner = BatchPlanner()
+    manifest = planner.build_manifest(batch_scripts)
+    planner.save(task_id, config["planner_version"], manifest)
+    if material_ids:
+        from autokat.models.db import get_conn
+        conn = get_conn()
+        conn.executemany(
+            "INSERT OR IGNORE INTO task_materials(task_id,material_id) VALUES(?,?)",
+            [(task_id, int(material_id)) for material_id in material_ids],
+        )
+        conn.commit()
+        conn.close()
+    _log(
+        f"   🔥 缓存预热清单: {len(manifest['hotspots'])} 个热点 · "
+        f"预计命中率 {manifest['estimated_hit_rate']:.0%}"
     )
 
     _log("─── [3/4] 输出准备 ───")
@@ -1105,6 +1064,22 @@ def create_and_run_batch(
             _set_stage(f"💾 编排脚本保存中 · {script['index']+1}/{count}")
 
     _log(f"   📐 为 {count} 条成片规划切片组合…  ·  共 {_total_shot_refs} 个切片引用")
+    _set_stage("🔥 热点片段缓存预热中 (3/4)")
+    from autokat.core.slice_cache import prewarm_scripts
+    prewarm_started = time.time()
+    prewarm_metrics = prewarm_scripts(
+        batch_scripts,
+        workers=max(1, min(4, workers if workers > 0 else 4)),
+    )
+    prewarm_metrics["elapsed_seconds"] = round(time.time() - prewarm_started, 3)
+    planner.save(task_id, config["planner_version"], manifest, metrics=prewarm_metrics)
+    _log(
+        f"   🔥 缓存预热完成: 新建 {prewarm_metrics['prewarm_built']} · "
+        f"已有 {prewarm_metrics['preexisting_hits']} · "
+        f"失败 {len(prewarm_metrics['failures'])} · "
+        f"覆盖 {prewarm_metrics['prewarm_reference_coverage']:.0%} · "
+        f"{prewarm_metrics['elapsed_seconds']:.1f}s"
+    )
     _log(f"─── [4/4] 启动渲染  (并发: {workers}) ───")
     _set_stage(f"🎬 视频渲染中 · 0/{count}")
     update_task_status(task_id, "running")
@@ -1171,13 +1146,36 @@ def _render_task(task_id: int, workers: int = 2, batch_cfg: Optional[dict] = Non
         # v2.3: 从 batch_cfg / config 读 perturbation 强度, 为每条成片生成独立扰动参数
         # perturbation_level: off/low/med/high（默认 med）
         _pert_level = (batch_cfg or {}).get("perturbation_level", "med")
-        _pert = build_perturbation(_pert_level) if is_level_enabled(_pert_level) else None
+        _pert = script.get("perturbation")
+        if "perturbation" not in script:
+            _pert = build_perturbation(_pert_level) if is_level_enabled(_pert_level) else None
         err_msg = render_simple(
             script, output_path, audio_path,
             bgm_path=bgm_path, fps=script.get("fps", 30),
             clip_id=clip["id"],
             perturbation=_pert,
         )
+        quality_result = None
+        auto_fix_count = 0
+        if err_msg is None:
+            from autokat.core.quality import quick_validate
+            quality_result = quick_validate(output_path, script)
+            if not quality_result["passed"]:
+                auto_fix_count = 1
+                _log_emit(f"🛠️  [{clip_idx+1}/{total}] 快速验收失败，自动重渲染一次（重随机扰动）")
+                if is_level_enabled(_pert_level):
+                    _pert = build_perturbation(_pert_level)
+                err_msg = render_simple(
+                    script, output_path, audio_path, bgm_path=bgm_path,
+                    fps=script.get("fps", 30), clip_id=clip["id"], perturbation=_pert,
+                )
+                quality_result = quick_validate(output_path, script) if err_msg is None else {
+                    "passed": False, "render_error": err_msg,
+                }
+                if not quality_result["passed"] and err_msg is None:
+                    err_msg = "快速质量验收失败: " + str(quality_result)[:180]
+            from autokat.core.quality import record_result
+            record_result(task_id, clip["id"], "quick", quality_result, auto_fix_count)
         elapsed = time.time() - t0
         if err_msg is None:
             # 渲染成功后 ffprobe 拿真实时长写回 DB（任务详情/Step 4 显示用）
@@ -1211,6 +1209,9 @@ def _render_task(task_id: int, workers: int = 2, batch_cfg: Optional[dict] = Non
             current = get_task(task_id)
         return stop_requested() or bool(current and current["status"] in ("pending", "failed"))
 
+    if workers <= 0:
+        workers, worker_reason = _adaptive_worker_count(len(clips))
+        _log(f"   🧠 自适应并发: {workers} · {worker_reason}")
     if workers > 1:
         # 多进程并行渲染
         with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -1245,6 +1246,33 @@ def _render_task(task_id: int, workers: int = 2, batch_cfg: Optional[dict] = Non
     done_count = final_counts["done"]
     final_status = "done" if done_count == final_counts["total"] else "failed"
     update_task_status(task_id, final_status, done=done_count)
+    from autokat.core.quality import (
+        finalize_task_quality, run_deep_validation, summarize_task_quality,
+    )
+    quality_summary = finalize_task_quality(task_id, final_counts["total"])
+    if final_status == "done":
+        force_full_deep = bool(
+            (batch_cfg or {}).get("full_deep_quality")
+            or os.environ.get("AUTOKAT_FORCE_FULL_DEEP_QA") == "1"
+        )
+        _log(
+            f"   🔬 启动{'全量' if force_full_deep else '抽样'}内容级 ASR/OCR 验收..."
+        )
+        deep_result = run_deep_validation(task_id, full=force_full_deep)
+        if deep_result.get("status") == "unavailable":
+            _log(f"   ⚠️ 深度验收不可用: {deep_result['reason']}")
+        elif not deep_result.get("passed"):
+            final_status = "failed"
+            final_counts = get_task_clip_counts(task_id)
+            done_count = final_counts["done"]
+            update_task_status(task_id, "failed", done=done_count)
+            _log("   ❌ 内容级深度验收失败，未交付失败成片")
+        else:
+            _log(
+                f"   ✅ 内容级深度验收通过 · {len(deep_result.get('videos', []))} 条 · "
+                f"{deep_result.get('elapsed_seconds', 0):.1f}s"
+            )
+        quality_summary = summarize_task_quality(task_id)
     # ── Phase 5：渲染收尾 ──
     elapsed_total = time.time() - _render_start_ts
     fail_count = final_counts["failed"]
@@ -1258,22 +1286,23 @@ def _render_task(task_id: int, workers: int = 2, batch_cfg: Optional[dict] = Non
     _log(f"   ⏱️ 渲染阶段耗时: {elapsed_total:.0f}s")
     _log(f"   📁 输出目录: {task_dir}  ({out_files} 文件 · {_fmt_size(out_size)})")
     _log(f"   🆔 任务 #{task_id}  →  状态: {final_status}")
-    # v2.4: 写 titles.txt (同 batch 共用一条 AI 标题, 一行一条 filename\ttitle)
+    _log(
+        f"   🛡️ 质量验收: 通过 {quality_summary['passed']} · "
+        f"自动修复 {quality_summary['auto_fixed']} · 阻断 {quality_summary['failed']} · "
+        f"深度验收 "
+        f"{'未执行' if quality_summary['deep_status'] == 'unavailable' else quality_summary['deep_status']}"
+    )
+    # Rendering must not call local/remote AI. Use a deterministic first-sentence title.
     try:
-        from autokat.core.writer import generate_publish_title as _gen_title
         _title_src = (_script_obj.get("narration") or "").split("---", 1)[0].strip()
-        _script_lang = _script_obj.get("lang") or "zh"
-        _title_lang = _script_lang.split("-", 1)[0]
-        if _title_lang not in ("zh", "en", "th"):
-            _title_lang = "zh"
-        _publish_title = _gen_title(_title_src, lang=_title_lang, max_chars=20)
+        _publish_title = re.split(r"[。！？!?\n]", _title_src, maxsplit=1)[0].strip()[:20]
         if _publish_title:
             _titles_path = task_dir / "titles.txt"
             with open(_titles_path, "w", encoding="utf-8") as _tf:
                 for _i in range(int(task.get("total") or len(clips))):
                     _fn = f"{safe_name}_{_i+1:04d}.mp4"
                     _tf.write(f"{_fn}\t{_publish_title}\n")
-            _log(f"   📝 发布标题已生成 → titles.txt ({task.get('total') or len(clips)} 行, 标题: {_publish_title})")
+            _log(f"   📝 发布标题已生成（确定性，无 AI 调用）→ titles.txt")
     except Exception as _t_exc:
         print(f"[titles] 生成/写盘失败 (不影响渲染): {_t_exc}")
     _log("─── 全部完成 ✅ ───")

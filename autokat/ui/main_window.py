@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
 
     QStackedWidget, QFrame, QSizePolicy, QSpacerItem, QGridLayout, QAbstractItemView,
     QSplitter, QStyledItemDelegate, QStyleOptionViewItem, QStyle, QMenu,
-    QButtonGroup, QRadioButton,
+    QButtonGroup, QRadioButton, QToolButton,
 )
 from PySide6.QtGui import QFont, QPixmap, QIcon, QColor, QPalette, QPainter, QBrush, QPen, QTextDocument
 from autokat.models.db import (
@@ -38,16 +38,31 @@ from autokat.core.bgm import get_bgm_duration, split_bgm_to_segments
 from autokat.core.writer import (
     generate_script_by_topic, generate_script_by_topic_detailed,
     validate_script_quality, estimate_chars_for_lang, estimate_chars_for_duration_range,
-    list_styles, check_deepseek_available, set_deepseek_key,
+    list_styles, check_deepseek_available, set_deepseek_key, set_deepseek_config,
 )
 from autokat.core.paths import DATA_ROOT
-_env_path = DATA_ROOT / ".env"
-if _env_path.exists():
-    for line in _env_path.read_text().splitlines():
-        if line.startswith("DEEPSEEK_API_KEY="):
-            key = line.split("=", 1)[1].strip()
-            if key:
-                set_deepseek_key(key)
+try:
+    from autokat.core.ai_providers import (
+        load_ai_settings, load_deepseek_key, save_deepseek_key,
+    )
+    _ai_settings = load_ai_settings()
+    _keychain_key = load_deepseek_key()
+    _env_path = DATA_ROOT / ".env"
+    if not _keychain_key and _env_path.exists():
+        for line in _env_path.read_text().splitlines():
+            if line.startswith("DEEPSEEK_API_KEY="):
+                _legacy_key = line.split("=", 1)[1].strip()
+                if _legacy_key:
+                    save_deepseek_key(_legacy_key)
+                    _keychain_key = _legacy_key
+                    break
+    set_deepseek_config(
+        _keychain_key,
+        _ai_settings.get("deepseek_url"),
+        _ai_settings.get("deepseek_model"),
+    )
+except Exception:
+    pass
 BASE_DIR = DATA_ROOT
 CONFIG_DIR = Path.home() / ".config" / "autokat"
 CONFIG_FILE = CONFIG_DIR / "subtitle_pos.json"
@@ -439,6 +454,13 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("AutoCat 智能混剪 v3.0")
         self.setMinimumSize(1280, 860)
         init_db()
+        # 一次性把 .env 中的 DEEPSEEK_API_KEY 搬到 macOS Keychain，
+        # 之后运行时不再依赖环境变量；旧 .env Key 会被清理。
+        try:
+            from autokat.core.ai_providers import migrate_env_key_to_keychain
+            migrate_env_key_to_keychain()
+        except Exception:
+            pass
         # 状态
         self._current_task_id = None
         self._sidebar_filter = "all"  # all / running / done / failed / pending
@@ -1566,6 +1588,64 @@ class MainWindow(QMainWindow):
         style_input = QComboBox()
         style_input.addItems(list_styles())
         form.addRow("风格:", style_input)
+        provider_input = QComboBox()
+        provider_input.addItem("本地模型", "local")
+        provider_input.addItem("DeepSeek", "deepseek")
+        form.addRow("AI 模型:", provider_input)
+        deepseek_config_btn = QPushButton("配置并测试 DeepSeek")
+        deepseek_config_btn.setVisible(False)
+        form.addRow("", deepseek_config_btn)
+        provider_input.currentIndexChanged.connect(
+            lambda _: deepseek_config_btn.setVisible(provider_input.currentData() == "deepseek")
+        )
+
+        def _configure_deepseek():
+            from autokat.core.ai_providers import (
+                DeepSeekWriterProvider, load_ai_settings, load_deepseek_key,
+                save_ai_settings, save_deepseek_key,
+            )
+            cfg = load_ai_settings()
+            config_dlg = QDialog(dlg)
+            config_dlg.setWindowTitle("DeepSeek 配置")
+            config_layout = QFormLayout(config_dlg)
+            key_edit = QLineEdit(load_deepseek_key())
+            key_edit.setEchoMode(QLineEdit.Password)
+            url_edit = QLineEdit(cfg.get("deepseek_url", "https://api.deepseek.com/v1/chat/completions"))
+            model_edit = QLineEdit(cfg.get("deepseek_model", "deepseek-chat"))
+            status_label = QLabel("")
+            test_btn = QPushButton("真实测试连接")
+            save_btn = QPushButton("保存")
+            config_layout.addRow("API Key:", key_edit)
+            config_layout.addRow("API 地址:", url_edit)
+            config_layout.addRow("模型名称:", model_edit)
+            config_layout.addRow(test_btn, save_btn)
+            config_layout.addRow(status_label)
+
+            def _test():
+                try:
+                    result = DeepSeekWriterProvider(
+                        key_edit.text(), url_edit.text(), model_edit.text()
+                    ).test_connection()
+                    status_label.setText(f"✅ 连接成功：{result['response']}")
+                except Exception as exc:
+                    status_label.setText(f"❌ {exc}")
+
+            def _save():
+                save_deepseek_key(key_edit.text())
+                new_cfg = load_ai_settings()
+                new_cfg.update({
+                    "provider": "deepseek",
+                    "deepseek_url": url_edit.text().strip(),
+                    "deepseek_model": model_edit.text().strip(),
+                })
+                save_ai_settings(new_cfg)
+                set_deepseek_config(key_edit.text(), url_edit.text(), model_edit.text())
+                config_dlg.accept()
+
+            test_btn.clicked.connect(_test)
+            save_btn.clicked.connect(_save)
+            config_dlg.exec()
+        deepseek_config_btn.clicked.connect(_configure_deepseek)
         detail_input = QLineEdit()
         detail_input.setPlaceholderText("可选：补充细节描述")
         form.addRow("细节:", detail_input)
@@ -1763,6 +1843,12 @@ class MainWindow(QMainWindow):
                                     target_chars_max=target_max,
                                     accepted_texts=accepted,
                                     progress_callback=quality_progress,
+                                    provider=provider_input.currentData(),
+                                    material_capabilities=__import__(
+                                        "autokat.core.material_analysis", fromlist=["capability_summary"]
+                                    ).capability_summary(
+                                        list(getattr(self, "_wiz_selected_materials", set())) or None
+                                    ),
                                 )
                                 accepted.append(generated["text"])
                                 quality = generated["quality"]
@@ -1979,7 +2065,7 @@ class MainWindow(QMainWindow):
         self._wiz_count.valueChanged.connect(lambda v: self._update_wiz_max_videos_label())
         _add_lbl(config_grid, 0, 2, "\u5e27\u7387:")
         self._wiz_fps = _add_combo(config_grid, 0, 3, ["30", "60"], min_width=80)
-        _add_lbl(config_grid, 0, 4, "\u6bcf\u6bb5\u65f6\u957f:")
+        _add_lbl(config_grid, 0, 4, "\u955c\u5934\u8282\u594f:")
         from PySide6.QtWidgets import QDoubleSpinBox
         self._wiz_shot_duration = QDoubleSpinBox()
         self._wiz_shot_duration.setRange(1.0, 5.0)
@@ -1988,11 +2074,12 @@ class MainWindow(QMainWindow):
         self._wiz_shot_duration.setValue(2.0)
         self._wiz_shot_duration.setSuffix(" \u79d2")
         self._wiz_shot_duration.setToolTip(
-            "\u6bcf\u955c\u5934\u6700\u77ed\u65f6\u957f\u3002\n"
-            "\u2022 1.0s\uff1a\u955c\u5934\u591a\u3001\u53d8\u5316\u5feb\u3001\u4f46\u6e32\u67d3\u6162\uff0850 \u53e5 \u2192 ~35 \u955c\u5934\uff09\n"
-            "\u2022 2.0s\uff1a\u9ed8\u8ba4\uff0850 \u53e5 \u2192 ~17 \u955c\u5934\uff0c1 \u5206\u949f\u80fd\u8dd1 3-4 \u6761\uff09\n"
-            "\u2022 3.0s\uff1a\u955c\u5934\u5c11\u3001\u53d8\u5316\u5c11\u3001\u4f46\u6e32\u67d3\u6700\u5feb"
+            "\u9ed8\u8ba4\u7531\u7cfb\u7edf\u6309\u53e3\u64ad\u65f6\u957f\u3001\u6807\u70b9\u548c\u89c6\u9891\u7c7b\u578b\u81ea\u52a8\u89c4\u5212\u3002\n"
+            "\u524d 3 \u79d2\u4f18\u5148\u7d27\u51d1\u955c\u5934\uff0c\u666e\u901a\u955c\u5934\u907f\u514d\u5f02\u5e38\u77ed\u788e\u7247\uff0c"
+            "30 \u79d2\u4ee5\u4e0a\u81ea\u52a8\u589e\u52a0 3-6 \u79d2\u7a33\u5b9a\u955c\u5934\u3002"
         )
+        self._wiz_shot_duration.setEnabled(False)
+        self._wiz_shot_duration.setSuffix(" \u79d2\uff08\u81ea\u52a8\uff09")
         self._wiz_shot_duration.setMinimumHeight(34)
         self._wiz_shot_duration.setMinimumWidth(130)
         config_grid.addWidget(self._wiz_shot_duration, 0, 5)
@@ -2000,10 +2087,11 @@ class MainWindow(QMainWindow):
         # Row 1: \u5e76\u53d1\u8fdb\u7a0b | \u5207\u7247\u6700\u5927\u590d\u7528\u6b21\u6570(+ \u6700\u591a\u6df7\u526a\u663e\u793a) | \u5206\u8fa8\u7387
         _add_lbl(config_grid, 1, 0, "\u5e76\u53d1\u8fdb\u7a0b:")
         self._wiz_workers = _add_spin(
-            config_grid, 1, 1, 1, 8, 2,
+            config_grid, 1, 1, 0, 8, 0,
             tooltip="\u5e76\u53d1\u8fdb\u7a0b\u6570\u3002\n\u2022 2\uff1a\u4fdd\u5b88\uff08CPU \u8f83\u5f31\uff09\n\u2022 4\uff1a\u63a8\u8350\uff08M \u7cfb\u5217 8 \u6838+\uff09\n\u2022 6-8\uff1a\u5feb\u4f46 CPU \u5403\u6ee1",
             min_width=80,
         )
+        self._wiz_workers.setSpecialValueText("\u81ea\u52a8")
         _add_lbl(config_grid, 1, 2, "\u5207\u7247\u6700\u5927\u590d\u7528\u6b21\u6570:")
         # \u5207\u7247\u6700\u5927\u590d\u7528\u6b21\u6570 spinbox + \u6700\u591a\u6df7\u526a N \u6761\u6210\u7247\uff0c\u540c\u4e00\u5355\u5143\u683c\u5185\u5e76\u6392
         max_uses_cell = QWidget()
@@ -2048,6 +2136,24 @@ class MainWindow(QMainWindow):
         config_grid.setColumnStretch(5, 1)
 
         layout.addWidget(config_group)
+        type_row = QHBoxLayout()
+        type_label = QLabel("视频类型:")
+        type_label.setStyleSheet("color:#374151; font-size:12px; font-weight:600;")
+        self._wiz_video_type = QComboBox()
+        for label, key in (
+            ("自动判断", "auto"),
+            ("商品推荐", "product_recommendation"),
+            ("口播讲解", "talking_explanation"),
+            ("氛围记录", "atmosphere"),
+            ("音乐卡点", "music_beat"),
+            ("随机混剪", "random_mix"),
+        ):
+            self._wiz_video_type.addItem(label, key)
+        self._wiz_video_type.setToolTip("默认自动判断；只影响镜头节奏与素材评分，不修改配音和字幕时间轴。")
+        type_row.addWidget(type_label)
+        type_row.addWidget(self._wiz_video_type)
+        type_row.addStretch()
+        layout.addLayout(type_row)
 
         # 风险徽章已移除 (v2.3 简化): 改在 _wiz_max_uses 后面显示 "最多混剪 N 条成片"
 
@@ -2397,6 +2503,19 @@ class MainWindow(QMainWindow):
             cfg["platform"] = PLATFORM_IDS[pid_idx]
         if hasattr(self, "_wiz_max_uses"):
             cfg["max_uses_per_slice"] = int(self._wiz_max_uses.value())
+        if hasattr(self, "_wiz_video_type"):
+            cfg["video_type"] = self._wiz_video_type.currentData() or "auto"
+        # 写明选定的 AI Provider（local / deepseek）和语义版本，方便后续审计。
+        try:
+            from autokat.core.ai_providers import load_ai_settings
+            cfg["writer_provider"] = load_ai_settings().get("provider", "local")
+        except Exception:
+            cfg["writer_provider"] = "local"
+        try:
+            from autokat.core.editor import INTENT_VERSION
+            cfg["intent_version"] = INTENT_VERSION
+        except Exception:
+            cfg["intent_version"] = "intent-v1"
         if hasattr(self, "_wiz_enable_perturb"):
             cfg["enable_diversity"] = bool(self._wiz_enable_perturb.isChecked())
         if hasattr(self, "_wiz_pert_level_group"):
@@ -2764,7 +2883,7 @@ class MainWindow(QMainWindow):
         last = self._load_last_settings()
         # count 不从 last settings恢复 (per-batch决策, 默认100)
         self._wiz_count.setValue(100)
-        self._wiz_workers.setValue(last.get("workers", 4))
+        self._wiz_workers.setValue(last.get("workers", 0))
         self._wiz_fps.setCurrentIndex(0)
         self._wiz_enable_bgm.setChecked(last.get("enable_bgm", False))
         self._wiz_bgm_volume.setValue(last.get("bgm_volume", 12))
@@ -3423,6 +3542,38 @@ class MainWindow(QMainWindow):
         self._detail_params = QLabel("")
         self._detail_params.setStyleSheet("font-size:12px; color:#6B7280; font-weight:500; background:transparent; padding-top:4px;")
         summary_layout.addWidget(self._detail_params)
+        self._detail_quality = QLabel("质量验收：等待任务完成")
+        self._detail_quality.setWordWrap(True)
+        self._detail_quality.setStyleSheet(
+            "font-size:12px; color:#2563EB; font-weight:600; background:#EFF6FF;"
+            "border-radius:8px; padding:7px 10px;"
+        )
+        summary_layout.addWidget(self._detail_quality)
+        self._detail_report_toggle = QToolButton()
+        self._detail_report_toggle.setText("▶ 展开技术报告")
+        self._detail_report_toggle.setCheckable(True)
+        self._detail_report_toggle.setStyleSheet(
+            "QToolButton{border:none;color:#6B7280;font-size:11px;font-weight:600;"
+            "padding:4px 0;text-align:left;background:transparent;}"
+        )
+        self._detail_report = QTextEdit()
+        self._detail_report.setReadOnly(True)
+        self._detail_report.setVisible(False)
+        self._detail_report.setMaximumHeight(180)
+        self._detail_report.setStyleSheet(
+            "QTextEdit{font-family:Menlo,Consolas,monospace;font-size:10px;"
+            "background:#F9FAFB;border:1px solid #E5E7EB;border-radius:8px;padding:6px;}"
+        )
+        self._detail_report_toggle.toggled.connect(
+            lambda checked: (
+                self._detail_report.setVisible(checked),
+                self._detail_report_toggle.setText(
+                    "▼ 收起技术报告" if checked else "▶ 展开技术报告"
+                ),
+            )
+        )
+        summary_layout.addWidget(self._detail_report_toggle)
+        summary_layout.addWidget(self._detail_report)
         # 操作按钮行
         action_row = QHBoxLayout()
         action_row.setSpacing(8)
@@ -3648,6 +3799,22 @@ class MainWindow(QMainWindow):
         parts.append(f"⚡ {cfg.get('fps',30)}fps")
         parts.append(f"🧵 {cfg.get('workers',2)}并发")
         self._detail_params.setText(" · ".join(parts))
+        try:
+            from autokat.core.quality import summarize_task_quality, technical_report_text
+            quality = summarize_task_quality(task_id)
+            deep_status = (
+                "未执行" if quality["deep_status"] == "unavailable"
+                else quality["deep_status"]
+            )
+            self._detail_quality.setText(
+                f"质量摘要：通过 {quality['passed']} · 自动修复 {quality['auto_fixed']} · "
+                f"阻断 {quality['failed']} · 深度验收 {deep_status}"
+            )
+            self._detail_report.setPlainText(technical_report_text(task_id))
+            self._detail_report_toggle.setVisible(True)
+        except Exception:
+            self._detail_quality.setText("质量摘要：未执行新版验收")
+            self._detail_report.setPlainText("尚无新版质量与性能技术报告。")
         # 按钮可用性
         status = task["status"]
         self._detail_btn_resume.setVisible(status in ("pending",))
@@ -3967,6 +4134,12 @@ class MainWindow(QMainWindow):
             "QPushButton:hover { background: #1D4ED8; }"
         )
         btn_row.addWidget(import_btn)
+        pause_import_btn = QPushButton("暂停导入")
+        retry_import_btn = QPushButton("重试失败")
+        pause_import_btn.setEnabled(False)
+        retry_import_btn.setEnabled(False)
+        btn_row.addWidget(pause_import_btn)
+        btn_row.addWidget(retry_import_btn)
         refresh_btn = QPushButton("\U0001f504 刷新")
         refresh_btn.setStyleSheet(
             "QPushButton { background: #FFFFFF; color: #2563EB; font-weight: 500;"
@@ -4014,6 +4187,24 @@ class MainWindow(QMainWindow):
         import_status.setStyleSheet("font-size:12px; color:#6B7280; background:transparent; font-weight:500;")
         progress_row.addWidget(import_status)
         layout.addLayout(progress_row)
+        latest_import_job = {"id": None}
+        try:
+            from autokat.core.import_jobs import ImportJobService
+            jobs = ImportJobService().list_jobs()
+            if jobs:
+                latest = jobs[0]
+                latest_import_job["id"] = int(latest["id"])
+                import_progress.setRange(0, max(1, int(latest["total"])))
+                import_progress.setValue(int(latest["done"]))
+                import_progress.setVisible(True)
+                import_status.setText(
+                    f"后台导入任务 #{latest['id']}：{latest['done']}/{latest['total']} · "
+                    f"{latest['status']}，离开页面或重启应用后可继续"
+                )
+                pause_import_btn.setEnabled(latest["status"] in ("queued", "running"))
+                retry_import_btn.setEnabled(latest["status"] == "failed")
+        except Exception:
+            pass
         # 素材列表（自定义 widget：复选框 + 文字区橡皮筋框选）
         mat_list = _RubberBandCheckListWidget()
         mat_list.setStyleSheet(
@@ -4027,6 +4218,12 @@ class MainWindow(QMainWindow):
         def _refresh():
             mat_list.clear()
             materials = get_all_materials()
+            conn = get_conn()
+            analysis_by_id = {
+                row["material_id"]: dict(row)
+                for row in conn.execute("SELECT * FROM material_analysis").fetchall()
+            }
+            conn.close()
             types = {}
             for m in materials:
                 types[m["mat_type"]] = types.get(m["mat_type"], 0) + 1
@@ -4039,6 +4236,15 @@ class MainWindow(QMainWindow):
                     if len(tags) > 5:
                         text += f" +{len(tags) - 5}"
                     text += "]"
+                analysis = analysis_by_id.get(m.get("clip_parent") or m["id"])
+                if analysis:
+                    if analysis["status"] == "done":
+                        text += (
+                            f"  · 能力: {analysis['capability_summary']}"
+                            f"  · 质量 {float(analysis['quality_score'] or 0):.2f}"
+                        )
+                    else:
+                        text += f"  · 分析: {analysis['status']}"
                 item = QListWidgetItem(text)
                 item.setData(Qt.UserRole, m["id"])
                 item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
@@ -4116,6 +4322,8 @@ class MainWindow(QMainWindow):
                 "素材文件 (*.jpg *.jpeg *.png *.webp *.mp4 *.mov *.avi *.mkv);;所有文件 (*)")
             if not files:
                 return
+            from autokat.core.import_jobs import ImportJobService
+            latest_import_job["id"] = ImportJobService().create_job(files)
             import_btn.setEnabled(False)
             import_btn.setText("导入中…")
             import_progress.setRange(0, len(files))
@@ -4128,11 +4336,13 @@ class MainWindow(QMainWindow):
                 finished_ok = Signal(object)            # stats dict
                 failed = Signal(str)
                 def run(self):
-                    from autokat.core.material import import_files_with_callback
+                    from autokat.core.import_jobs import ImportJobService
                     try:
                         def _cb(cur, total, fn, st):
                             self.progress.emit(cur, total, fn, st)
-                        stats_obj = import_files_with_callback(files, _cb, generate_kenburns=True)
+                        stats_obj = ImportJobService().process_job(
+                            int(latest_import_job["id"]), on_progress=_cb,
+                        )
                         self.finished_ok.emit(stats_obj)
                     except Exception as e:
                         self.failed.emit(str(e))
@@ -4155,6 +4365,8 @@ class MainWindow(QMainWindow):
                 import_status.setText(f"完成:新增 {n_ok},跳过 {n_skip}")
                 import_btn.setEnabled(True)
                 import_btn.setText("📂 导入素材")
+                pause_import_btn.setEnabled(False)
+                retry_import_btn.setEnabled(bool(stats_obj.get("errors")))
                 clear_material_pool_cache()
                 _refresh()
                 # 3 秒后自动隐藏进度条,恢复初始提示
@@ -4171,6 +4383,31 @@ class MainWindow(QMainWindow):
             worker.failed.connect(_on_fail)
             worker.start()
         import_btn.clicked.connect(_import)
+        def _pause_import():
+            if latest_import_job["id"] is None:
+                return
+            from autokat.core.import_jobs import ImportJobService
+            ImportJobService().pause_job(int(latest_import_job["id"]))
+            pause_import_btn.setEnabled(False)
+            import_status.setText(
+                f"导入任务 #{latest_import_job['id']} 已请求暂停，当前文件完成后生效"
+            )
+
+        def _retry_import():
+            if latest_import_job["id"] is None:
+                return
+            from autokat.core.import_jobs import ImportJobService
+            service = ImportJobService()
+            service.retry_failed(int(latest_import_job["id"]))
+            retry_import_btn.setEnabled(False)
+            pause_import_btn.setEnabled(True)
+            import_status.setText(f"导入任务 #{latest_import_job['id']} 正在重试失败项")
+            threading.Thread(
+                target=service.process_job, args=(int(latest_import_job["id"]),), daemon=True,
+            ).start()
+
+        pause_import_btn.clicked.connect(_pause_import)
+        retry_import_btn.clicked.connect(_retry_import)
         refresh_btn.clicked.connect(_refresh)
         mat_list.setContextMenuPolicy(Qt.CustomContextMenu)
         mat_list.customContextMenuRequested.connect(_on_context)
@@ -4573,14 +4810,17 @@ def run_ui():
     try:
         init_db()
     except Exception as e:
-        warnings.append(f"Database init failed: {e}")
-        from autokat.models.db import DB_PATH
-        db_path = DB_PATH
-        if db_path.exists():
-            db_path.unlink()
-        init_db()
+        warnings.append(f"Database migration failed; original database was preserved: {e}")
     
     ensure_dirs()
+    # Persistent imports continue independently of the visible page.
+    try:
+        from autokat.core.import_jobs import resume_import_jobs
+        threading.Thread(target=resume_import_jobs, daemon=True).start()
+        from autokat.core.material_analysis import analyze_pending_materials
+        threading.Thread(target=analyze_pending_materials, daemon=True).start()
+    except Exception as exc:
+        warnings.append(f"Import job resume failed: {exc}")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     app = QApplication(sys.argv)
     app_icon_path = os.environ.get("AUTOKAT_APP_ICON")
