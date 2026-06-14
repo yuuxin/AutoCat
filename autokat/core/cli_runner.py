@@ -168,6 +168,7 @@ def run_generate(
 
     # 6) 实际生成（核心调用，GUI/CLI 共用同一条路径）
     task_id = create_and_run_batch(
+
         script_id=script_id,
         narration_text=text,
         narration_config=tts_config or None,
@@ -182,6 +183,7 @@ def run_generate(
         config=batch_config,
         subtitle_position=subtitle_position,
         log_fn=log_fn,
+        wizard_snapshot=batch_config.get("wizard_snapshot"),
     )
     log_fn(f"[run_generate] 任务已创建: task_id={task_id}")
     return task_id

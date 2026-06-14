@@ -41,6 +41,9 @@ from autokat.core.writer import (
     list_styles, check_deepseek_available, set_deepseek_key, set_deepseek_config,
 )
 from autokat.core.paths import DATA_ROOT
+from autokat.core.wizard_snapshot import (
+    WIZARD_FIELD_LABELS, empty_snapshot, label_for,
+)
 try:
     from autokat.core.ai_providers import (
         load_ai_settings, load_deepseek_key, save_deepseek_key,
@@ -465,6 +468,12 @@ class MainWindow(QMainWindow):
         self._current_task_id = None
         self._sidebar_filter = "all"  # all / running / done / failed / pending
         self._wizard_draft = {}  # 暂存向导中的草稿
+        # v3: 向导当前的查看/编辑模式。None=正常新建，'view'=只读查看已有任务,
+        # 'fork'=基于已有任务新建(预填+可编辑)。配合 _wizard_view_task_id 一起用。
+        self._wizard_mode = None
+        self._wizard_view_task_id = None
+        # 旧任务降级：wizard_snapshot 为 NULL 时打开的"不完整视图"标记
+        self._wizard_view_is_legacy = False
         self._gen_start_time = datetime.now()
         self._wiz_poll_timer = QTimer()
         self._detail_task_id = None
@@ -603,6 +612,50 @@ class MainWindow(QMainWindow):
         self._content_stack.addWidget(self._wizard_step3)      # 3
         self._content_stack.addWidget(self._wizard_step4)      # 4
         self._content_stack.addWidget(self._task_detail_page)  # 5
+        # v3: 向导查看模式横幅。Qt 不允许同一 widget 挂在多个 layout 下，
+        # 所以为 4 个 step page 各建一个 banner 实例（视觉/文案完全一致）。
+        # 第一个 banner 的 label 和 button 暴露为 self 属性，方便统一改文案。
+        self._wizard_view_banners = []
+        self._wizard_view_banner = None  # 第一个 banner, 保留为兼容引用
+        self._wizard_view_banner_label = None
+        self._wizard_view_banner_btn = None
+        for _sp_idx in range(1, 5):
+            _ban = QFrame()
+            _ban.setObjectName("wizard_view_banner")
+            _ban.setStyleSheet(
+                "QFrame#wizard_view_banner{background:#FEF3C7;border:1.5px solid #FBBF24;"
+                "border-radius:10px;padding:0 12px;}"
+                "QFrame#wizard_view_banner QLabel{color:#92400E;font-size:12px;"
+                "font-weight:600;background:transparent;border:none;}"
+                "QFrame#wizard_view_banner QPushButton{background:#FFFFFF;color:#92400E;"
+                "border:1.5px solid #F59E0B;border-radius:8px;padding:5px 16px;"
+                "font-size:12px;font-weight:700;}"
+                "QFrame#wizard_view_banner QPushButton:hover{background:#FEF3C7;}"
+            )
+            _ban.setMinimumHeight(38)
+            _ban.setMaximumHeight(44)
+            _lay = QHBoxLayout(_ban)
+            _lay.setContentsMargins(10, 4, 8, 4)
+            _lay.setSpacing(10)
+            _lbl = QLabel("")
+            _lbl.setMinimumWidth(200)
+            _lay.addWidget(_lbl, 1)
+            _btn = QPushButton("知道了")
+            _btn.setFixedHeight(28)
+            _btn.clicked.connect(self._exit_wizard_view)
+            _lay.addWidget(_btn, 0)
+            _ban.setVisible(False)
+            self._wizard_view_banners.append((_ban, _lbl, _btn))
+            if _sp_idx == 1:
+                # 保留第一个 banner 的引用作为"主"banner, 让 _enter_wizard_for
+                # 只改这一份文案即可（4 个 banner 的 label/button 都是独立 widget
+                # 但我们手动把它们的 text 同步一下）
+                self._wizard_view_banner = _ban
+                self._wizard_view_banner_label = _lbl
+                self._wizard_view_banner_btn = _btn
+            # 把 banner 插到这个 step page 的布局顶端
+            _sp = getattr(self, f"_wizard_step{_sp_idx}")
+            _sp.layout().insertWidget(0, _ban)
         self._show_page(self.PAGE_DASHBOARD)
         # v2.3 兼容 shim: 旧 test 还在 hasattr 旧控件 (_wiz_filter / _wiz_color_mood / _wiz_max_clips / 风险徽章)
         # 这些控件已移除但保留属性占位 (None) 防止 test 崩
@@ -974,6 +1027,22 @@ class MainWindow(QMainWindow):
         time_lbl.setFixedWidth(100)
         time_lbl.setStyleSheet("font-size:12px;color:#6B7280;background:transparent;")
         layout.addWidget(time_lbl)
+        # v3: 卡片尾部加一个 "查看配置" 小图标入口。点击直接打开 wizard view 模式，
+        # 不用先点进任务详情页。Qt 按钮 click 不会冒泡到 card 的 mousePressEvent，
+        # 所以这里不会跟 card 整体的"跳详情"点击冲突。
+        view_btn = QPushButton("👁")
+        view_btn.setFixedSize(28, 24)
+        view_btn.setCursor(Qt.PointingHandCursor)
+        view_btn.setToolTip(f"查看任务 #{t['id']} 的步骤配置（只读）")
+        view_btn.setStyleSheet(
+            "QPushButton{background:transparent;color:#0EA5E9;font-size:14px;"
+            "border:1px solid transparent;border-radius:6px;padding:0;}"
+            "QPushButton:hover{background:#0EA5E910;border-color:#0EA5E940;}"
+        )
+        view_btn.clicked.connect(
+            lambda _checked=False, _tid=t["id"]: self._open_wizard_view(_tid)
+        )
+        layout.addWidget(view_btn)
         return card
     @staticmethod
     def _make_small_btn(text: str, cb) -> QPushButton:
@@ -1022,26 +1091,9 @@ class MainWindow(QMainWindow):
         self._log(f"🔄 任务 #{task_id} 已准备重试（重置 {reset_count} 条失败成片）")
         self._resume_task(task_id)
     def _replay_task(self, task_id):
-        """复现任务：读取配置，预填向导"""
-        task = get_task(task_id)
-        if not task:
-            return
-        script = get_script_by_id(task["script_id"])
-        cfg = json.loads(task["config"]) if isinstance(task["config"], str) else task["config"]
-        self._wizard_draft = {
-            "script_text": script["narration"] if script else "",
-            "script_name": (script["name"] if script else "") + " (复现)",
-            "voice": cfg.get("voice", "zh-CN-XiaoxiaoNeural"),
-            "rate": cfg.get("rate", "+0%"),
-            "pitch": cfg.get("pitch", "+0Hz"),
-            "count": cfg.get("count", 100),
-            "workers": cfg.get("workers", 2),
-            "fps": cfg.get("fps", 30),
-            "enable_bgm": cfg.get("enable_bgm", False),
-            "bgm_volume": cfg.get("bgm_volume", 12),
-            "lang": cfg.get("lang", "zh"),
-        }
-        self._start_wizard()
+        """基于此新建：原"复现"按钮的回调。现在统一走 _enter_wizard_for(fork)
+        复用完整的 snapshot 还原 + readonly 切换逻辑。"""
+        self._enter_wizard_for(task_id, mode="fork")
     # ══════════════════════════════════════════════════════════
     # 向导：Step 1 - 素材导入
     # ══════════════════════════════════════════════════════════
@@ -2568,6 +2620,13 @@ class MainWindow(QMainWindow):
 
         if hasattr(self, "_wiz_dedup") and self._wiz_dedup.isChecked():
             cfg["dedup_threshold"] = 0.78
+        # v3 wizard 快照：全量 UI 状态 JSON 字符串，db_create_task 写入 tasks.wizard_snapshot。
+        # 之后 "查看配置 / 基于此新建" 两种模式都靠这个字段还原。
+        import json as _json
+        try:
+            cfg["wizard_snapshot"] = _json.dumps(self._capture_wizard_snapshot(), ensure_ascii=False)
+        except Exception:
+            cfg["wizard_snapshot"] = None
         # v2.3 E1: 字幕字体/字号/动效 (差异化的字幕层)
         if hasattr(self, "_wiz_subtitle_font"):
             cfg["subtitle_font"] = self._wiz_subtitle_font.currentText()
@@ -2778,6 +2837,333 @@ class MainWindow(QMainWindow):
     # ══════════════════════════════════════════════════════════
     # 步骤条组件
     # ══════════════════════════════════════════════════════════
+    # -- 步骤快照 capture / apply / readonly -----------------------------
+    # 这三个方法配合 wizard_snapshot.WIZARD_FIELD_LABELS 字典使用，让任何已完成
+    # 任务都能以 view（只读）或 fork（可编辑）两种模式重新打开向导。
+
+    def _wizard_interactive_widgets(self) -> list:
+        """Return all input widgets across the 4 wizard step pages.
+
+        Skips the step bar (tagged with objectName "step_bar") and the
+        Close wizard button (it must stay clickable in any mode). Callers
+        iterate the result to setEnabled() in bulk.
+        """
+        from PySide6.QtWidgets import (
+            QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QSpinBox,
+            QDoubleSpinBox, QCheckBox, QRadioButton, QSlider, QPushButton,
+        )
+        # QPushButton is included separately so we can filter the close button.
+        # findChildren doesn't accept a tuple of types, so we query each.
+        widget_type_lists = (QLineEdit, QTextEdit, QPlainTextEdit, QComboBox,
+                             QSpinBox, QDoubleSpinBox, QCheckBox, QRadioButton,
+                             QSlider)
+        result = []
+        for step_idx in range(1, 5):
+            page = getattr(self, f"_wizard_step{step_idx}", None)
+            if page is None:
+                continue
+            for wt in widget_type_lists:
+                for w in page.findChildren(wt):
+                    # Skip the step bar (objectName set in _build_step_bar)
+                    parent = w.parent()
+                    in_step_bar = False
+                    while parent is not None and parent is not page:
+                        if parent.objectName() == "step_bar":
+                            in_step_bar = True
+                            break
+                        parent = parent.parent()
+                    if not in_step_bar:
+                        result.append(w)
+        return result
+
+    def _set_wizard_readonly(self, readonly: bool) -> None:
+        """Enable or disable every wizard input widget. Used to enter view mode.
+
+        In view mode the step bar stays clickable (handled separately, not in
+        this method), the "Close wizard" button stays clickable, and the
+        "知道了" exit button (added in view mode by the caller) shows.
+        """
+        for w in self._wizard_interactive_widgets():
+            try:
+                w.setEnabled(not readonly)
+            except Exception:
+                pass
+
+    def _capture_wizard_snapshot(self) -> dict:
+        """Dump every wizard widget's value into a JSON-serializable dict.
+
+        Safe to call at any time (even mid-wizard). Fields the wizard hasn't
+        touched yet come out as None; that's fine, the schema is permissive.
+        """
+        snap = empty_snapshot()
+        fields = snap["fields"]
+        # Step 1
+        if hasattr(self, "_wiz_selected_materials"):
+            fields["selected_material_ids"] = sorted(
+                int(m) for m in self._wiz_selected_materials
+            )
+        # Step 2
+        if hasattr(self, "_wiz_script_editor"):
+            fields["script_text"] = self._wiz_script_editor.toPlainText()
+        if hasattr(self, "_wiz_script_name"):
+            fields["script_name"] = self._wiz_script_name.text()
+        if hasattr(self, "_wiz_voice"):
+            fields["voice"] = self._wiz_voice.currentText()
+        if hasattr(self, "_wiz_rate"):
+            fields["rate"] = int(self._wiz_rate.value())
+        if hasattr(self, "_wiz_pitch"):
+            fields["pitch"] = int(self._wiz_pitch.value())
+        if hasattr(self, "_wiz_video_type_step2"):
+            fields["writer_provider"] = (
+                self._wiz_video_type_step2.currentData() or "auto"
+            )
+        # Step 3
+        if hasattr(self, "_wiz_step3_tname_edit"):
+            fields["task_name"] = self._wiz_step3_tname_edit.text()
+        if hasattr(self, "_wiz_count"):
+            fields["count"] = int(self._wiz_count.value())
+        if hasattr(self, "_wiz_workers"):
+            fields["workers"] = int(self._wiz_workers.value())
+        if hasattr(self, "_wiz_fps"):
+            fields["fps"] = int(self._wiz_fps.currentText())
+        if hasattr(self, "_wiz_enable_bgm"):
+            fields["enable_bgm"] = bool(self._wiz_enable_bgm.isChecked())
+        if hasattr(self, "_wiz_bgm_volume"):
+            fields["bgm_volume"] = int(self._wiz_bgm_volume.value())
+        if hasattr(self, "_wiz_max_uses"):
+            fields["max_uses_per_slice"] = int(self._wiz_max_uses.value())
+        if hasattr(self, "_wiz_enable_perturb"):
+            fields["enable_diversity"] = bool(self._wiz_enable_perturb.isChecked())
+        if hasattr(self, "_wiz_pert_level_group"):
+            fields["perturbation_level"] = self._wiz_pert_level_group.checkedId()
+        if hasattr(self, "_wiz_dedup") and self._wiz_dedup.isChecked():
+            fields["dedup_threshold"] = 0.78
+        if hasattr(self, "_wiz_subtitle_font"):
+            fields["subtitle_font"] = self._wiz_subtitle_font.currentText()
+        if hasattr(self, "_wiz_subtitle_size"):
+            fields["font_size"] = int(self._wiz_subtitle_size.value())
+        if hasattr(self, "_wiz_platform_group"):
+            fields["platform"] = self._wiz_platform_group.checkedId()
+        if hasattr(self, "_wiz_video_type_step3"):
+            fields["video_type"] = self._wiz_video_type_step3.currentData() or "auto"
+        # writer_provider is sourced from AI settings (not a wizard widget);
+        # capture it so a fork can reproduce the exact provider choice.
+        try:
+            from autokat.core.ai_providers import load_ai_settings
+            fields["writer_provider"] = load_ai_settings().get("provider", "local")
+        except Exception:
+            fields["writer_provider"] = "local"
+        return snap
+
+    def _apply_wizard_snapshot(self, snapshot: dict) -> None:
+        """Restore wizard widget values from a previously captured snapshot.
+
+        Unknown / missing fields are silently ignored (the schema is
+        forward-compatible: older snapshots opened in newer wizards just
+        skip fields that no longer exist).
+        """
+        if not snapshot or not isinstance(snapshot, dict):
+            return
+        fields = snapshot.get("fields") or {}
+        # Step 1
+        mat_ids = fields.get("selected_material_ids")
+        if mat_ids is not None and hasattr(self, "_wiz_selected_materials"):
+            self._wiz_selected_materials = set(int(m) for m in mat_ids)
+        # Step 2
+        if "script_text" in fields and hasattr(self, "_wiz_script_editor"):
+            self._wiz_script_editor.setPlainText(fields["script_text"] or "")
+        if "script_name" in fields and hasattr(self, "_wiz_script_name"):
+            self._wiz_script_name.setText(fields["script_name"] or "")
+        if "voice" in fields and hasattr(self, "_wiz_voice"):
+            v = fields["voice"]
+            idx = self._wiz_voice.findText(v) if v else -1
+            if idx >= 0:
+                self._wiz_voice.setCurrentIndex(idx)
+        if "rate" in fields and hasattr(self, "_wiz_rate"):
+            self._wiz_rate.setValue(int(fields["rate"] or 0))
+        if "pitch" in fields and hasattr(self, "_wiz_pitch"):
+            self._wiz_pitch.setValue(int(fields["pitch"] or 0))
+        # video_type is sync'd between step 2 and step 3; we update the
+        # step 3 one (which is the "authoritative" copy in fork mode)
+        if "video_type" in fields and hasattr(self, "_wiz_video_type_step3"):
+            v = fields["video_type"] or "auto"
+            idx = self._wiz_video_type_step3.findData(v)
+            if idx >= 0:
+                self._wiz_video_type_step3.setCurrentIndex(idx)
+        # Step 3
+        if "task_name" in fields and hasattr(self, "_wiz_step3_tname_edit"):
+            self._wiz_step3_tname_edit.setText(fields["task_name"] or "")
+        if "count" in fields and hasattr(self, "_wiz_count"):
+            self._wiz_count.setValue(int(fields["count"] or 100))
+        if "workers" in fields and hasattr(self, "_wiz_workers"):
+            self._wiz_workers.setValue(int(fields["workers"] or 0))
+        if "fps" in fields and hasattr(self, "_wiz_fps"):
+            v = str(fields["fps"] or 30)
+            idx = self._wiz_fps.findText(v)
+            if idx >= 0:
+                self._wiz_fps.setCurrentIndex(idx)
+        if "enable_bgm" in fields and hasattr(self, "_wiz_enable_bgm"):
+            self._wiz_enable_bgm.setChecked(bool(fields["enable_bgm"]))
+        if "bgm_volume" in fields and hasattr(self, "_wiz_bgm_volume"):
+            self._wiz_bgm_volume.setValue(int(fields["bgm_volume"] or 12))
+        if "max_uses_per_slice" in fields and hasattr(self, "_wiz_max_uses"):
+            self._wiz_max_uses.setValue(int(fields["max_uses_per_slice"] or 5))
+        if "enable_diversity" in fields and hasattr(self, "_wiz_enable_perturb"):
+            self._wiz_enable_perturb.setChecked(bool(fields["enable_diversity"]))
+        if "perturbation_level" in fields and hasattr(self, "_wiz_pert_level_group"):
+            btn = self._wiz_pert_level_group.button(int(fields["perturbation_level"] or 0))
+            if btn is not None:
+                btn.setChecked(True)
+        if "dedup_threshold" in fields and hasattr(self, "_wiz_dedup"):
+            self._wiz_dedup.setChecked(fields["dedup_threshold"] is not None)
+        if "subtitle_font" in fields and hasattr(self, "_wiz_subtitle_font"):
+            v = fields["subtitle_font"]
+            idx = self._wiz_subtitle_font.findText(v) if v else -1
+            if idx >= 0:
+                self._wiz_subtitle_font.setCurrentIndex(idx)
+        if "font_size" in fields and hasattr(self, "_wiz_subtitle_size"):
+            self._wiz_subtitle_size.setValue(int(fields["font_size"] or 24))
+        if "platform" in fields and hasattr(self, "_wiz_platform_group"):
+            btn = self._wiz_platform_group.button(int(fields["platform"] or 0))
+            if btn is not None:
+                btn.setChecked(True)
+
+    def _wizard_set_field_for_test(self, field: str, value):
+        """测试用: 设置某个 wizard 字段值, 模拟 capture 之后 apply 验证。
+
+        不在生产代码中使用, 也不在 UI 暴露入口。"""
+        snap = self._capture_wizard_snapshot()
+        snap["fields"][field] = value
+        self._apply_wizard_snapshot(snap)
+
+    def _enter_wizard_for(self, task_id: int, mode: str = "view") -> None:
+        """打开向导查看 / 基于此新建 已有任务。
+
+        mode:
+            ``view``  - 只读。控件全部 disabled，步骤条可点击来回翻，
+                        顶部 banner 显示 "只读模式"，底部 "知道了" 退出。
+            ``fork``  - 可编辑。控件预填任务快照，用户改完可以走"开始生成"
+                        走正常新建流程。
+
+        旧任务（wizard_snapshot 为 NULL）走 graceful degradation：banner 提示
+        "配置不完整"，view 模式只显示 tasks.config 里那 10 个字段。
+        """
+        from autokat.models.db import get_task, get_script_by_id
+        task = get_task(task_id)
+        if not task:
+            QMessageBox.warning(self, "提示", f"任务 #{task_id} 不存在")
+            return
+        script = get_script_by_id(task["script_id"])
+        # Reset any prior mode state
+        self._wizard_view_is_legacy = False
+        self._wizard_mode = mode
+        self._wizard_view_task_id = task_id
+        # Apply wizard_snapshot if present, else build a partial snapshot
+        # from tasks.config + scripts.tts_config for legacy graceful degradation.
+        raw_snap = task.get("wizard_snapshot")
+        is_legacy = not raw_snap
+        if raw_snap:
+            try:
+                snapshot = json.loads(raw_snap)
+            except Exception:
+                snapshot = empty_snapshot()
+        else:
+            snapshot = empty_snapshot()
+            cfg_str = task.get("config") or "{}"
+            try:
+                cfg = json.loads(cfg_str) if isinstance(cfg_str, str) else cfg_str
+            except Exception:
+                cfg = {}
+            # Map legacy cfg fields to the snapshot schema where they overlap
+            # Legacy cfg stored rate/pitch as strings like "0%" / "0Hz",
+            # but the new snapshot schema wants raw int slider values. Parse
+            # them here so old tasks render correctly in view mode.
+            def _parse_pct(v):
+                if v is None: return None
+                if isinstance(v, (int, float)): return int(v)
+                s = str(v).replace("%", "").replace("+", "").strip()
+                try: return int(float(s))
+                except (TypeError, ValueError): return None
+            legacy_map = {
+                "voice": cfg.get("voice"),
+                "rate": _parse_pct(cfg.get("rate")),
+                "pitch": _parse_pct(cfg.get("pitch")),
+                "count": cfg.get("count"),
+                "workers": cfg.get("workers"),
+                "fps": cfg.get("fps"),
+                "enable_bgm": cfg.get("enable_bgm"),
+                "bgm_volume": cfg.get("bgm_volume"),
+                "task_name": cfg.get("task_name"),
+            }
+            if script:
+                legacy_map["script_text"] = script.get("narration")
+                legacy_map["script_name"] = script.get("name")
+            for k, v in legacy_map.items():
+                if v is not None:
+                    snapshot["fields"][k] = v
+        # 同时填 _wizard_draft（兼容老代码 + app-test 期望）
+        self._wizard_draft = {
+            "script_text": snapshot["fields"].get("script_text") or "",
+            "script_name": snapshot["fields"].get("script_name") or "",
+            "voice": snapshot["fields"].get("voice") or "zh-CN-XiaoxiaoNeural",
+            "rate": str(snapshot["fields"].get("rate") or 0) + "%",
+            "pitch": str(snapshot["fields"].get("pitch") or 0) + "Hz",
+            "count": snapshot["fields"].get("count") or 100,
+            "workers": snapshot["fields"].get("workers") or 0,
+            "fps": snapshot["fields"].get("fps") or 30,
+            "enable_bgm": bool(snapshot["fields"].get("enable_bgm")),
+            "bgm_volume": snapshot["fields"].get("bgm_volume") or 12,
+            "shot_duration": 2.0,
+            "lang": "zh",
+        }
+        # Enter the wizard then apply the snapshot to the live widgets
+        self._start_wizard()
+        self._apply_wizard_snapshot(snapshot)
+        self._wizard_view_is_legacy = is_legacy
+        # In view mode, disable every input widget. In fork mode, leave them
+        # editable so the user can change anything before generating.
+        self._set_wizard_readonly(mode == "view")
+        # Sync all 4 banner instances with the right text and visibility.
+        # Only the currently-visible step page's banner is actually shown
+        # by Qt (other pages are hidden by the QStackedWidget), but we
+        # write to all 4 so when the user flips steps the banner is ready.
+        for _ban, _lbl, _btn in self._wizard_view_banners:
+            _ban.setVisible(True)
+            if mode == "view":
+                title = f"📖 查看配置 · 任务 #{task_id}"
+                if is_legacy:
+                    title += "  ·  ⚠️ 早期任务，仅显示部分字段"
+                _lbl.setText(title)
+                _btn.setText("知道了")
+            else:
+                title = f"📝 基于任务 #{task_id} 新建（可编辑）"
+                if is_legacy:
+                    title += "  ·  ⚠️ 早期任务，配置不完整，建议检查后修改"
+                _lbl.setText(title)
+                _btn.setText("取消并返回")
+        # In view mode, also dim the "下一步" buttons to make "知道了" the
+        # obvious exit. We can't easily hide them across 4 step pages
+        # without major refactor, so we leave the nav buttons enabled but
+        # add a visual hint via the banner.
+        self._log(
+            f"[wizard] 任务 #{task_id} 以 {mode} 模式打开，"
+            f"snapshot={('present' if not is_legacy else '缺失-降级')}"
+        )
+
+    def _exit_wizard_view(self) -> None:
+        """Exit view/fork mode: hide the banner, lift readonly, go back to dashboard."""
+        self._set_wizard_readonly(False)
+        for _ban, _lbl, _btn in self._wizard_view_banners:
+            _ban.setVisible(False)
+        self._wizard_mode = None
+        self._wizard_view_task_id = None
+        self._wizard_view_is_legacy = False
+        self._show_page(self.PAGE_DASHBOARD)
+
+    def _open_wizard_view(self, task_id: int) -> None:
+        """Dashboard "查看配置" icon entry: shorthand for _enter_wizard_for(..., view)."""
+        self._enter_wizard_for(task_id, mode="view")
+
     def _build_step_bar(self, current_step: int) -> QWidget:
         bar = QWidget()
         bar.setObjectName("step_bar")
@@ -2844,6 +3230,16 @@ class MainWindow(QMainWindow):
 
             node_lay.addWidget(circle, 0, Qt.AlignCenter)
             node_lay.addWidget(lbl, 0, Qt.AlignCenter)
+            # Make the step node clickable to jump directly to that step.
+            # Cursor + tooltip signal clickability; the actual handler is
+            # installed via mousePressEvent override so the existing visual
+            # layout (QWidget containing QVBoxLayout of QLabel children)
+            # is preserved.
+            node.setCursor(Qt.PointingHandCursor)
+            node.setToolTip(f"跳到第 {num} 步：{label}")
+            node.mousePressEvent = (
+                lambda _evt, _n=num: self._go_to_step(_n)
+            )
             track_lay.addWidget(node)
 
             # 连接线：只在两个节点之间
@@ -3624,7 +4020,20 @@ class MainWindow(QMainWindow):
         action_row.addWidget(self._detail_btn_resume)
         self._detail_btn_retry = self._make_detail_btn("🔄 重试", "#F59E0B", lambda: self._on_detail_retry())
         action_row.addWidget(self._detail_btn_retry)
-        self._detail_btn_replay = self._make_detail_btn("🔁 复现", "#2563EB", lambda: self._on_detail_replay())
+        # v3: 把"复现"拆成两个入口——查看配置(view) + 基于此新建(fork)。
+        self._detail_btn_view = self._make_detail_btn(
+            "👁 查看配置", "#0EA5E9", lambda: self._on_detail_view()
+        )
+        action_row.addWidget(self._detail_btn_view)
+        self._detail_btn_fork = self._make_detail_btn(
+            "📝 基于此新建", "#2563EB", lambda: self._on_detail_fork()
+        )
+        action_row.addWidget(self._detail_btn_fork)
+        # 保留旧 self._detail_btn_replay 引用, 但隐藏, 防止别处代码崩
+        self._detail_btn_replay = self._make_detail_btn(
+            "🔁 复现 (兼容)", "#9CA3AF", lambda: self._on_detail_replay()
+        )
+        self._detail_btn_replay.setVisible(False)
         action_row.addWidget(self._detail_btn_replay)
         self._detail_btn_delete = self._make_detail_btn("🗑 删除", "#EF4444", lambda: self._on_detail_delete())
         action_row.addWidget(self._detail_btn_delete)
@@ -3895,6 +4304,16 @@ class MainWindow(QMainWindow):
     def _on_detail_replay(self):
         if hasattr(self, "_detail_task_id"):
             self._replay_task(self._detail_task_id)
+
+    def _on_detail_view(self):
+        """任务详情页 "查看配置" 入口：只读模式打开向导"""
+        if hasattr(self, "_detail_task_id") and self._detail_task_id:
+            self._enter_wizard_for(self._detail_task_id, mode="view")
+
+    def _on_detail_fork(self):
+        """任务详情页 "基于此新建" 入口：可编辑模式打开向导"""
+        if hasattr(self, "_detail_task_id") and self._detail_task_id:
+            self._enter_wizard_for(self._detail_task_id, mode="fork")
     def _on_detail_open_dir(self):
         """任务详情页「输出目录」：打开该任务实际的输出子目录（不是顶层 output/）"""
         if not hasattr(self, "_detail_task_id"):

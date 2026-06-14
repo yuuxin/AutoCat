@@ -845,6 +845,7 @@ def create_and_run_batch(
     config: Optional[dict] = None,
     subtitle_position: Optional[str] = None,
     log_fn=None,
+    wizard_snapshot: Optional[str] = None,
 ) -> int:
     from autokat.models.db import create_task as db_create_task
     from autokat.core.progress_log import set_stage as _set_stage
@@ -1017,6 +1018,7 @@ def create_and_run_batch(
     task_id = db_create_task(
         script_id=script_id, config=config,
         output_dir=str(OUTPUT_DIR), total=count,
+        wizard_snapshot=wizard_snapshot,
     )
     from autokat.core.batch_planner import BatchPlanner
     planner = BatchPlanner()

@@ -22,7 +22,7 @@ class DatabaseMigrationTests(unittest.TestCase):
                 }
                 versions = conn.execute("SELECT version FROM schema_migrations").fetchall()
                 conn.close()
-        self.assertEqual(versions, [(1,), (2,), (3,)])
+        self.assertEqual(versions, [(1,), (2,), (3,), (4,)])
         self.assertTrue({
             "import_jobs", "import_items", "material_analysis", "virtual_slices",
             "cache_entries", "task_materials", "task_plans", "quality_runs",

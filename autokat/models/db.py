@@ -225,10 +225,28 @@ def _migration_v3(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_v4(conn: sqlite3.Connection) -> None:
+    """Add tasks.wizard_snapshot column for full UI state replay & view-only inspection.
+
+    Captured at task creation time so that any future task can be opened in the
+    wizard in either of two modes: view (read-only, audit Steps 1-3 after the
+    task finished) or fork (editable, copy the configuration into a new task).
+    Old tasks created before this migration have NULL here and gracefully
+    degrade to showing only the trimmed subset of fields that tasks.config
+    already records.
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+    if "wizard_snapshot" not in cols:
+        conn.execute(
+            "ALTER TABLE tasks ADD COLUMN wizard_snapshot TEXT DEFAULT NULL"
+        )
+
+
 MIGRATIONS = {
     1: ("persistent library, planning, cache and QA foundations", _migration_v1),
     2: ("backfill virtual slices for legacy source videos", _migration_v2),
     3: ("classify legacy original materials and physical slices", _migration_v3),
+    4: ("wizard_snapshot column on tasks for full UI replay", _migration_v4),
 }
 
 
@@ -299,6 +317,7 @@ def init_db():
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             script_id   INTEGER NOT NULL,
             config      TEXT    NOT NULL DEFAULT '{}', -- 生成参数 JSON
+            wizard_snapshot TEXT DEFAULT NULL,         -- 完整 UI 状态（用于查看配置/基于此新建）
             status      TEXT    NOT NULL DEFAULT 'pending'
                         CHECK(status IN ('pending','running','done','failed')),
             total       INTEGER DEFAULT 0,
@@ -572,16 +591,38 @@ def get_clip_count(mat_id: int) -> int:
 
 # ── 任务 CRUD ──
 
-def create_task(script_id: int, config: dict, output_dir: str, total: int) -> int:
+def create_task(
+    script_id: int, config: dict, output_dir: str, total: int,
+    wizard_snapshot: Optional[str] = None,
+) -> int:
+    """Create a new task. ``wizard_snapshot`` is an opaque JSON blob capturing
+    every wizard widget's value at creation time, so the task can later be
+    reopened in view/fork mode. Older callers can pass ``None`` and the row
+    will get a NULL column (graceful degradation)."""
     conn = get_conn()
     cur = conn.execute(
-        "INSERT INTO tasks (script_id, config, total, output_dir) VALUES (?,?,?,?)",
-        (script_id, json.dumps(config), total, output_dir)
+        "INSERT INTO tasks (script_id, config, total, output_dir, wizard_snapshot) "
+        "VALUES (?,?,?,?,?)",
+        (script_id, json.dumps(config), total, output_dir, wizard_snapshot)
     )
     conn.commit()
     task_id = cur.lastrowid
     conn.close()
     return task_id
+
+
+def update_task_wizard_snapshot(task_id: int, wizard_snapshot: str) -> None:
+    """Persist the wizard UI snapshot for an existing task. Used by
+    MainWindow when the user clicks 开始生成; we write the snapshot after
+    all the per-step state is finalized so a later view/fork reopen shows
+    exactly what the user saw at generation time."""
+    conn = get_conn()
+    conn.execute(
+        "UPDATE tasks SET wizard_snapshot=? WHERE id=?",
+        (wizard_snapshot, task_id)
+    )
+    conn.commit()
+    conn.close()
 
 
 def get_task(task_id: int) -> Optional[dict]:
