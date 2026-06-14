@@ -587,6 +587,9 @@ class MainWindow(QMainWindow):
         self.PAGE_WIZARD_STEP3 = 3
         self.PAGE_WIZARD_STEP4 = 4
         self.PAGE_TASK_DETAIL = 5
+        # 视频类型下拉框：Step 2 与 Step 3 各放一个独立 QComboBox（Qt 不允许同一 widget
+        # 同时挂在两个 layout 下），通过 currentIndexChanged 双向同步，确保两边选中值一致。
+        # 实际 widget 实例在 _build_wizard_step2 / _build_wizard_step3 里创建。
         # 构建各页面
         self._dashboard_page = self._build_dashboard_page()
         self._wizard_step1 = self._build_wizard_step1()
@@ -1042,6 +1045,31 @@ class MainWindow(QMainWindow):
     # ══════════════════════════════════════════════════════════
     # 向导：Step 1 - 素材导入
     # ══════════════════════════════════════════════════════════
+    def _build_video_type_combo(self) -> QComboBox:
+        """Factory for the per-page 视频类型 QComboBox.
+
+        Step 2 and Step 3 each get their own QComboBox instance (Qt forbids
+        a single widget sitting in two layouts at once). They stay in sync
+        via currentIndexChanged connections wired in the calling page
+        builders, so the user can change the type on either page and the
+        other page reflects it immediately.
+        """
+        combo = QComboBox()
+        for _label, _key in (
+            ("自动判断", "auto"),
+            ("商品推荐", "product_recommendation"),
+            ("口播讲解", "talking_explanation"),
+            ("氛围记录", "atmosphere"),
+            ("音乐卡点", "music_beat"),
+            ("随机混剪", "random_mix"),
+        ):
+            combo.addItem(_label, _key)
+        combo.setToolTip(
+            "视频类型决定 AI 文案风格、镜头节奏和素材评分。\n"
+            "可在 Step 2 与 Step 3 之间随时切换，再次点 AI 辅助生成会用新风格重出文案。"
+        )
+        return combo
+
     def _build_wizard_step1(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -1420,6 +1448,16 @@ class MainWindow(QMainWindow):
         """)
         ai_btn.clicked.connect(self._on_wizard_ai_script)
         ai_row.addWidget(ai_btn)
+        # 视频类型下拉框：与 AI 辅助生成按钮同行，因为类型直接决定 AI 文案风格
+        _type_lbl = QLabel("视频类型:")
+        _type_lbl.setStyleSheet("color:#374151; font-size:12px; font-weight:600;")
+        ai_row.addWidget(_type_lbl)
+        self._wiz_video_type_step2 = self._build_video_type_combo()
+        self._wiz_video_type_step2.currentIndexChanged.connect(
+            lambda _i: self._wiz_video_type_step3.setCurrentIndex(_i)
+            if hasattr(self, "_wiz_video_type_step3") else None
+        )
+        ai_row.addWidget(self._wiz_video_type_step2)
         from_history_btn = QPushButton("📋 从历史选择")
         from_history_btn.setStyleSheet("""
             QPushButton {
@@ -1844,6 +1882,7 @@ class MainWindow(QMainWindow):
                                     accepted_texts=accepted,
                                     progress_callback=quality_progress,
                                     provider=provider_input.currentData(),
+                                    video_type=self._wiz_video_type_step2.currentData() or "auto",
                                     material_capabilities=__import__(
                                         "autokat.core.material_analysis", fromlist=["capability_summary"]
                                     ).capability_summary(
@@ -2136,22 +2175,17 @@ class MainWindow(QMainWindow):
         config_grid.setColumnStretch(5, 1)
 
         layout.addWidget(config_group)
+        # Step 3 的下拉框是独立实例，通过 currentIndexChanged 同步到 Step 2
         type_row = QHBoxLayout()
         type_label = QLabel("视频类型:")
         type_label.setStyleSheet("color:#374151; font-size:12px; font-weight:600;")
-        self._wiz_video_type = QComboBox()
-        for label, key in (
-            ("自动判断", "auto"),
-            ("商品推荐", "product_recommendation"),
-            ("口播讲解", "talking_explanation"),
-            ("氛围记录", "atmosphere"),
-            ("音乐卡点", "music_beat"),
-            ("随机混剪", "random_mix"),
-        ):
-            self._wiz_video_type.addItem(label, key)
-        self._wiz_video_type.setToolTip("默认自动判断；只影响镜头节奏与素材评分，不修改配音和字幕时间轴。")
         type_row.addWidget(type_label)
-        type_row.addWidget(self._wiz_video_type)
+        self._wiz_video_type_step3 = self._build_video_type_combo()
+        self._wiz_video_type_step3.currentIndexChanged.connect(
+            lambda _i: self._wiz_video_type_step2.setCurrentIndex(_i)
+            if hasattr(self, "_wiz_video_type_step2") else None
+        )
+        type_row.addWidget(self._wiz_video_type_step3)
         type_row.addStretch()
         layout.addLayout(type_row)
 
@@ -2503,8 +2537,8 @@ class MainWindow(QMainWindow):
             cfg["platform"] = PLATFORM_IDS[pid_idx]
         if hasattr(self, "_wiz_max_uses"):
             cfg["max_uses_per_slice"] = int(self._wiz_max_uses.value())
-        if hasattr(self, "_wiz_video_type"):
-            cfg["video_type"] = self._wiz_video_type.currentData() or "auto"
+        if hasattr(self, "_wiz_video_type_step3"):
+            cfg["video_type"] = self._wiz_video_type_step3.currentData() or "auto"
         # 写明选定的 AI Provider（local / deepseek）和语义版本，方便后续审计。
         try:
             from autokat.core.ai_providers import load_ai_settings
