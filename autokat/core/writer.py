@@ -55,11 +55,26 @@ def estimate_chars_for_lang(
 
 def estimate_chars_for_duration_range(
     lang: str, duration_min: float, duration_max: float, rate_pct: int = 0,
+    margin: float = 0.10,
 ) -> tuple[int, int]:
-    """Return a hard character range whose estimated duration stays in range."""
-    min_ideal = estimate_chars_for_lang(lang, duration_min, rate_pct, margin=0)[2]
-    max_ideal = estimate_chars_for_lang(lang, duration_max, rate_pct, margin=0)[2]
-    return min(min_ideal, max_ideal), max(min_ideal, max_ideal)
+    """Return (chars_min, chars_max) for a duration range with optional margin.
+
+    与 UI 显示路径使用同一套 margin (默认 0.10) — 这样 UI 提示的「预计文案
+    字符范围」与后端 enforce 的 target_chars_min/target_chars_max 完全一致。
+    之前的实现两边用不同 margin (UI=0.10, 后端=0) 导致 UI 107-156 / 后端
+    119-142 这种用户困惑。
+
+    margin 语义:
+      chars_min = ideal_at_min_dur * (1 - margin) — 短时长方向可放宽下限
+      chars_max = ideal_at_max_dur * (1 + margin) — 长时长方向可放宽上限
+    """
+    lo = min(duration_min, duration_max)
+    hi = max(duration_min, duration_max)
+    ideal_lo = estimate_chars_for_lang(lang, lo, rate_pct, margin=0)[2]
+    ideal_hi = estimate_chars_for_lang(lang, hi, rate_pct, margin=0)[2]
+    target_min = max(1, int(ideal_lo * (1 - margin)))
+    target_max = int(ideal_hi * (1 + margin))
+    return target_min, target_max
 
 from pathlib import Path
 from typing import Optional
@@ -190,6 +205,19 @@ def _build_prompt(topic: str, style: str,
             f"- 即使引用模板中的占位逻辑，也必须改写成抽象的情绪/场景表达，绝不能凭空捏造具体外观描述。\n"
         )
 
+    # v3.2: 【禁止捏造设计过程 / 过度承诺 / 跨品类】 — 始终启用, 与 validation 对应
+    # 极简措辞以避免 prompt 过长 (test_core_unit 期望 < 1000 字符)
+    no_fabrication_hint = (
+        "\n【禁止捏造】以下文案会被系统拒收 (validate_script_quality 直接拦截)：\n"
+        "- 设计过程 / 设计师故事：禁止「设计灵感」「设计故事」「设计理念」「设计师」「设计师的故事」「匠心」"
+        "「匠心独运」「匠心打造」「手工打造」「精雕细琢」「精心打造」「精挑细选」「每一寸细节」等"
+        "凭空捏造的设计过程或工艺细节。\n"
+        "- 无支撑的过度承诺：禁止「艺术品」「完美展现」「极致」「独一无二」「绝佳」「殿堂级」「全新升级」"
+        "「全球首发」「颠覆性」等无数据支撑的过度营销词。\n"
+        "- 跨品类混淆：禁止把产品说成另一种东西。如选题是女鞋，不能说「一件衣服」「衣物」「外套」"
+        "「裤子」「裙子」。保持品类一致。\n"
+    )
+
     # ── 长度硬约束 + 输出格式硬约束 ──
     # v3.1: 把长度要求升级为"系统会强制 trim 超过 max 的部分，少于 min 拒收"
     #       + 显式禁止 hashtag、emoji、markdown、前缀导语（之前在要求列表里已有，
@@ -230,7 +258,7 @@ def _build_prompt(topic: str, style: str,
 6. **绝对不要 markdown 格式** (不要 # 标题/不要 **加粗**/不要列表符号 - 1. -)
 7. **直接输出文案正文, 前后不要任何额外说明** (不要"以下是文案:"/"文案:"等前缀, 不要"好的, 这是文案"等导语)
 8. 必须围绕主题({topic})展开
-{diversity_hint}{no_appearance_hint}
+{diversity_hint}{no_appearance_hint}{no_fabrication_hint}
 {lang_hint}
 {extra_hint}
 
@@ -646,6 +674,62 @@ _UNSUPPORTED_PRODUCT_CLAIMS = (
 )
 _PROMOTION_WORDS = ("限时", "抢购", "特价", "特惠", "优惠", "秒杀", "直降", "折扣")
 
+# v3.2: 凭空捏造的设计过程/设计师故事 — 未提供素材细节时不能编造
+_FABRICATED_PROCESS_CLAIMS = (
+    "设计灵感", "设计故事", "设计理念", "设计哲学",
+    "匠心", "匠心独运", "匠心打造", "匠心呈现",
+    "设计师", "设计师的故事", "设计师的灵感",
+    "手工打造", "手工制作", "纯手工",
+    "精雕细琢", "精心打造", "精心设计", "精挑细选",
+    "每一寸细节", "每一道工序", "每一处细节",
+    "反复打磨", "千锤百炼",
+)
+
+# v3.2: 无具体数据/材质支撑的过度承诺词
+_OVERCLAIMS_NO_SUPPORT = (
+    "艺术品", "完美", "完美展现", "完美呈现", "完美融合",
+    "极致", "独一无二", "绝佳", "殿堂级", "顶配",
+    "全新升级", "全球首发", "颠覆性", "革命性",
+)
+
+# v3.2: 跨品类混淆 — topic 类别 → text 里不应出现的另一类核心词
+# 启发式: 当 topic 是 X 类时, text 把 X 描述成 Y 类核心词就标记为跨品类混淆
+_CROSS_CATEGORY_FORBIDDEN = {
+    # topic 含鞋相关词 → text 不能出现衣服/裤/裙等品类词 (除非作为搭配对象且未混淆主语)
+    ("鞋",): ("衣服", "衣物", "上衣", "外套", "衬衫", "T恤", "卫衣",
+              "裤子", "裙", "连衣裙"),
+    # topic 含衣服/裤/裙等 → text 不能出现鞋/靴/袜品类词
+    ("衣", "裤", "裙", "衫"): ("鞋子", "运动鞋", "皮鞋", "高跟鞋", "靴子", "袜子"),
+    # topic 含包 → text 不能出现衣服/鞋
+    ("包",): ("衣服", "衣物", "鞋子"),
+    # topic 含帽 → text 不能出现衣服/鞋
+    ("帽",): ("衣服", "衣物", "鞋子"),
+}
+
+_TOPIC_CATEGORY_KEYS = (
+    ("女鞋", "鞋子", "男鞋", "童鞋", "运动鞋", "皮鞋", "高跟鞋", "平底鞋",
+     "靴子", "凉鞋", "拖鞋", "袜子", "鞋"),
+    ("衣服", "上衣", "外套", "衬衫", "T恤", "卫衣", "风衣", "羽绒服",
+     "裤子", "裙", "连衣裙"),
+    ("包", "包包", "背包", "手提包", "钱包"),
+    ("帽", "帽子", "鸭舌帽", "渔夫帽"),
+)
+
+
+def _detect_topic_category(topic: str) -> Optional[str]:
+    """根据 topic 关键词粗略判定品类 (鞋 / 衣 / 包 / 帽 / None)。
+
+    用于跨品类混淆检测。如果 topic 是混合品类 (如 "穿搭" 这种风格词)，
+    返回 None 跳过检测。
+    """
+    if not topic:
+        return None
+    for idx, keywords in enumerate(_TOPIC_CATEGORY_KEYS):
+        for kw in keywords:
+            if kw in topic:
+                return ("鞋", "衣", "包", "帽")[idx]
+    return None
+
 
 def _content_char_count(text: str) -> int:
     return len(re.sub(r"\s+", "", text or ""))
@@ -729,6 +813,27 @@ def validate_script_quality(
         ]
         if claims:
             reasons.append("包含未提供的具体属性: " + "、".join(claims[:5]))
+    # v3.2: 凭空捏造的设计过程 / 设计师故事 — 不论有没有提供素材，都不允许出现
+    #        因为本地模型会编造不存在的设计师/灵感/工艺细节来填充篇幅
+    process_claims = [
+        claim for claim in _FABRICATED_PROCESS_CLAIMS if claim in text
+    ]
+    if process_claims:
+        reasons.append("凭空捏造设计过程/设计师故事: " + "、".join(process_claims[:5]))
+    # v3.2: 无数据支撑的过度承诺词 — 模型为了凑字数经常叠加这种词
+    overclaims = [claim for claim in _OVERCLAIMS_NO_SUPPORT if claim in text]
+    if overclaims:
+        reasons.append("无支撑的过度承诺: " + "、".join(overclaims[:5]))
+    # v3.2: 跨品类混淆 — topic 是鞋/衣/包/帽, text 里却把产品描述为另一品类
+    category = _detect_topic_category(topic)
+    if category:
+        forbidden = []
+        for cat_keys, bad_words in _CROSS_CATEGORY_FORBIDDEN.items():
+            if category in cat_keys:
+                forbidden.extend(bad_words)
+        cross_hits = [w for w in forbidden if w in text]
+        if cross_hits:
+            reasons.append(f"跨品类混淆: 选题是「{category}」但文案出现了 {cross_hits[:3]}")
     if lang == "zh":
         zh_count = sum("\u4e00" <= char <= "\u9fff" for char in text)
         foreign_count = sum(char.isalpha() and not ("\u4e00" <= char <= "\u9fff") for char in text)

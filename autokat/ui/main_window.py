@@ -1770,20 +1770,30 @@ class MainWindow(QMainWindow):
         def _update_ai_chars_tip(*_):
             """语速+语言+时长 任何一项变，重算预计字数"""
             try:
-                from autokat.core.writer import estimate_chars_for_lang
+                from autokat.core.writer import (
+                    estimate_chars_for_lang, estimate_chars_for_duration_range,
+                )
                 lang_idx = lang_input.currentIndex()
                 lang_code = ["zh", "th", "en"][lang_idx]
                 dmin = dur_min.value()
                 dmax = dur_max.value()
                 rate = ai_rate.value()
                 ai_rate_label.setText(f"{rate:+d}%")
-                mn_min, mx_min, ideal_min = estimate_chars_for_lang(lang_code, dmin, rate)
-                _, mx_max, ideal_max = estimate_chars_for_lang(lang_code, dmax, rate)
+                # v3.2: 始终用 estimate_chars_for_duration_range (默认 margin=0.10)
+                # 让 UI 提示范围与后端 enforce 完全一致; dmin==dmax 也显示范围
+                target_min, target_max = estimate_chars_for_duration_range(
+                    lang_code, dmin, dmax, rate,
+                )
+                _, _, ideal_min = estimate_chars_for_lang(lang_code, dmin, rate, margin=0)
+                _, _, ideal_max = estimate_chars_for_lang(lang_code, dmax, rate, margin=0)
+                target_min = min(target_min, target_max)
                 if dmax == dmin:
-                    txt = f"~{ideal_min} 字符（{lang_code}, {dmin}s, 语速 {rate:+d}%）"
+                    txt = (f"~{target_min}-{target_max} 字符 "
+                           f"（目标 {ideal_min}, {lang_code}, {dmin}s, 语速 {rate:+d}%）")
                 else:
-                    txt = (f"~{mn_min}-{mx_max} 字符（{lang_code}, "
-                           f"{dmin}-{dmax}s 目标, 语速 {rate:+d}%）")
+                    txt = (f"~{target_min}-{target_max} 字符 "
+                           f"（目标 {ideal_min}-{ideal_max}, {lang_code}, "
+                           f"{dmin}-{dmax}s, 语速 {rate:+d}%）")
                 ai_chars_tip.setText(txt)
                 ai_chars_tip.setStyleSheet(
                     "color:#10B981; font-size:11px; font-weight:600; "
