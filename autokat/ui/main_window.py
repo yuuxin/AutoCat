@@ -1107,18 +1107,13 @@ class MainWindow(QMainWindow):
         other page reflects it immediately.
         """
         combo = QComboBox()
-        for _label, _key in (
-            ("自动判断", "auto"),
-            ("商品推荐", "product_recommendation"),
-            ("口播讲解", "talking_explanation"),
-            ("氛围记录", "atmosphere"),
-            ("音乐卡点", "music_beat"),
-            ("随机混剪", "random_mix"),
-        ):
+        from autokat.core.ai_providers import VIDEO_TYPE_LABELS
+        # v3.2: 用 VIDEO_TYPE_LABELS (口语化名字), key 保持不变所以不会破坏现有快照
+        for _key, _label in VIDEO_TYPE_LABELS.items():
             combo.addItem(_label, _key)
         combo.setToolTip(
-            "视频类型决定 AI 文案风格、镜头节奏和素材评分。\n"
-            "可在 Step 2 与 Step 3 之间随时切换，再次点 AI 辅助生成会用新风格重出文案。"
+            "视频类型：决定 AI 怎么组织文案的结构和节奏。\n"
+            "可在 Step 2 与 Step 3 之间随时切换，再次点 AI 辅助生成会用新类型重出文案。"
         )
         return combo
 
@@ -1675,9 +1670,58 @@ class MainWindow(QMainWindow):
         topic_input = QLineEdit()
         topic_input.setPlaceholderText("例如：春夏单鞋、厨房收纳...")
         form.addRow("选题 *:", topic_input)
+
+        # v3.2: B+C 设计 — 视频类型为主控 (默认显示), 文案风格藏在 ⚙ 高级 后面
+        # 视频类型变 → 自动默认文案风格 (从 VIDEO_TYPE_DEFAULT_STYLE 取)
+        from autokat.core.ai_providers import (
+            VIDEO_TYPE_LABELS, VIDEO_TYPE_DEFAULT_STYLE,
+        )
+        from autokat.core.writer import list_style_choices
+
+        video_type_input = QComboBox()
+        for _key, _label in VIDEO_TYPE_LABELS.items():
+            video_type_input.addItem(_label, _key)
+        video_type_input.setToolTip("决定 AI 怎么组织文案的结构和节奏")
+        # 默认值: 与 Step 2/3 当前选择同步
+        _wiz_vt = getattr(self, "_wiz_video_type_step2", None)
+        if _wiz_vt is not None:
+            _idx = video_type_input.findData(_wiz_vt.currentData() or "auto")
+            if _idx >= 0:
+                video_type_input.setCurrentIndex(_idx)
+        form.addRow("视频类型:", video_type_input)
+
+        # ⚙ 高级 checkbox — 展开文案风格选择
+        advanced_checkbox = QCheckBox("⚙ 高级 (手动设置文案风格)")
+        advanced_checkbox.setChecked(False)
+        form.addRow("", advanced_checkbox)
+
+        # 文案风格 (默认隐藏, 勾选高级才显示)
         style_input = QComboBox()
-        style_input.addItems(list_styles())
-        form.addRow("风格:", style_input)
+        for _label, _key in list_style_choices():
+            style_input.addItem(_label, _key)
+        style_input.setToolTip("决定 AI 用什么腔调讲话（博主人设）。\n默认按视频类型自动匹配。")
+        style_input.setVisible(False)
+        form.addRow("文案风格:", style_input)
+
+        def _sync_default_style(video_type_key: str) -> None:
+            """视频类型变 → 默认文案风格 (仅在用户未手动改过时生效)。"""
+            default = VIDEO_TYPE_DEFAULT_STYLE.get(video_type_key)
+            if default is None:
+                return
+            idx = style_input.findData(default)
+            if idx >= 0:
+                style_input.setCurrentIndex(idx)
+
+        def _toggle_advanced(checked: bool) -> None:
+            style_input.setVisible(checked)
+            if checked:
+                _sync_default_style(video_type_input.currentData())
+
+        advanced_checkbox.toggled.connect(_toggle_advanced)
+        video_type_input.currentIndexChanged.connect(
+            lambda _i: _sync_default_style(video_type_input.currentData())
+        )
+
         provider_input = QComboBox()
         provider_input.addItem("本地模型", "local")
         provider_input.addItem("DeepSeek", "deepseek")
@@ -1905,7 +1949,10 @@ class MainWindow(QMainWindow):
             if not topic:
                 QMessageBox.warning(dlg, "提示", "请输入选题")
                 return
-            style = style_input.currentText()
+            # v3.2: 文案风格下拉框用 (label, key) 模式, 取 currentData() 而不是 currentText()
+            style = style_input.currentData() or style_input.currentText()
+            _vt_data = video_type_input.currentData()
+            _captured_video_type = _vt_data or "auto"
             detail = detail_input.text().strip() or None
             features = feature_input.text().strip() or None
             gen_btn.setEnabled(False)
@@ -1922,7 +1969,6 @@ class MainWindow(QMainWindow):
             # 否则 worker 里的 self 是 GenWorker 实例，访问 self._wiz_video_type_step2
             # 会 AttributeError，访问 self._wiz_selected_materials 会因为 getattr 默认值
             # 默默退化成空集合，AI 文案生成拿不到素材能力摘要。
-            _captured_video_type = self._wiz_video_type_step2.currentData() or "auto"
             _captured_provider = provider_input.currentData()
             _captured_selected_materials = list(
                 getattr(self, "_wiz_selected_materials", set()) or set()

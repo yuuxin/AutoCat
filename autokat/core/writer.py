@@ -1098,6 +1098,22 @@ def list_styles() -> list[str]:
     return list(STYLES.keys())
 
 
+# v3.2: UI 显示用的文案风格标签 — key 不变, prompt 内部描述保留
+# 命名原则: 用「身份+腔调」让用户一眼看出博主人设
+STYLE_LABELS: dict[str, str] = {
+    "种草推荐": "带货博主",
+    "生活技巧": "生活达人",
+    "知识科普": "科普老师",
+    "测评对比": "实测派",
+    "励志感悟": "走心姐姐",
+}
+
+
+def list_style_choices() -> list[tuple[str, str]]:
+    """返回 [(display_label, key), ...] 顺序, 用于 UI 下拉框构建。"""
+    return [(STYLE_LABELS.get(k, k), k) for k in STYLES.keys()]
+
+
 def generate_publish_title(narration: str, lang: str = "zh",
                            max_chars: int = 20, provider: str = "local") -> str:
     """根据口播文案生成一句发布标题 (10~max_chars 字)
