@@ -1053,41 +1053,16 @@ def generate_script_by_topic_detailed(
                 + "；".join(last_reasons)
             )
 
-    # Deterministic safe templates rotate until one is sufficiently different.
-    for offset in range(max(8, len(accepted_texts or []) + 1)):
-        fallback = build_safe_script(
-            topic, _variation_index + offset,
-            target_chars_min=target_chars_min,
-            target_chars_max=target_chars_max,
-        )
-        if _target_lang:
-            source_quality = validate_script_quality(
-                fallback, topic, lang="zh", detail=detail, features=features,
-            )
-            fallback = _translate_if_needed(fallback, _target_lang, provider=provider)
-            quality = validate_script_quality(
-                fallback, topic, lang=lang,
-                target_chars_min=target_chars_min,
-                target_chars_max=target_chars_max,
-                detail=detail, features=features,
-                accepted_texts=accepted_texts, require_topic=False,
-            )
-            if not source_quality["valid"]:
-                quality["valid"] = False
-                quality["reasons"] = source_quality["reasons"] + quality["reasons"]
-        else:
-            quality = validate_script_quality(
-                fallback, topic, lang=lang,
-                target_chars_min=target_chars_min,
-                target_chars_max=target_chars_max,
-                detail=detail, features=features,
-                accepted_texts=accepted_texts,
-            )
-        if quality["valid"]:
-            if progress_callback:
-                progress_callback("安全模板", 1, 1, "AI 重试耗尽，已使用安全模板补齐")
-            return {"text": fallback, "source": "安全模板", "quality": quality}
-    raise RuntimeError("安全模板未通过质量校验: " + "；".join(quality["reasons"]))
+    # v3.2: 移除 build_safe_script 兜底 (用户报告: 兜底模板「无意义」)。
+    # AI 重试耗尽后, 直接 raise 清晰错误, 异常路径直达 UI 日志, 用户看到后
+    # 知道是哪个 provider 失败 / 为什么失败, 然后在文本框手动录入。
+    _reasons = sorted(set(last_reasons))[:3] or ["模型未返回有效正文"]
+    raise RuntimeError(
+        f"{backend_name} 生成文案失败 (重试 {max_attempts} 次均不合格): "
+        + "；".join(_reasons)
+        + f"\n请在 AI 辅助生成对话框下方的文本框中手动录入文案, "
+        f"或检查 {backend_name} 配置 (Key/网络/模型名) 后重试。"
+    )
 
 
 def generate_script_by_topic(
@@ -1180,6 +1155,11 @@ def generate_publish_title(narration: str, lang: str = "zh",
         raise ValueError(f"不支持的文案模型: {provider}")
     if provider == "deepseek" and not DEEPSEEK_API_KEY:
         raise RuntimeError("已选择 DeepSeek，但尚未配置有效 API Key")
+    # v3.2: 移除「用 narration 首句截断」兜底 (用户报告: 「无意义」)。
+    # 标题 AI 失败时直接 raise, UI / 上游看到后让用户手动录入标题。
+    # 必须真的调一次 provider — 失败信息里要告诉用户「deepseek 调失败」
+    # 或「local 加载失败」, 而不是凭空说「调用失败」。
+    _errs = []
     if provider == "deepseek":
         try:
             result = _call_deepseek_api(prompt, max_tokens=128)
@@ -1191,8 +1171,8 @@ def generate_publish_title(narration: str, lang: str = "zh",
                 if result:
                     return result
         except Exception as _e:
-            print(f"[标题] DeepSeek 生成失败, 使用确定性兜底: {_e}")
-
+            print(f"[标题] DeepSeek 生成失败: {_e}")
+        _errs.append("DeepSeek 调用失败 (检查 API Key/网络/余额)")
     if provider == "local":
         try:
             result = _call_local_model(prompt, max_length=128)
@@ -1204,16 +1184,13 @@ def generate_publish_title(narration: str, lang: str = "zh",
                 if result:
                     return result
         except Exception as _e:
-            print(f"[标题] Qwen 生成失败, 使用确定性兜底: {_e}")
-
-    # 模式 3: 兜底 — 用 narration 第一句的前 max_chars 字
-    import re as _re
-    first_sent = _re.split(r"[。！？!?\n]", narration.strip(), maxsplit=1)[0].strip()
-    if not first_sent:
-        first_sent = narration.strip()
-    fallback = first_sent[:max_chars]
-    print(f"[标题] AI 全部失败, 用首句 fallback ({len(fallback)} 字): {fallback}")
-    return fallback
+            print(f"[标题] Qwen 生成失败: {_e}")
+        _errs.append("本地模型加载失败或无有效输出")
+    raise RuntimeError(
+        f"AI 标题生成失败 ({'; '.join(_errs) or '未知'})。"
+        f"请在任务列表/发布页的标题栏手动录入, "
+        f"或检查 {provider} 配置后重试。"
+    )
 
 
 def set_deepseek_key(api_key: str):

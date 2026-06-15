@@ -102,24 +102,44 @@ class RetryShortCircuitTests(unittest.TestCase):
             mock_factory.return_value = type(
                 "FakeProvider", (), {"generate": fake_generate}
             )()
-            result = writer.generate_script_by_topic_detailed(
-                topic="时尚女鞋",
-                target_chars_min=119, target_chars_max=142,
-                max_attempts=3,
-            )
+            with self.assertRaises(RuntimeError) as ctx:
+                writer.generate_script_by_topic_detailed(
+                    topic="时尚女鞋",
+                    target_chars_min=119, target_chars_max=142,
+                    max_attempts=3,
+                )
 
         # 因为 _is_wildly_off 触发早 fail，模型只该被调 1 次
         self.assertEqual(call_count[0], 1,
                          f"wildly off 应当早 fail，模型只调 1 次，实际 {call_count[0]} 次")
-        # 最终结果是 fallback safe template（包含 topic 词）
-        self.assertIn("时尚女鞋", result["text"])
+        # v3.2: 异常信息必须含手动录入建议 (不再兜底模板)
+        # 注意: wildly-off 早 fail 路径 _is_wildly_off 直接 raise, 还没经过
+        # quality check 收集 reasons, 所以异常里不会有 topic 词。
+        err = str(ctx.exception)
+        self.assertIn("手动录入", err,
+                       "v3.2: AI 失败时异常必须提示用户手动录入文案 (不要兜底模板)")
 
     def test_in_range_output_succeeds_on_first_try(self):
         """正常长度的输出应该 1 次过，不需要 fallback。"""
         call_count = [0]
-        # 用包含 topic 词且字数合规的中文 mock，长度刚好在 119-142 中间
-        _filler = "时尚女鞋搭配推荐，舒适透气百搭好看又耐穿，柔软不磨脚！"
-        in_range_output = (_filler * 5)[:130]
+        # v3.2: 用 10 句不重复 (或弱重复) 的中文, 总长 125 chars 含 topic 词。
+        # 不能再用 _filler * 5 — 会被 _dedup_repetitions 折叠成 26 chars 触发 min_chars 失败,
+        # 然后走到新行为 raise, 测试 fail。
+        # 必须避免:
+        #   - _UNSUPPORTED_PRODUCT_CLAIMS: 面料/材质/防滑/真皮/皮革/颜色/...
+        #   - _CROSS_CATEGORY_FORBIDDEN[("鞋",)]: 衣服/裙/裤子/T恤/...
+        in_range_output = (
+            "想为你的日常造型注入新灵感。"
+            "这双时尚女鞋正是不错的选择。"
+            "以简约线条勾勒都市的优雅。"
+            "通勤出街周末约会都能切换。"
+            "百搭款式不挑场合也省心。"
+            "衣橱里少有的常驻嘉宾。"
+            "阳光下走两步就让人回头看。"
+            "穿上它整条街都为你倾倒。"
+            "让日常每一步都轻盈自在。"
+            "这就是值得拥有的好物。"
+        )
         assert 119 <= len(in_range_output) <= 142, f"len={len(in_range_output)}"
 
         def fake_generate(self, prompt, max_tokens):

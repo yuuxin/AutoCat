@@ -99,27 +99,38 @@ class WriterQualityTests(unittest.TestCase):
 
     @patch("autokat.core.writer.DEEPSEEK_API_KEY", "")
     @patch("autokat.core.writer._call_local_model", return_value=None)
-    def test_all_backend_failures_use_safe_template(self, local):
-        result = generate_script_by_topic_detailed(
-            TOPIC, "种草推荐", extra_instruction="第5条",
-            target_chars_min=MIN_CHARS, target_chars_max=MAX_CHARS,
-        )
-        self.assertEqual(result["source"], "安全模板")
-        self.assertEqual(local.call_count, 3)
-        self.assertTrue(result["quality"]["valid"])
+    def test_all_backend_failures_raise_with_manual_input_hint(self, local):
+        """v3.2: AI 失败不再用 build_safe_script 兜底, 直接 raise 提示用户手动录入。
+        用户报告: 兜底模板「无意义」。"""
+        with self.assertRaises(RuntimeError) as ctx:
+            generate_script_by_topic_detailed(
+                TOPIC, "种草推荐", extra_instruction="第5条",
+                target_chars_min=MIN_CHARS, target_chars_max=MAX_CHARS,
+            )
+        err = str(ctx.exception)
+        self.assertEqual(local.call_count, 3,
+                          "local 失败 3 次后应该 raise (不再落兜底模板)")
+        # 异常必须含: 失败原因 + 手动录入建议 + provider 名
+        self.assertIn("手动录入", err, "异常必须提示用户手动录入")
+        self.assertIn("LocalWriterProvider", err, "异常必须指明哪个 provider 失败")
+        self.assertNotIn("安全模板", err, "v3.2: 异常中不应再出现「安全模板」字样")
 
     @patch("autokat.core.writer.DEEPSEEK_API_KEY", "configured")
     @patch("autokat.core.writer._call_local_model")
     @patch("autokat.core.writer._call_deepseek_api", return_value=None)
     def test_explicit_deepseek_never_silently_calls_local(self, deepseek, local):
-        result = generate_script_by_topic_detailed(
-            TOPIC, "种草推荐", extra_instruction="第5条",
-            target_chars_min=MIN_CHARS, target_chars_max=MAX_CHARS,
-            provider="deepseek",
-        )
-        self.assertEqual(result["source"], "安全模板")
+        """v3.2: DeepSeek 失败不落兜底模板, 直接 raise。绝不静默切到 local。"""
+        with self.assertRaises(RuntimeError) as ctx:
+            generate_script_by_topic_detailed(
+                TOPIC, "种草推荐", extra_instruction="第5条",
+                target_chars_min=MIN_CHARS, target_chars_max=MAX_CHARS,
+                provider="deepseek",
+            )
         self.assertEqual(deepseek.call_count, 3)
-        local.assert_not_called()
+        local.assert_not_called()  # contract: explicit deepseek 失败不静默切 local
+        err = str(ctx.exception)
+        self.assertIn("DeepSeekWriterProvider", err)
+        self.assertIn("手动录入", err)
 
     @patch("autokat.core.writer.DEEPSEEK_API_KEY", "configured")
     @patch("autokat.core.writer._call_local_model", return_value=None)
@@ -127,22 +138,30 @@ class WriterQualityTests(unittest.TestCase):
     def test_default_provider_is_local_even_when_deepseek_is_configured(
         self, deepseek, local,
     ):
-        result = generate_script_by_topic_detailed(
-            TOPIC, "种草推荐",
-            target_chars_min=MIN_CHARS, target_chars_max=MAX_CHARS,
-        )
-        self.assertEqual(result["source"], "安全模板")
+        """v3.2: local 失败也直接 raise, 不落兜底模板。"""
+        with self.assertRaises(RuntimeError) as ctx:
+            generate_script_by_topic_detailed(
+                TOPIC, "种草推荐",
+                target_chars_min=MIN_CHARS, target_chars_max=MAX_CHARS,
+            )
         self.assertEqual(local.call_count, 3)
-        deepseek.assert_not_called()
+        deepseek.assert_not_called()  # contract: default=local, deepseek 不该被调
+        err = str(ctx.exception)
+        self.assertIn("LocalWriterProvider", err)
+        self.assertIn("手动录入", err)
 
     @patch("autokat.core.writer.DEEPSEEK_API_KEY", "configured")
     @patch("autokat.core.writer._call_local_model")
     @patch("autokat.core.writer._call_deepseek_api", return_value=None)
     def test_explicit_deepseek_title_never_calls_local(self, deepseek, local):
-        title = generate_publish_title("时尚女鞋让日常搭配更有精神。", provider="deepseek")
-        self.assertTrue(title)
-        deepseek.assert_called_once()
-        local.assert_not_called()
+        """v3.2: 标题 AI 失败也不再「用首句截断」兜底, 直接 raise 提示用户手动录入。"""
+        with self.assertRaises(RuntimeError) as ctx:
+            generate_publish_title("时尚女鞋让日常搭配更有精神。", provider="deepseek")
+        self.assertEqual(deepseek.call_count, 1)
+        local.assert_not_called()  # contract: explicit deepseek 失败不切 local
+        err = str(ctx.exception)
+        self.assertIn("手动录入", err)
+        self.assertIn("DeepSeek", err)
 
     @patch("autokat.core.writer.DEEPSEEK_API_KEY", "configured")
     @patch("autokat.core.writer._call_local_model", return_value="local translation")
