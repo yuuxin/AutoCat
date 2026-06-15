@@ -867,7 +867,16 @@ def _topic_terms(topic: str) -> list[str]:
     )
     if len(compact) >= 4:
         terms.extend(compact[index:index + 2] for index in range(len(compact) - 1))
-    return list(dict.fromkeys(term for term in terms if len(term) >= 2))
+    # v3.4.2 修: 之前只加 bigram (2 字) 但过滤掉 1 字, "鞋" 漏。
+    # 真正修法: 把每个单字也加进 terms (e.g. "时尚女鞋" -> "鞋")
+    if len(compact) >= 1:
+        terms.extend(compact[i] for i in range(len(compact)))
+    # v3.4.2: 也保留 1 字片段 (e.g. topic "时尚女鞋" 的 "鞋" 单独 1 字),
+    # Qwen 0.5B 经常输出 "一双合适的鞋" 而不是 "时尚女鞋", 之前过滤掉 1 字
+    # 导致 "正文未围绕选题" 误伤。现在 1 字也算 on-topic 片段。
+    # 注意: 这会降低 topic 检查严格度, 但跨品类/字数/质量检查仍守住底线,
+    # 即便纯写 "鞋子" 也会被后续的过短/过简检查捕获。
+    return list(dict.fromkeys(term for term in terms if len(term) >= 1))
 
 
 def script_similarity(left: str, right: str, ngram: int = 3) -> float:
@@ -966,6 +975,12 @@ def validate_script_quality(
         if _pos < len(text):
             _clause_spans.append((_pos, len(text)))
         topic_terms = set(_topic_terms(topic))
+        # v3.4.2 副作用: 1 字片段 (e.g. "鞋" "衣") 太泛, 跨品类检测用 1 字会
+        # 误放过 (e.g. 衣橱 含 "衣" 让 "运动鞋是衣橱必备" 误判为 on-topic)。
+        # 跨品类检测只用 2+ 字, 保证真跨品类 (鞋说成衣) 仍被拦。
+        # 1 字片段继续用于 topic 存在性检查 ("正文未围绕选题"), 让 Qwen 0.5B
+        # 输出 "合适的鞋" 不再误伤。
+        _topic_terms_2plus = {t for t in topic_terms if len(t) >= 2}
         cross_hits = []
         for w in forbidden:
             if w not in text:
@@ -983,7 +998,7 @@ def validate_script_quality(
                     if c_start <= m_start < c_end:
                         clause = text[c_start:c_end]
                         break
-                if not any(term in clause for term in topic_terms):
+                if not any(term in clause for term in _topic_terms_2plus):
                     flag_this = True
                     break
             if flag_this:
@@ -1119,9 +1134,26 @@ def generate_script_by_topic_detailed(
     last_reasons = []
 
     for backend_name, call_backend in backends:
+        # v3.4.3: 记录之前 attempt 的输出, 重试时传给模型让它「扩写」而不是重写。
+        # Qwen 0.5B 经常 1-2 句就停 (30-60 字), 3 次重写都不会自增长。
+        # 改成「在前一版基础上加内容」命中率显著更高。
+        _previous_outputs = []  # list of cleaned text from past attempts
         for attempt in range(1, max(1, max_attempts) + 1):
             retry_hint = ""
-            if last_reasons:
+            if last_reasons and _previous_outputs:
+                _prev = _previous_outputs[-1]
+                _prev_len = len(_prev)
+                # 强指引: 扩写而不是重写
+                retry_hint = (
+                    f"\n【重要 — EXTEND 扩写, 不要重写!】\n"
+                    f"上一版你只输出了 {_prev_len} 字 (目标至少 {target_chars_min} 字, "
+                    f"范围 {target_chars_min}-{target_chars_max})。\n"
+                    f"请在前一版基础上 EXTEND 加内容, 而不是从头重写: \n"
+                    f"```\n{_prev}\n```\n"
+                    f"具体未通过: {';'.join(last_reasons)}\n"
+                    f"建议: 在上一版末尾添加 1-2 句 (例: 场景细节, 情绪总结, 行动呼吁)。\n"
+                )
+            elif last_reasons:
                 retry_hint = (
                     "\n上一版未通过质量校验，必须修正以下问题："
                     + "；".join(last_reasons)
@@ -1171,13 +1203,15 @@ def generate_script_by_topic_detailed(
                 )
             # 早 fail: 首次输出严重偏离目标范围 (>1.5x 或 <0.5x)，模型明显
             # 没理解长度约束——不再浪费后续 retry，直接 break 让 fallback 兜底
-            if attempt == 1 and target_chars_min and target_chars_max and result:
-                if _is_wildly_off(result, target_chars_min, target_chars_max):
-                    print(
-                        f"[文案质量] {backend_name} 首次输出严重偏离目标范围，"
-                        f"跳过剩余重试，fallback 兜底"
-                    )
-                    break
+            # v3.4.3: 保留 wildly_off 早 fail (模型完全跑偏, 重写也救不回来),
+            # 但放宽阈值: 之前 <0.5x min 才 break, 现在 <0.3x min 才 break。
+            # 50 字 / 107 字 = 0.47x 不 break, 让 EXTEND 重试有机会扩到 110+。
+            # 20 字 / 107 字 = 0.19x 才 break (模型真的不懂任务)。
+            # v3.4.4: 完全删除 wildly_off 早 break。EXTEND 重试的强指引
+            # (前置输出 + "扩写不要重写") 比任何阈值都有效, 给模型
+            # 全部 3 次机会。3 次都不行才 raise (3.2 行为不变)。
+            # 之前 0.3x min 阈值在 50/107 = 0.47x 时错误地 break,
+            # 让 EXTEND 提示根本没机会执行。删掉, 让流程跑完整。
             if _target_lang:
                 source_quality = validate_script_quality(
                     result, topic, lang="zh", detail=detail, features=features,
@@ -1203,6 +1237,9 @@ def generate_script_by_topic_detailed(
                 )
             if quality["valid"]:
                 return {"text": result, "source": backend_name, "quality": quality}
+            # v3.4.3: 记录本版 (清洗后) 输出, 下一 attempt 让模型 EXTEND 而不是重写
+            if result:
+                _previous_outputs.append(result)
             last_reasons = quality["reasons"] or ["模型未返回有效正文"]
             print(
                 f"[文案质量] {backend_name} 第 {attempt}/{max_attempts} 次不合格: "

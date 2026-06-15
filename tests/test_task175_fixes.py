@@ -85,7 +85,7 @@ class WildlyOffHelperTests(unittest.TestCase):
 
 
 class RetryShortCircuitTests(unittest.TestCase):
-    """端到端：mock 本地模型第一次返回短到离谱的输出，断言只调了 1 次就放弃。"""
+    """端到端：v3.4.4 删了 wildly_off 早 break, 3 次都跑。"""
 
     def test_wildly_off_first_attempt_calls_model_once(self):
         call_count = [0]
@@ -109,9 +109,9 @@ class RetryShortCircuitTests(unittest.TestCase):
                     max_attempts=3,
                 )
 
-        # 因为 _is_wildly_off 触发早 fail，模型只该被调 1 次
-        self.assertEqual(call_count[0], 1,
-                         f"wildly off 应当早 fail，模型只调 1 次，实际 {call_count[0]} 次")
+        # v3.4.4: wildly_off 早 fail 已删除, 模型被调满 3 次
+        self.assertEqual(call_count[0], 3,
+                         f"v3.4.4: 应调满 max_attempts=3 次, 实际 {call_count[0]} 次")
         # v3.2: 异常信息必须含手动录入建议 (不再兜底模板)
         # 注意: wildly-off 早 fail 路径 _is_wildly_off 直接 raise, 还没经过
         # quality check 收集 reasons, 所以异常里不会有 topic 词。

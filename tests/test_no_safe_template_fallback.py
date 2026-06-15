@@ -58,12 +58,12 @@ class NoSafeTemplateFallbackInScriptGenTests(unittest.TestCase):
             f"v3.3: 永久错误不应再被「手动录入」包装, 实际: {err!r}")
 
     def test_wildly_off_raises_with_manual_input_hint(self):
-        """首次输出严重偏离字数范围, 早 fail 后也要 raise (不再走兜底)"""
+        """v3.4.4: wildly_off 早 fail 已删除, 3 次都调模型, 然后 raise 提示手动录入"""
         call_count = [0]
 
         def fake_generate(self, prompt, max_tokens):
             call_count[0] += 1
-            return "abcde"  # 5 chars, 远低于 min
+            return "abcde"  # 5 chars, 远低于 min, 3 次都返回这个
 
         with patch("autokat.core.ai_providers.build_writer_provider") as mock_factory:
             mock_factory.return_value = type(
@@ -75,7 +75,8 @@ class NoSafeTemplateFallbackInScriptGenTests(unittest.TestCase):
                     target_chars_min=119, target_chars_max=142,
                     max_attempts=3,
                 )
-        self.assertEqual(call_count[0], 1, "_is_wildly_off 早 fail 应只调 1 次")
+        self.assertEqual(call_count[0], 3,
+                         "v3.4.4: wildly_off 早 fail 已删除, 应调满 max_attempts=3 次")
         self.assertIn("手动录入", str(ctx.exception))
 
     def test_build_safe_script_function_kept_but_unused(self):
