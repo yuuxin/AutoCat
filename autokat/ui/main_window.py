@@ -1674,21 +1674,41 @@ class MainWindow(QMainWindow):
         # v3.2: B+C 设计 — 视频类型为主控 (默认显示), 文案风格藏在 ⚙ 高级 后面
         # 视频类型变 → 自动默认文案风格 (从 VIDEO_TYPE_DEFAULT_STYLE 取)
         from autokat.core.ai_providers import (
-            VIDEO_TYPE_LABELS, VIDEO_TYPE_DEFAULT_STYLE,
+            VIDEO_TYPE_LABELS, VIDEO_TYPE_DEFAULT_STYLE, VIDEO_TYPE_TOOLTIP,
         )
-        from autokat.core.writer import list_style_choices
+        from autokat.core.writer import list_style_choices, STYLE_TOOLTIP
+
+        # v3.2: tooltip 提示图标 — 下拉菜单不容易让用户发现 tooltip,
+        # 在 combobox 旁加一个灰色 "?" QLabel, 鼠标悬停时显示完整说明
+        def _make_help_label(tooltip_text: str) -> QLabel:
+            lbl = QLabel("?")
+            lbl.setToolTip(tooltip_text)
+            lbl.setStyleSheet(
+                "color:#6B7280; font-weight:700; font-size:13px; "
+                "background:#F3F4F6; border-radius:9px; "
+                "padding:0 6px; margin-left:4px;"
+            )
+            lbl.setCursor(Qt.PointingHandCursor)
+            return lbl
 
         video_type_input = QComboBox()
         for _key, _label in VIDEO_TYPE_LABELS.items():
             video_type_input.addItem(_label, _key)
-        video_type_input.setToolTip("决定 AI 怎么组织文案的结构和节奏")
+        video_type_input.setToolTip(VIDEO_TYPE_TOOLTIP)
         # 默认值: 与 Step 2/3 当前选择同步
         _wiz_vt = getattr(self, "_wiz_video_type_step2", None)
         if _wiz_vt is not None:
             _idx = video_type_input.findData(_wiz_vt.currentData() or "auto")
             if _idx >= 0:
                 video_type_input.setCurrentIndex(_idx)
-        form.addRow("视频类型:", video_type_input)
+        # v3.2: 把 combobox 和 ? 图标一起装进 QWidget, 视频类型 整行作为一个 form row
+        video_type_row = QWidget()
+        _vt_row_layout = QHBoxLayout(video_type_row)
+        _vt_row_layout.setContentsMargins(0, 0, 0, 0)
+        _vt_row_layout.setSpacing(6)
+        _vt_row_layout.addWidget(video_type_input, 1)
+        _vt_row_layout.addWidget(_make_help_label(VIDEO_TYPE_TOOLTIP), 0)
+        form.addRow("视频类型:", video_type_row)
 
         # ⚙ 高级 checkbox — 展开文案风格选择
         advanced_checkbox = QCheckBox("⚙ 高级 (手动设置文案风格)")
@@ -1699,9 +1719,16 @@ class MainWindow(QMainWindow):
         style_input = QComboBox()
         for _label, _key in list_style_choices():
             style_input.addItem(_label, _key)
-        style_input.setToolTip("决定 AI 用什么腔调讲话（博主人设）。\n默认按视频类型自动匹配。")
-        style_input.setVisible(False)
-        form.addRow("文案风格:", style_input)
+        style_input.setToolTip(STYLE_TOOLTIP)
+        # v3.2: 整行装进 QWidget (combobox + ? 图标), 高级展开时整体显示/隐藏
+        style_row = QWidget()
+        _st_row_layout = QHBoxLayout(style_row)
+        _st_row_layout.setContentsMargins(0, 0, 0, 0)
+        _st_row_layout.setSpacing(6)
+        _st_row_layout.addWidget(style_input, 1)
+        _st_row_layout.addWidget(_make_help_label(STYLE_TOOLTIP), 0)
+        style_row.setVisible(False)
+        form.addRow("文案风格:", style_row)
 
         def _sync_default_style(video_type_key: str) -> None:
             """视频类型变 → 默认文案风格 (仅在用户未手动改过时生效)。"""
@@ -1713,7 +1740,7 @@ class MainWindow(QMainWindow):
                 style_input.setCurrentIndex(idx)
 
         def _toggle_advanced(checked: bool) -> None:
-            style_input.setVisible(checked)
+            style_row.setVisible(checked)
             if checked:
                 _sync_default_style(video_type_input.currentData())
 

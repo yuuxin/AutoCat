@@ -188,6 +188,8 @@ VIDEO_TYPE_DEFAULT_STYLE: dict[str, str | None] = {
     "music_beat": "种草推荐",                # 音乐卡点 → 带货博主 (卡点视频也多是带货)
     "random_mix": None,                # 混剪不预设
 }
+# v3.2: UI 上加 "?" 图标的 tooltip 文案 (下拉菜单用户不容易发现提示, ? 图标更明显)
+VIDEO_TYPE_TOOLTIP = "决定 AI 怎么组织文案的结构和节奏"
 
 
 def video_type_prompt_hint(video_type) -> str:

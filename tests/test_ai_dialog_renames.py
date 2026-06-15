@@ -174,3 +174,45 @@ class WizardVideoTypeComboLabelsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ── 4. tooltip 文案常量 (用户可见 "?" 图标悬停时显示) ──────────────
+
+class TooltipConstantsTests(unittest.TestCase):
+    """tooltip 文案抽成常量, 既可复用也可测试覆盖。"""
+
+    def test_video_type_tooltip_exists_and_contains_keywords(self):
+        from autokat.core.ai_providers import VIDEO_TYPE_TOOLTIP
+        self.assertIsInstance(VIDEO_TYPE_TOOLTIP, str)
+        self.assertGreater(len(VIDEO_TYPE_TOOLTIP.strip()), 0,
+                           "VIDEO_TYPE_TOOLTIP 不能是空字符串")
+        self.assertIn("结构", VIDEO_TYPE_TOOLTIP,
+                      "视频类型 tooltip 应说明它决定『结构』")
+        self.assertIn("节奏", VIDEO_TYPE_TOOLTIP,
+                      "视频类型 tooltip 应说明它决定『节奏』")
+
+    def test_style_tooltip_exists_and_contains_keywords(self):
+        from autokat.core.writer import STYLE_TOOLTIP
+        self.assertIsInstance(STYLE_TOOLTIP, str)
+        self.assertGreater(len(STYLE_TOOLTIP.strip()), 0,
+                           "STYLE_TOOLTIP 不能是空字符串")
+        self.assertIn("腔调", STYLE_TOOLTIP,
+                      "文案风格 tooltip 应说明它决定『腔调』")
+        self.assertIn("博主人设", STYLE_TOOLTIP,
+                      "文案风格 tooltip 应说明它决定『博主人设』")
+
+    def test_style_tooltip_mentions_auto_default_behavior(self):
+        """文案风格 tooltip 必须告诉用户有「自动匹配」行为, 避免困惑『为什么改了视频类型,
+        我手动选的风格也跟着变了』。"""
+        from autokat.core.writer import STYLE_TOOLTIP
+        self.assertIn("自动匹配", STYLE_TOOLTIP,
+                      "STYLE_TOOLTIP 必须提及『自动匹配』, 否则用户不知有联动")
+        self.assertIn("高级", STYLE_TOOLTIP,
+                      "STYLE_TOOLTIP 应告诉用户在「⚙ 高级」里手动覆盖")
+
+    def test_tooltips_are_distinct(self):
+        """两个 tooltip 不能一样 (否则等于没区分)。"""
+        from autokat.core.ai_providers import VIDEO_TYPE_TOOLTIP
+        from autokat.core.writer import STYLE_TOOLTIP
+        self.assertNotEqual(VIDEO_TYPE_TOOLTIP, STYLE_TOOLTIP,
+                            "视频类型 和 文案风格 的 tooltip 应该不一样")

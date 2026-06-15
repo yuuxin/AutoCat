@@ -1107,6 +1107,11 @@ STYLE_LABELS: dict[str, str] = {
     "测评对比": "实测派",
     "励志感悟": "走心姐姐",
 }
+# v3.2: UI 上加 "?" 图标的 tooltip 文案
+STYLE_TOOLTIP = (
+    "决定 AI 用什么腔调讲话（博主人设）。\n"
+    "默认按视频类型自动匹配，展开「⚙ 高级」后可手动覆盖。"
+)
 
 
 def list_style_choices() -> list[tuple[str, str]]:
