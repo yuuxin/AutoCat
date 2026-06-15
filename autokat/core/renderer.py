@@ -1223,7 +1223,7 @@ def _render_task(task_id: int, workers: int = 2, batch_cfg: Optional[dict] = Non
 
     if workers <= 0:
         workers, worker_reason = _adaptive_worker_count(len(clips))
-        _log(f"   🧠 自适应并发: {workers} · {worker_reason}")
+        _log_emit(f"   🧠 自适应并发: {workers} · {worker_reason}")
     if workers > 1:
         # 多进程并行渲染
         with ThreadPoolExecutor(max_workers=workers) as pool:

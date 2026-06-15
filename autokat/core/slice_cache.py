@@ -142,6 +142,10 @@ def _needs_hdr_to_sdr(metadata: dict) -> bool:
 
 
 def _bt709_output_args() -> list[str]:
+    # 仅在 HDR→SDR tonemap 路径下使用 (输出实际是 bt709, 加 tag 正确)。
+    # SDR 源绝对不能用 — 否则 ffmpeg 会隐性转色 (任务 239 用户报告:
+    # 选择「不扰动」成片色调还是被改了)。
+    # 调用点必须先判 is_hdr = _needs_hdr_to_sdr(metadata), 再决定是否加。
     return [
         "-colorspace", "bt709", "-color_primaries", "bt709",
         "-color_trc", "bt709", "-color_range", "tv",
@@ -168,7 +172,8 @@ def cached_segment(clip: dict, fps: int, perturbation: dict | None = None,
         "setpts=PTS-STARTPTS",
     ]
     color_metadata = _source_color_metadata(source)
-    if _needs_hdr_to_sdr(color_metadata):
+    is_hdr = _needs_hdr_to_sdr(color_metadata)
+    if is_hdr:
         filters.append(
             "zscale=t=linear:npl=100,tonemap=mobius:desat=0,"
             "zscale=p=bt709:t=bt709:m=bt709:r=tv"
@@ -191,12 +196,19 @@ def cached_segment(clip: dict, fps: int, perturbation: dict | None = None,
         command = [FFMPEG, "-y"]
         if is_image:
             command.extend(["-loop", "1"])
+        # v3.2: 只在 HDR→SDR tonemap 路径下加 bt709 tag (输出实际是 bt709)。
+        # SDR 源绝对不加 — 否则 ffmpeg 会隐性转色 (任务 239 用户报告:
+        # 选择「不扰动」成片色调还是被改了)。
+        # 注意: 不能写 *_bt709_output_args() if is_hdr else [] —
+        # Python 不允许 *starred 表达式内嵌 ternary (语法歧义), 必须先赋给变量。
+        color_args = _bt709_output_args() if is_hdr else []
         command.extend([
             "-i", source, "-vf", ",".join(filters),
             "-frames:v", str(duration_frames),
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-g", "60",
             "-pix_fmt", "yuv420p", "-r", str(fps),
-            *_bt709_output_args(), str(target),
+            *color_args,
+            str(target),
         ])
         run_ffmpeg(command, desc="缓存标准化片段")
 

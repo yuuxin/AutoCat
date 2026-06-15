@@ -596,9 +596,8 @@ class MainWindow(QMainWindow):
         self.PAGE_WIZARD_STEP3 = 3
         self.PAGE_WIZARD_STEP4 = 4
         self.PAGE_TASK_DETAIL = 5
-        # 视频类型下拉框：Step 2 与 Step 3 各放一个独立 QComboBox（Qt 不允许同一 widget
-        # 同时挂在两个 layout 下），通过 currentIndexChanged 双向同步，确保两边选中值一致。
-        # 实际 widget 实例在 _build_wizard_step2 / _build_wizard_step3 里创建。
+        # v3.2: 视频类型下拉框只放在 Step 2 (原 Step 3 同步副本已移除 — 用户在 Step 2 选一次即可)。
+        # 实际 widget 实例在 _build_wizard_step2 里创建。
         # 构建各页面
         self._dashboard_page = self._build_dashboard_page()
         self._wizard_step1 = self._build_wizard_step1()
@@ -1100,11 +1099,9 @@ class MainWindow(QMainWindow):
     def _build_video_type_combo(self) -> QComboBox:
         """Factory for the per-page 视频类型 QComboBox.
 
-        Step 2 and Step 3 each get their own QComboBox instance (Qt forbids
-        a single widget sitting in two layouts at once). They stay in sync
-        via currentIndexChanged connections wired in the calling page
-        builders, so the user can change the type on either page and the
-        other page reflects it immediately.
+        v3.2: 只在 Step 2 放一个 QComboBox 实例, Step 3 不再放独立副本
+        (避免 UI 重复且 Qt 不允许同一 widget 挂在两个 layout 下)。
+        全程只有 _wiz_video_type_step2 这一个实例, 作为唯一 source of truth。
         """
         combo = QComboBox()
         from autokat.core.ai_providers import VIDEO_TYPE_LABELS
@@ -1113,7 +1110,7 @@ class MainWindow(QMainWindow):
             combo.addItem(_label, _key)
         combo.setToolTip(
             "视频类型：决定 AI 怎么组织文案的结构和节奏。\n"
-            "可在 Step 2 与 Step 3 之间随时切换，再次点 AI 辅助生成会用新类型重出文案。"
+            "在 Step 2 选一次即可，下次点 AI 辅助生成会用新类型重出文案。"
         )
         return combo
 
@@ -1500,10 +1497,6 @@ class MainWindow(QMainWindow):
         _type_lbl.setStyleSheet("color:#374151; font-size:12px; font-weight:600;")
         ai_row.addWidget(_type_lbl)
         self._wiz_video_type_step2 = self._build_video_type_combo()
-        self._wiz_video_type_step2.currentIndexChanged.connect(
-            lambda _i: self._wiz_video_type_step3.setCurrentIndex(_i)
-            if hasattr(self, "_wiz_video_type_step3") else None
-        )
         ai_row.addWidget(self._wiz_video_type_step2)
         from_history_btn = QPushButton("📋 从历史选择")
         from_history_btn.setStyleSheet("""
@@ -2329,19 +2322,10 @@ class MainWindow(QMainWindow):
         config_grid.setColumnStretch(5, 1)
 
         layout.addWidget(config_group)
-        # Step 3 的下拉框是独立实例，通过 currentIndexChanged 同步到 Step 2
-        type_row = QHBoxLayout()
-        type_label = QLabel("视频类型:")
-        type_label.setStyleSheet("color:#374151; font-size:12px; font-weight:600;")
-        type_row.addWidget(type_label)
-        self._wiz_video_type_step3 = self._build_video_type_combo()
-        self._wiz_video_type_step3.currentIndexChanged.connect(
-            lambda _i: self._wiz_video_type_step2.setCurrentIndex(_i)
-            if hasattr(self, "_wiz_video_type_step2") else None
-        )
-        type_row.addWidget(self._wiz_video_type_step3)
-        type_row.addStretch()
-        layout.addLayout(type_row)
+        # v3.2: Step 3 不再单独放视频类型下拉框 — Qt 不允许同一 widget 同时属于
+        # 两个 page, 所以原代码在 Step 2/3 各放一个独立 QComboBox 互相同步, 但 UI 上重复,
+        # 用户只需在 Step 2 选一次, Step 3 不用再选。
+        # (Step 2 的 _wiz_video_type_step2 是唯一 source of truth)
 
         # 风险徽章已移除 (v2.3 简化): 改在 _wiz_max_uses 后面显示 "最多混剪 N 条成片"
 
@@ -2691,8 +2675,8 @@ class MainWindow(QMainWindow):
             cfg["platform"] = PLATFORM_IDS[pid_idx]
         if hasattr(self, "_wiz_max_uses"):
             cfg["max_uses_per_slice"] = int(self._wiz_max_uses.value())
-        if hasattr(self, "_wiz_video_type_step3"):
-            cfg["video_type"] = self._wiz_video_type_step3.currentData() or "auto"
+        if hasattr(self, "_wiz_video_type_step2"):
+            cfg["video_type"] = self._wiz_video_type_step2.currentData() or "auto"
         # 写明选定的 AI Provider（local / deepseek）和语义版本，方便后续审计。
         try:
             from autokat.core.ai_providers import load_ai_settings
@@ -3037,8 +3021,8 @@ class MainWindow(QMainWindow):
             fields["font_size"] = int(self._wiz_subtitle_size.value())
         if hasattr(self, "_wiz_platform_group"):
             fields["platform"] = self._wiz_platform_group.checkedId()
-        if hasattr(self, "_wiz_video_type_step3"):
-            fields["video_type"] = self._wiz_video_type_step3.currentData() or "auto"
+        if hasattr(self, "_wiz_video_type_step2"):
+            fields["video_type"] = self._wiz_video_type_step2.currentData() or "auto"
         # writer_provider is sourced from AI settings (not a wizard widget);
         # capture it so a fork can reproduce the exact provider choice.
         try:
@@ -3078,11 +3062,11 @@ class MainWindow(QMainWindow):
             self._wiz_pitch.setValue(int(fields["pitch"] or 0))
         # video_type is sync'd between step 2 and step 3; we update the
         # step 3 one (which is the "authoritative" copy in fork mode)
-        if "video_type" in fields and hasattr(self, "_wiz_video_type_step3"):
+        if "video_type" in fields and hasattr(self, "_wiz_video_type_step2"):
             v = fields["video_type"] or "auto"
-            idx = self._wiz_video_type_step3.findData(v)
+            idx = self._wiz_video_type_step2.findData(v)
             if idx >= 0:
-                self._wiz_video_type_step3.setCurrentIndex(idx)
+                self._wiz_video_type_step2.setCurrentIndex(idx)
         # Step 3
         if "task_name" in fields and hasattr(self, "_wiz_step3_tname_edit"):
             self._wiz_step3_tname_edit.setText(fields["task_name"] or "")
