@@ -103,25 +103,34 @@ class CrossCategoryConfusionTests(unittest.TestCase):
             f"女鞋+「衣服/衣物」应被标记, 实际={result['reasons']}",
         )
 
-    def test_clothes_topic_rejects_shoes_words(self):
+    def test_clothes_topic_allows_shoes_as_pairing(self):
+        # v3.2 优化: 上衣 + 「搭配运动鞋」是合理的造型搭配场景, 不算跨品类混淆。
+        # forbidden word 所在子句同时提到 topic word → 算 on-topic 内的搭配。
         text = "这件上衣搭配运动鞋，让你的造型更有活力。"
         result = validate_script_quality(text, "时尚上衣", lang="zh")
-        self.assertFalse(result["valid"])
+        self.assertNotIn(
+            "跨品类", " | ".join(result["reasons"]),
+            f"上衣+「搭配运动鞋」是合理搭配, 不应触发跨品类, 实际={result['reasons']}",
+        )
+
+    def test_clothes_topic_rejects_genuine_subject_confusion(self):
+        # v3.2 优化: 真跨品类混淆 (子句完全没提 topic word) 仍要拦截。
+        text = "运动鞋是衣橱必备，让你出门更有范儿。"
+        result = validate_script_quality(text, "时尚上衣", lang="zh")
         self.assertTrue(
             any("跨品类" in r for r in result["reasons"]),
-            f"上衣+「运动鞋」应被标记, 实际={result['reasons']}",
+            f"上衣+「运动鞋是衣橱必备」(子句无 topic word) 应被标记, 实际={result['reasons']}",
         )
 
     def test_shoes_topic_does_not_flag_reasonable_pairing(self):
-        # 鞋子搭配衣服 是正常造型场景 — 不应被拒收 (主题鞋子, 衣服作为搭配)
-        # 这里我们只关心"鞋子变成衣服"那种主谓混淆,
-        # 简单实现会过度严格, 这里允许少量误报
+        # v3.2 优化: 鞋子搭配裙子/裤子 是正常造型场景, 不应被拒收。
+        # forbidden word "裙子" 所在子句同时提到 "春夏女鞋" → on-topic 搭配。
         text = "春夏女鞋搭配今天的裙子，让整体造型更有层次感。"
-        # 当前实现: 只要出现 cross_hits 就拒收, 这里期望会拒收 (False positive 接受)
-        # 因为单纯 substring 检测无法区分主谓混淆 vs 搭配场景
         result = validate_script_quality(text, "春夏女鞋", lang="zh")
-        # 文档化当前行为: 简单 substring 会命中, 但用户可手动确认
-        self.assertIn("跨品类", " | ".join(result["reasons"]))
+        self.assertNotIn(
+            "跨品类", " | ".join(result["reasons"]),
+            f"女鞋+「搭配裙子」是合理搭配, 不应触发跨品类, 实际={result['reasons']}",
+        )
 
     def test_no_category_skips_check(self):
         # topic 是抽象风格词如「穿搭」, 没有具体品类, 应跳过跨品类检测

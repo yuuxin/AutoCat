@@ -224,10 +224,17 @@ def _build_prompt(topic: str, style: str,
     #       但模型依旧会输出，这次提到【字数硬性要求】同一段强化权重）。
     length_hint = ""
     if target_chars_min and target_chars_max:
+        # v3.2 优化: 给模型一个「目标字数 + 写作技巧」, 实际写出的长度更接近范围。
+        # LLM 不擅长精确数中文字符, 给「写 N 个短句累计 M 字」这种结构化指引
+        # 比「范围 107-142」命中率更高。
+        _target_ideal = (target_chars_min + target_chars_max) // 2
+        _min_sentences = 3
+        _max_sentences = 4
         length_hint = (
-            f"\n【字数硬性要求】必须严格控制在 {target_chars_min}-{target_chars_max} 个字符之间。"
-            f"少于 {target_chars_min} 视频会短于目标时长（系统拒收），"
-            f"多于 {target_chars_max} 视频会超过目标时长（系统强制截断到 {target_chars_max} 字）。\n"
+            f"\n【字数硬性要求】目标约 {_target_ideal} 字 (系统可接受范围 {target_chars_min}-{target_chars_max} 字)。\n"
+            f"- 写作技巧: 写 {_min_sentences}-{_max_sentences} 个短句, 每句 25-40 字, 累计约 {_target_ideal} 字。\n"
+            f"- 写完后估算一下字数 (1 个汉字 = 1 字), 不到 {max(60, target_chars_min - 20)} 字的输出会被系统拒收。\n"
+            f"- 超过 {target_chars_max} 字会被强制截断到 {target_chars_max} 字, 浪费内容。\n"
             f"**绝对禁止**输出：\n"
             f"  - 以'好的'/'文案:'/'以下是'/'当然'等导语开头的元描述\n"
             f"  - 任何形式的 # 标签（如 #经典单品 #品质保证）\n"
@@ -815,9 +822,12 @@ def validate_script_quality(
         reasons.append("检测到追问、拒答或元回复")
     if require_topic and not any(term in text for term in _topic_terms(topic)):
         reasons.append("正文未围绕选题")
-    if target_chars_min and char_count < target_chars_min:
+    # v3.2 优化: 字数 ±5% 容差, 边界 case 不再硬拒。
+    # 107-142 的范围容许 102-149, 模型微小偏离不再触发 3 次重试。
+    # 极端偏离 (如 83 < 107) 仍然会被拒, 不会让视频明显短于目标。
+    if target_chars_min and char_count < int(target_chars_min * 0.95):
         reasons.append(f"字数不足: {char_count} < {target_chars_min}")
-    if target_chars_max and char_count > target_chars_max:
+    if target_chars_max and char_count > int(target_chars_max * 1.05):
         reasons.append(f"字数超限: {char_count} > {target_chars_max}")
     if re.search(r"[{【\[][^}\]】]*[}】\]]|(?:xx|XX)", text):
         reasons.append("包含占位符或元描述")
@@ -844,14 +854,56 @@ def validate_script_quality(
     overclaims = [claim for claim in _OVERCLAIMS_NO_SUPPORT if claim in text]
     if overclaims:
         reasons.append("无支撑的过度承诺: " + "、".join(overclaims[:5]))
-    # v3.2: 跨品类混淆 — topic 是鞋/衣/包/帽, text 里却把产品描述为另一品类
+    # v3.2 优化: 跨品类混淆 — 只在「作为主语/品类描述」时才算混淆。
+    # 启发式: 服装搭配场景下 (如 "搭配裤子更有型"), 提到 裤子/裙 是合理的
+    # 搭配描述, 不是把鞋描述为裤子。简单 substring 匹配会误判, 用户报告频繁失败。
+    # 判定规则 (按优先级):
+    #   1. forbidden word 出现在 「搭配/配/和/与/跟/百搭」 后面 → 搭配描述, 不算
+    #   2. forbidden word 所在子句 (按 。！？?；;，, 切分) 提到任意 topic word → on-topic 搭配, 不算
+    #   3. forbidden word 所在子句完全没提 topic word → 跨品类混淆, 标记
+    # 注: 用「子句」不是「句子」 — 句子以 。！？? 结束, 但一个句子里可能有
+    # 多个并列子句 (以 ，, 隔开), 跨品类检查需要按子句粒度判定, 否则
+    # "穿上这款女鞋, 您将不再仅仅是一件衣服" 会被误判为 on-topic。
     category = _detect_topic_category(topic)
     if category:
         forbidden = []
         for cat_keys, bad_words in _CROSS_CATEGORY_FORBIDDEN.items():
             if category in cat_keys:
                 forbidden.extend(bad_words)
-        cross_hits = [w for w in forbidden if w in text]
+        _STYLING_PRE = ("搭配", "配上", "配着", "配", "和", "与",
+                        "跟", "百搭", "相配", "相称", "适配")
+        _CLAUSE_RE = re.compile(r"[。！？?；;，,]+")
+        _clause_spans = []  # list of (start, end) for each non-empty clause
+        _pos = 0
+        for _m in _CLAUSE_RE.finditer(text):
+            if _m.start() > _pos:
+                _clause_spans.append((_pos, _m.start()))
+            _pos = _m.end()
+        if _pos < len(text):
+            _clause_spans.append((_pos, len(text)))
+        topic_terms = set(_topic_terms(topic))
+        cross_hits = []
+        for w in forbidden:
+            if w not in text:
+                continue
+            flag_this = False
+            for match in re.finditer(re.escape(w), text):
+                # 规则 1: 前缀是搭配标记 → 算搭配描述, 跳过
+                prefix = text[max(0, match.start() - 6):match.start()]
+                if any(p in prefix for p in _STYLING_PRE):
+                    continue
+                # 规则 2: 找该 word 所在子句, 看是否提到 topic
+                m_start = match.start()
+                clause = ""
+                for c_start, c_end in _clause_spans:
+                    if c_start <= m_start < c_end:
+                        clause = text[c_start:c_end]
+                        break
+                if not any(term in clause for term in topic_terms):
+                    flag_this = True
+                    break
+            if flag_this:
+                cross_hits.append(w)
         if cross_hits:
             reasons.append(f"跨品类混淆: 选题是「{category}」但文案出现了 {cross_hits[:3]}")
     if lang == "zh":
