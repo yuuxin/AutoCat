@@ -99,7 +99,7 @@ _STYLE = """
 /* AutoCat — Midnight Dark Theme (参考拆图工具风格) */
 /* Palette: #FCFCFD bg | #FFFFFF card | #FCFCFD input | #2563EB primary | #10B981 emerald | #F59E0B amber | #EF4444 red | #111827 white | #6B7280 muted | #E5E7EB border */
 * {
-    font-family: -apple-system, "SF Pro Display", "Helvetica Neue", Arial, sans-serif;
+    font-family: "SF Pro Display", "Helvetica Neue", "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
     font-size: 13px;
     color: #111827;
 }
@@ -978,7 +978,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(num)
         # 状态文字(无背景,仅文字色)
         tag = QLabel(_tag_text(t["status"]))
-        tag.setFixedWidth(35)
+        tag.setFixedWidth(70)  # 状态列宽度 +100%
         tag.setStyleSheet(_tag_style(t["status"]))
         tag.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         layout.addWidget(tag)
