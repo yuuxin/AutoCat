@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import sys
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,12 +34,49 @@ def save_ai_settings(settings: dict) -> None:
     SETTINGS_PATH.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def save_deepseek_key(api_key: str) -> None:
-    subprocess.run(
-        ["security", "add-generic-password", "-U", "-s", KEYCHAIN_SERVICE,
-         "-a", KEYCHAIN_ACCOUNT, "-w", api_key],
-        check=True, capture_output=True, text=True,
-    )
+def save_deepseek_key(api_key: str) -> bool:
+    """Save the DeepSeek API key to the macOS Keychain.
+
+    Returns True on success. On failure (keychain access denied, keychain
+    locked, unsigned script blocked by macOS 15+, non-darwin platform, etc.)
+    prints a friendly message and returns False so the caller can show UI
+    feedback instead of crashing with a raw subprocess.CalledProcessError.
+
+    Notes:
+    - 加了 -A (allow-all-applications) 标志: macOS 15+ 对未签名脚本访问 keychain
+      限制更严, 没有 -A 会弹出"始终允许"对话框, 而新系统往往拒绝弹窗
+      (导致 security 退出码 36, 即 errSecInteractionNotAllowed)。
+    - 非 macOS 平台 (Linux/Windows) 不尝试调用 security, 直接返回 False
+      让上层用 in-memory 或环境变量兜底。
+    """
+    if not api_key:
+        return False
+    if sys.platform != "darwin":
+        print(f"[deepseek] 非 macOS 平台 ({sys.platform}), keychain 不可用, 跳过保存")
+        return False
+    try:
+        subprocess.run(
+            ["security", "add-generic-password", "-A", "-U", "-s", KEYCHAIN_SERVICE,
+             "-a", KEYCHAIN_ACCOUNT, "-w", api_key],
+            check=True, capture_output=True, text=True,
+        )
+        return True
+    except subprocess.CalledProcessError as e:
+        # security 退出码 36 在 macOS 15+ 是常见问题: 未签名脚本/进程被拒绝
+        # 与 keychain 交互 (即使有 -A), 因为 security 工具本身需要信任。
+        # 此时 API key 仍然有效 (本次生成测试已通过), 只是无法持久化。
+        stderr = (e.stderr or "").strip() or f"exit {e.returncode}"
+        print(
+            f"[deepseek] ⚠️  Keychain 保存失败 ({stderr})。"
+            f"key 仍然在本次会话有效 (已设到内存环境变量)。"
+            f"如需持久化: 在 macOS 钥匙串访问 app 手动添加条目"
+            f" (服务 {KEYCHAIN_SERVICE}, 账户 {KEYCHAIN_ACCOUNT}),"
+            f"或重启 app 后再试 (有时是临时权限问题)。"
+        )
+        return False
+    except FileNotFoundError:
+        print("[deepseek] ⚠️  security 命令不可用, keychain 不可用")
+        return False
 
 
 def load_deepseek_key() -> str:

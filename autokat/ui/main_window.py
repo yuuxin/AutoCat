@@ -1721,7 +1721,12 @@ class MainWindow(QMainWindow):
                     status_label.setText(f"❌ {exc}")
 
             def _save():
-                save_deepseek_key(key_edit.text())
+                # v3.2: save_deepseek_key 返回 bool (False = keychain 写入失败)
+                # macOS 15+ 经常对未签名脚本拒绝写入 keychain (exit 36),
+                # 此时 key 仍可用 (本次会话 in-memory), 但需要让用户看到错误
+                # 而不是看到 raw CalledProcessError stacktrace。
+                key_ok = save_deepseek_key(key_edit.text())
+                # ai_settings.json + in-memory 配置无论如何都要写, 否则本会话都跑不起来
                 new_cfg = load_ai_settings()
                 new_cfg.update({
                     "provider": "deepseek",
@@ -1730,6 +1735,14 @@ class MainWindow(QMainWindow):
                 })
                 save_ai_settings(new_cfg)
                 set_deepseek_config(key_edit.text(), url_edit.text(), model_edit.text())
+                if not key_ok:
+                    status_label.setText(
+                        "⚠️ Keychain 保存失败 (详见控制台日志)。"
+                        "本次会话仍可用 (已写入内存 + ai_settings.json),"
+                        "下次启动需重新填入 API key。"
+                    )
+                    # 不关闭对话框 — 让用户能看到错误并决定下一步
+                    return
                 config_dlg.accept()
 
             test_btn.clicked.connect(_test)
