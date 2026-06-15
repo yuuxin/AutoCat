@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import subprocess
 import sys
 import urllib.request
@@ -16,6 +17,10 @@ from autokat.core.paths import DATA_ROOT
 SETTINGS_PATH = DATA_ROOT / "config" / "ai_settings.json"
 KEYCHAIN_SERVICE = "com.autokat.deepseek"
 KEYCHAIN_ACCOUNT = "api-key"
+# v3.2: 文件存储兜底 — macOS keychain 在某些上下文 (locked keychain / sandbox /
+# 已有条目 ACL 冲突) 即使有 -A 也会拒绝写入, 必须有 fallback。
+# 选 chmod 600 的单独文件, 不与 ai_settings.json 共享目录, 避免权限继承问题。
+_KEY_FILE = DATA_ROOT / "config" / "deepseek_key"
 
 
 def load_ai_settings() -> dict:
@@ -34,26 +39,8 @@ def save_ai_settings(settings: dict) -> None:
     SETTINGS_PATH.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def save_deepseek_key(api_key: str) -> bool:
-    """Save the DeepSeek API key to the macOS Keychain.
-
-    Returns True on success. On failure (keychain access denied, keychain
-    locked, unsigned script blocked by macOS 15+, non-darwin platform, etc.)
-    prints a friendly message and returns False so the caller can show UI
-    feedback instead of crashing with a raw subprocess.CalledProcessError.
-
-    Notes:
-    - 加了 -A (allow-all-applications) 标志: macOS 15+ 对未签名脚本访问 keychain
-      限制更严, 没有 -A 会弹出"始终允许"对话框, 而新系统往往拒绝弹窗
-      (导致 security 退出码 36, 即 errSecInteractionNotAllowed)。
-    - 非 macOS 平台 (Linux/Windows) 不尝试调用 security, 直接返回 False
-      让上层用 in-memory 或环境变量兜底。
-    """
-    if not api_key:
-        return False
-    if sys.platform != "darwin":
-        print(f"[deepseek] 非 macOS 平台 ({sys.platform}), keychain 不可用, 跳过保存")
-        return False
+def _save_deepseek_key_keychain(api_key: str) -> bool:
+    """纯 keychain 写入路径。无外部依赖副作用,返回 True/False。"""
     try:
         subprocess.run(
             ["security", "add-generic-password", "-A", "-U", "-s", KEYCHAIN_SERVICE,
@@ -62,16 +49,10 @@ def save_deepseek_key(api_key: str) -> bool:
         )
         return True
     except subprocess.CalledProcessError as e:
-        # security 退出码 36 在 macOS 15+ 是常见问题: 未签名脚本/进程被拒绝
-        # 与 keychain 交互 (即使有 -A), 因为 security 工具本身需要信任。
-        # 此时 API key 仍然有效 (本次生成测试已通过), 只是无法持久化。
         stderr = (e.stderr or "").strip() or f"exit {e.returncode}"
         print(
             f"[deepseek] ⚠️  Keychain 保存失败 ({stderr})。"
-            f"key 仍然在本次会话有效 (已设到内存环境变量)。"
-            f"如需持久化: 在 macOS 钥匙串访问 app 手动添加条目"
-            f" (服务 {KEYCHAIN_SERVICE}, 账户 {KEYCHAIN_ACCOUNT}),"
-            f"或重启 app 后再试 (有时是临时权限问题)。"
+            f"将自动降级到 chmod 600 文件存储。"
         )
         return False
     except FileNotFoundError:
@@ -79,15 +60,63 @@ def save_deepseek_key(api_key: str) -> bool:
         return False
 
 
-def load_deepseek_key() -> str:
+def _save_deepseek_key_file(api_key: str) -> bool:
+    """文件存储兜底。chmod 600 原子写入,跨平台可用。
+
+    原因: macOS keychain 在某些上下文 (locked keychain / sandbox /
+    已有条目 ACL 冲突) 即使有 -A 也会拒绝写入 (返回
+    SecKeychainItemModifyContent: User interaction is not allowed) —
+    只有文件存储才能保证一定能持久化。文件与 ai_settings.json 同目录
+    但单独文件,便于单独设权限 0o600 (owner only)。
+    """
     try:
-        return subprocess.run(
-            ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE,
-             "-a", KEYCHAIN_ACCOUNT, "-w"],
-            check=True, capture_output=True, text=True,
-        ).stdout.strip()
-    except Exception:
+        _KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _KEY_FILE.with_suffix(_KEY_FILE.suffix + ".tmp")
+        tmp.write_text(api_key, encoding="utf-8")
+        os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
+        os.replace(tmp, _KEY_FILE)  # POSIX rename 原子
+        return True
+    except OSError as e:
+        print(f"[deepseek] ⚠️  文件兜底保存失败: {e}")
+        return False
+
+
+def save_deepseek_key(api_key: str) -> bool:
+    """保存 DeepSeek API key。先 keychain,失败兜底到 chmod 600 文件。
+
+    macOS 15+ keychain 经常返回 User interaction is not allowed
+    (即使 -A 也不够) — 此时降级到文件存储,保证持久化一定成功。
+    非 macOS 平台直接走文件路径。
+    """
+    if not api_key:
+        return False
+    if sys.platform == "darwin":
+        if _save_deepseek_key_keychain(api_key):
+            return True
+    return _save_deepseek_key_file(api_key)
+
+
+def _load_deepseek_key_file() -> str:
+    try:
+        return _KEY_FILE.read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, PermissionError, OSError):
         return ""
+
+
+def load_deepseek_key() -> str:
+    """读 keychain (macOS),为空再读文件兜底。"""
+    if sys.platform == "darwin":
+        try:
+            key = subprocess.run(
+                ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE,
+                 "-a", KEYCHAIN_ACCOUNT, "-w"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            if key:
+                return key
+        except Exception:
+            pass
+    return _load_deepseek_key_file()
 
 
 def migrate_env_key_to_keychain(env_var: str = "DEEPSEEK_API_KEY") -> bool:
@@ -138,6 +167,26 @@ VIDEO_TYPE_PROMPTS: dict[str, str] = {
     "auto": (
         "视频类型：由你根据选题自由判断，按最贴合主题的方式组织内容。"
     ),
+}
+
+# v3.2: UI 显示用的视频类型标签 — key 不变, prompt 内部描述保留 (写得扎实没必要重写)
+# 命名原则: 用用户视角的口语化表达, 一眼知道这个类型是干啥的
+VIDEO_TYPE_LABELS: dict[str, str] = {
+    "auto": "AI 智能",
+    "product_recommendation": "卖货种草",
+    "talking_explanation": "知识讲解",
+    "atmosphere": "日常记录",
+    "music_beat": "音乐卡点",
+    "random_mix": "素材混剪",
+}
+# 视频类型 → 默认文案风格 (主控联动副控, B+C 设计)
+VIDEO_TYPE_DEFAULT_STYLE: dict[str, str | None] = {
+    "auto": None,                    # AI 智能不预设
+    "product_recommendation": "种草推荐",   # 卖货种草 → 带货博主
+    "talking_explanation": "知识科普",      # 知识讲解 → 科普老师
+    "atmosphere": "励志感悟",                # 日常记录 → 走心姐姐
+    "music_beat": "种草推荐",                # 音乐卡点 → 带货博主 (卡点视频也多是带货)
+    "random_mix": None,                # 混剪不预设
 }
 
 
