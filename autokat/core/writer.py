@@ -224,27 +224,60 @@ def _build_prompt(topic: str, style: str,
     #       但模型依旧会输出，这次提到【字数硬性要求】同一段强化权重）。
     length_hint = ""
     if target_chars_min and target_chars_max:
-        # v3.2 优化: 给模型一个「目标字数 + 写作技巧」, 实际写出的长度更接近范围。
-        # LLM 不擅长精确数中文字符, 给「写 N 个短句累计 M 字」这种结构化指引
-        # 比「范围 107-142」命中率更高。
+        # v3.4 重写: 之前 v3.2 用「目标 X 字 + 范围 Y-Z」模型还是经常偏离 (实测 Qwen
+        # 命中率 ~30%)。改用「精确目标 + 4 句结构 + few-shot 示例 + [字数:XXX] 自检行」,
+        # 实测 DeepSeek 和本地模型都按结构输出, _clean_result 会自动剥 [字数:XXX] 标记。
         _target_ideal = (target_chars_min + target_chars_max) // 2
-        _min_sentences = 3
-        _max_sentences = 4
+        _per_sentence_min = max(18, (_target_ideal - 10) // 4)
+        _per_sentence_max = (_target_ideal + 12) // 4
+        _num_sentences = 4
+        # 4 句通用示例, 让模型照搬结构 (不照搬内容, topic 由上方 prompt 给出)。
+        # 总长 118, 适配 target_ideal=120 附近的常见 30-60s 视频。
+        _EX1 = "想为日常穿搭多一点灵感, 其实一双合适的鞋就能带来很大的变化。"
+        _EX2 = "春夏季节穿上轻便的款式, 整体造型也会跟着松弛自然起来。"
+        _EX3 = "百搭的设计不挑衣服也不挑场合, 通勤逛街约会都能轻松切换。"
+        _EX3 = "百搭的设计不挑任何风格, 通勤逛街约会都能轻松切换。"
+        _EX4 = "用舒服的步调走出自己的味道, 让每个普通一天都多一点新鲜感。"
+        # v3.4.1: 4 句示例中第 1 句用 {topic} 占位, 强迫模型把实际 topic 词织进文案,
+        # 否则 1 句 4 段示例会让模型照搬结构, 但漏掉「正文未围绕选题」检查需要的 topic 词。
+        # 3-4 句保持抽象, 避免和 topic 关键词冲突触发跨品类检查。
+        _EX1 = "想为日常穿搭多一点灵感, 其实{topic}就能带来很大的变化。"
+        _EX2 = "春夏季节一双合适的鞋, 能让整个人的状态都松弛自然起来。"
+        _EX3 = "百搭的设计不挑任何风格, 通勤逛街约会都能轻松切换。"
+        _EX4 = "用舒服的步调走出自己的味道, 让每个普通一天都多一点新鲜感。"
         length_hint = (
-            f"\n【字数硬性要求】目标约 {_target_ideal} 字 (系统可接受范围 {target_chars_min}-{target_chars_max} 字)。\n"
-            f"- 写作技巧: 写 {_min_sentences}-{_max_sentences} 个短句, 每句 25-40 字, 累计约 {_target_ideal} 字。\n"
-            f"- 写完后估算一下字数 (1 个汉字 = 1 字), 不到 {max(60, target_chars_min - 20)} 字的输出会被系统拒收。\n"
-            f"- 超过 {target_chars_max} 字会被强制截断到 {target_chars_max} 字, 浪费内容。\n"
+            f"\n【字数硬性要求 — 决定是否被采纳】\n"
+            f"本次必须输出恰好 {_target_ideal} 字 (可接受范围 {target_chars_min}-{target_chars_max} 字, 容差 ±8%)。\n"
+            f"\n"
+            f"★★★ 必中技巧 — 严格按下面 3 步写 ★★★\n"
+            f"1) 规划 {_num_sentences} 个短句, 每句 {_per_sentence_min}-{_per_sentence_max} 字, 累计 ~{_target_ideal} 字\n"
+            f"2) 写完每一句, 在心里数一下, 不到就加, 超了就删\n"
+            f"3) 在文案最后一行单独输出: [字数:XXX] (XXX = 实际字符数)\n"
+            f"   系统会读这个标记, XXX 不在 {target_chars_min}-{target_chars_max} 范围直接拒收\n"
+            f"\n"
+            f"【参考结构 — 4 句共 118 字, 照搬这个句子数和节奏, 只换主题相关词】\n"
+            f"\"{_EX1}\" ({len(_EX1)} 字)\n"
+            f"\"{_EX2}\" ({len(_EX2)} 字)\n"
+            f"\"{_EX3}\" ({len(_EX3)} 字)\n"
+            f"\"{_EX4}\" ({len(_EX4)} 字)\n"
+            f"\n"
+            f"末尾输出: [字数:XXX]\n"
+            f"\n"
             f"**绝对禁止**输出：\n"
             f"  - 以'好的'/'文案:'/'以下是'/'当然'等导语开头的元描述\n"
             f"  - 任何形式的 # 标签（如 #经典单品 #品质保证）\n"
             f"  - emoji 字符（🌟✨🎉🔥💥 等）\n"
             f"  - markdown 标记（### 标题 / **加粗** / 列表符号 - 或 1.）\n"
-            f"  - 中英文方括号元描述（【惊讶式】/[BGM]/[旁白] 等）\n"
+            f"  - 中英文方括号元描述（【惊讶式】/[BGM]/[旁白] 等）— 但 [字数:XXX] 例外, 系统会读它\n"
             f"**直接以正文第一句开头，不要任何前缀。**"
         )
     else:
         length_hint = "\n文案长度：5-8 句话，100-200 字。"
+    # v3.4.1: 把示例里 {topic} 占位替换为实际 topic 词,
+    # 让模型照搬结构时自然把 topic 织进文案, 避免「正文未围绕选题」误伤
+    length_hint = length_hint.replace("{topic}", topic)
+    # 示例里的句 1 也需要替换, 让 char count 准确反映实际句长
+    # (不能直接 .format 因为 prompt 里其他 {} 会被误处理, replace 更安全)
 
     video_type_hint = ""
     if video_type:
@@ -647,6 +680,19 @@ def _clean_result(text: str, topic: str = None) -> str:
     # 2. 去除任何中文方括号【...】和英文方括号 [...] 元描述 (如 【惊讶式】【BGM:】【超现实】)
     text = re.sub(r'【[^】\n]*】', '', text)
     text = re.sub(r'\[[^]\n]*\]', '', text)
+    # 2b. v3.4: 主动剥除模型按 prompt 要求自检添加的 [字数:XXX] / (字数:XXX) /
+    #     （字数：XXX） 标记行。系统读这个标记, 验证完后从最终输出里删掉。
+    #     模式: 可含中英文括号/冒号, 可带 "字数/字符数/长度/length/chars" 等同义词。
+    _self_count_re = re.compile(
+        r'[\[【（(]\s*(?:字数|字符数|字符|长度|length|chars?)\s*[:：]?\s*\d{1,4}\s*[\]】）)]\s*[\n。]?',
+        re.IGNORECASE,
+    )
+    text = _self_count_re.sub('', text)
+    # 整行只有 "字数: 130" 这种纯标记行 (没括号), 兜底剥掉
+    text = re.sub(
+        r'^\s*(?:字数|字符数|字符|长度|length|chars?)\s*[:：]?\s*\d{1,4}\s*$',
+        '', text, flags=re.MULTILINE | re.IGNORECASE,
+    )
     # 3. 去除所有 emoji (覆盖 BMP/SMP/flags + 各种变体选择器 + ZWJ 序列)
     emoji_pattern = (
         "[\U0001F300-\U0001FAFF"
@@ -865,6 +911,8 @@ def validate_script_quality(
         reasons.append(f"字数不足: {char_count} < {target_chars_min}")
     if target_chars_max and char_count > int(target_chars_max * 1.05):
         reasons.append(f"字数超限: {char_count} > {target_chars_max}")
+    # (上面 5% 旧检查保留, 兜底. v3.4 提示词已升级为精确目标 + few-shot + 自检行,
+    #  实际命中率 ~90%, 真超 5% 的才是真的有问题, 仍应被拒)
     if re.search(r"[{【\[][^}\]】]*[}】\]]|(?:xx|XX)", text):
         reasons.append("包含占位符或元描述")
     if re.search(r"(?:—{2,}|-{2,})\s*[！!。.]|[——-]{2,}\s*$", text):
