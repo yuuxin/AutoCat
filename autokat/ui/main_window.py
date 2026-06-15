@@ -1327,7 +1327,7 @@ class MainWindow(QMainWindow):
         self._import_worker.error.connect(lambda e: self._log(f"导入失败: {e}"))
         self._import_worker.start()
     def _on_import_progress(self, current, total, filename, status):
-        ts = datetime.now().strftime("%H:%M:%S")
+        ts = datetime.now().strftime("%Y%m%d %H:%M:%S")
         elapsed = (datetime.now() - self._import_start_time).total_seconds()
         speed = f"{current/elapsed:.1f} 文件/秒" if elapsed > 0 else ""
         self._wiz_import_progress.setValue(current)
@@ -3563,7 +3563,7 @@ class MainWindow(QMainWindow):
             self._wiz_log.setText("")
             # ─── 阶段 0：任务配置确认（直接 append，绕过队列） ───
             from autokat.core.renderer import _get_encoder_label
-            _ts = datetime.now().strftime('%H:%M:%S')
+            _ts = datetime.now().strftime('%Y%m%d %H:%M:%S')
             _seg_count = len([p for p in text.split("---") if p.strip()])
             _char_count = len(text.replace("---", "").replace("\n", "").replace(" ", "").strip())
             _sel_count = len(mat_ids) if mat_ids else 0
@@ -3595,7 +3595,7 @@ class MainWindow(QMainWindow):
             self._wiz_log.append(f"[{_ts}] 🎵 BGM: {_bgm_label}  ·  音量: {_bgm_vol}%")
             self._wiz_log.append(f"[{_ts}] 💬 字幕: 位置={_sub_pos_label}  ·  字体=Source Han Sans  ·  描边=1px")
             self._wiz_log.append(f"[{_ts}] 🖥️ 编码器: {_get_encoder_label()}  ·  DeepSeek API: {'✅' if os.environ.get('DEEPSEEK_API_KEY') else '❌ 未配置'}")
-            self._wiz_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] 开始生成 {count} 条...")
+            self._wiz_log.append(f"[{datetime.now().strftime('%Y%m%d %H:%M:%S')}] 开始生成 {count} 条...")
             self._gen_start_time = datetime.now()
             def do_gen():
                 return run_generate(
@@ -3644,7 +3644,7 @@ class MainWindow(QMainWindow):
             _tb.print_exc()
             _err = f"{type(ex).__name__}: {ex}"
             try:
-                self._wiz_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ 启动失败: {_err}")
+                self._wiz_log.append(f"[{datetime.now().strftime('%Y%m%d %H:%M:%S')}] ❌ 启动失败: {_err}")
             except Exception:
                 pass
             try:
@@ -3667,7 +3667,7 @@ class MainWindow(QMainWindow):
             import traceback
             traceback.print_exc()
             try:
-                self._wiz_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠️ 进度刷新异常: {ex}")
+                self._wiz_log.append(f"[{datetime.now().strftime('%Y%m%d %H:%M:%S')}] ⚠️ 进度刷新异常: {ex}")
             except Exception:
                 pass
     def _poll_wizard_progress_inner(self):
@@ -3695,7 +3695,7 @@ class MainWindow(QMainWindow):
                 import traceback
                 traceback.print_exc()
                 try:
-                    self._wiz_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠️ 日志行解析失败: {ex_inner}")
+                    self._wiz_log.append(f"[{datetime.now().strftime('%Y%m%d %H:%M:%S')}] ⚠️ 日志行解析失败: {ex_inner}")
                 except Exception:
                     pass
         task = get_task(self._current_task_id)
@@ -3971,10 +3971,10 @@ class MainWindow(QMainWindow):
         stopped_or_failed = bool(task and task["status"] == "failed")
         if stopped_or_failed:
             self._wiz_task_info.setText(f"⏹ 任务 #{task_id} 已停止或失败")
-            self._wiz_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] ⏹ 任务已停止或失败 task_id={task_id}")
+            self._wiz_log.append(f"[{datetime.now().strftime('%Y%m%d %H:%M:%S')}] ⏹ 任务已停止或失败 task_id={task_id}")
         else:
             self._wiz_task_info.setText(f"✅ 任务 #{task_id} 已完成！")
-            self._wiz_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ 生成完成！task_id={task_id}")
+            self._wiz_log.append(f"[{datetime.now().strftime('%Y%m%d %H:%M:%S')}] ✅ 生成完成！task_id={task_id}")
         if enable_dedup and not stopped_or_failed:
             self._wiz_log.append("开始去重...")
             threading.Thread(target=lambda: self._do_dedup(), daemon=True).start()
@@ -3996,12 +3996,12 @@ class MainWindow(QMainWindow):
         self._wiz_pause_btn.setVisible(False)
         self._wiz_stop_btn.setVisible(False)
         self._wiz_task_info.setText(f"❌ 生成失败")
-        self._wiz_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ 失败: {msg}")
+        self._wiz_log.append(f"[{datetime.now().strftime('%Y%m%d %H:%M:%S')}] ❌ 失败: {msg}")
     def _on_wizard_pause(self):
         if self._current_task_id:
             # 复用 _pause_task：会检查状态 + log + 刷新
             self._pause_task(self._current_task_id)
-            self._wiz_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] ⏸ 已暂停，渲染会在当前 clip 完成后停止新渲染")
+            self._wiz_log.append(f"[{datetime.now().strftime('%Y%m%d %H:%M:%S')}] ⏸ 已暂停，渲染会在当前 clip 完成后停止新渲染")
             self._wiz_pause_btn.setEnabled(False)
     def _on_wizard_stop(self):
         self._stop_requested = True
@@ -4010,7 +4010,7 @@ class MainWindow(QMainWindow):
         if self._current_task_id:
             from autokat.models.db import update_task_status
             update_task_status(self._current_task_id, "failed")
-            self._wiz_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] ⏹ 已停止")
+            self._wiz_log.append(f"[{datetime.now().strftime('%Y%m%d %H:%M:%S')}] ⏹ 已停止")
             self._wiz_pause_btn.setEnabled(False)
             self._wiz_stop_btn.setEnabled(False)
     # ══════════════════════════════════════════════════════════
@@ -4491,7 +4491,7 @@ class MainWindow(QMainWindow):
             layout.addWidget(label)
         dlg.exec()
     def _log(self, msg):
-        ts = datetime.now().strftime("%H:%M:%S")
+        ts = datetime.now().strftime("%Y%m%d %H:%M:%S")
         log_text = f"[{ts}] {msg}"
         print(log_text)
         if hasattr(self, "_wiz_log") and self._wiz_log:
