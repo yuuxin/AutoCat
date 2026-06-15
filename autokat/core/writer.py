@@ -312,7 +312,39 @@ def _call_deepseek_api(prompt: str, max_tokens: int = 512,
 
         with urllib.request.urlopen(req, timeout=30) as resp:
             result = json.loads(resp.read().decode("utf-8"))
-            content = result["choices"][0]["message"]["content"]
+            # v3.3: 空 choices 不再静默返回 None, 显式 raise 提示用户检查
+            # 模型名/Key 权限 (用户报告: deepseek-v4-flash 返回 0 字符误以为网络问题)
+            choices = result.get("choices") or []
+            if not choices:
+                body_excerpt = json.dumps(result, ensure_ascii=False)[:200]
+                raise RuntimeError(
+                    f"DeepSeek API 返回空 choices 字段 (模型 {effective_model} 可能无效或 Key 无权访问。"
+                    f"DeepSeek 官方仅支持 deepseek-chat / deepseek-reasoner)。"
+                    f"响应: {body_excerpt}"
+                )
+            # v3.3: 优先取 content; 如果是推理模型 (deepseek-reasoner /
+            # deepseek-v4-flash 等带 reasoning_content 的) content 经常是空,
+            # 全部 token 被 reasoning_content 吃光, 退回到 reasoning_content
+            # 让上游至少拿到「思考结论」(实测: max_tokens=15 时
+            # deepseek-v4-flash 返回 content="" + reasoning_content=... 整段思考)
+            message = choices[0].get("message", {}) or {}
+            content = message.get("content") or ""
+            if not content:
+                reasoning = message.get("reasoning_content") or ""
+                if reasoning:
+                    print(
+                        f"[DeepSeek] 警告: 模型 {effective_model} 是推理模型,"
+                        f"content 为空但 reasoning_content 有 {len(reasoning)} 字符,"
+                        f"临时回退使用 (建议 max_tokens >= 4096)"
+                    )
+                    content = reasoning
+            if not content:
+                body_excerpt = json.dumps(result, ensure_ascii=False)[:200]
+                raise RuntimeError(
+                    f"DeepSeek API 返回 choices 但 message.content 为空 "
+                    f"(模型 {effective_model} 触发了内容过滤或返回异常结构)。"
+                    f"响应: {body_excerpt}"
+                )
             return content.strip()
 
     except urllib.error.HTTPError as e:
@@ -335,6 +367,10 @@ def _call_deepseek_api(prompt: str, max_tokens: int = 512,
         # 改用 raise 让上游 DeepSeekWriterProvider.generate 接住, 在 UI 日志里
         # 显示完整路径 (Keychain 路径 / 文件路径 / 错误原因)
         raise RuntimeError(f"DeepSeek API {msg}") from e
+    except RuntimeError:
+        # v3.3: 业务异常 (空 choices / 空 content) 不应被吞, propagate 给上游
+        # 让用户在 UI 日志里看到具体原因 (模型名/Key/响应片段)
+        raise
     except Exception as e:
         print(f"[DeepSeek] API 调用失败: {e}")
         return None
@@ -1015,6 +1051,14 @@ def generate_script_by_topic_detailed(
     _max_tokens = 512
     if target_chars_max:
         _max_tokens = max(512, min(2048, int(target_chars_max * 2)))
+    # v3.3: 推理模型 (deepseek-v4-flash / deepseek-reasoner) 输出的 token
+    # 会被 reasoning_content 吃掉一大半, 给足 max_tokens 让 content 也有空间。
+    # 普通对话模型 (deepseek-chat / deepseek-coder) 不受影响, 多给 token 没事。
+    # v3.3 用户补充 deepseek-v4-flash 官方规格: 1M 上下文 + 384K 最大输出。
+    # 给 4096 tokens ≈ 12000 中文字, 远超我们实际需要的 142 字脚本, 给推理链
+    # 留足空间 (实测 max_tokens=15 时全部 token 被 reasoning_content 吃光)。
+    if provider == "deepseek" and _max_tokens < 4096:
+        _max_tokens = 4096
 
     # Provider selection goes through ai_providers.build_writer_provider so
     # the macOS Keychain and ai_settings.json are the single source of truth.
@@ -1054,6 +1098,18 @@ def generate_script_by_topic_detailed(
                 )
             try:
                 raw = provider_obj.generate(prompt, max_tokens=_max_tokens)
+            except RuntimeError:
+                # v3.3: 业务/永久错误 (模型名错, Key 无效, 推理模型 content 空
+                # 被回退后仍空 等) 不应被静默重试 — 立即向上抛, 让用户看到真实
+                # 原因, 不要再浪费 3 次 API 调用和用户 30 秒等待。
+                # 网络/瞬时错误 (ConnectionError, URLError, TimeoutError)
+                # 走下面 except Exception 路径, 仍会重试。
+                # v3.3.1: 包装异常带上 provider 名 (LocalWriterProvider /
+                # DeepSeekWriterProvider), 用户能直接定位是哪个后端失败。
+                import sys as _sys
+                raise RuntimeError(
+                    f"{backend_name}: {_sys.exc_info()[1]}"
+                ) from _sys.exc_info()[1]
             except Exception as _call_err:
                 raw = None
                 print(f"[文案质量] {backend_name} 调用失败: {_call_err}")

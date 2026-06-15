@@ -39,7 +39,9 @@ class NoSafeTemplateFallbackInScriptGenTests(unittest.TestCase):
             "v3.2: generate_script_by_topic_detailed 不应再调 build_safe_script 兜底")
 
     def test_ai_failure_raises_with_manual_input_hint(self):
-        """AI 失败必须 raise RuntimeError 含「手动录入」建议"""
+        """v3.3: AI 失败必须 raise, 错误信息含具体 provider 失败原因。
+        旧版 (v3.2) 错误信息含「手动录入」, v3.3 改为 fail-fast 直接抛 provider
+        自己的错误 (如「本地模型未返回有效正文」) 更精准。"""
         with patch("autokat.core.writer.DEEPSEEK_API_KEY", ""), \
              patch("autokat.core.writer._call_local_model", return_value=None):
             with self.assertRaises(RuntimeError) as ctx:
@@ -48,13 +50,12 @@ class NoSafeTemplateFallbackInScriptGenTests(unittest.TestCase):
                     target_chars_min=100, target_chars_max=130,
                 )
         err = str(ctx.exception)
-        self.assertIn("手动录入", err,
-            f"AI 失败时异常必须含「手动录入」建议, 实际: {err!r}")
-        self.assertIn("生成文案失败", err)
-        self.assertTrue(
-            "LocalWriterProvider" in err or "DeepSeek" in err,
-            f"异常必须指明哪个 provider 失败, 实际: {err!r}",
-        )
+        # v3.3: 永久错误立即抛, 异常透传 provider 自己的错误
+        self.assertIn("LocalWriterProvider", err,
+            f"v3.3: 异常必须指明 LocalWriterProvider 失败 (fail-fast 透传), 实际: {err!r}")
+        # 不能再含「手动录入」 (那是 v3.2 旧 contract, v3.3 改 fail-fast)
+        self.assertNotIn("手动录入", err,
+            f"v3.3: 永久错误不应再被「手动录入」包装, 实际: {err!r}")
 
     def test_wildly_off_raises_with_manual_input_hint(self):
         """首次输出严重偏离字数范围, 早 fail 后也要 raise (不再走兜底)"""
