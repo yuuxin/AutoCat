@@ -73,9 +73,17 @@ class WriterQualityTests(unittest.TestCase):
     @patch("autokat.core.writer._call_deepseek_api")
     def test_retries_until_valid(self, deepseek, _local):
         valid = build_safe_script(TOPIC, 2, MIN_CHARS, MAX_CHARS)
+        # 用 mid-range 长度 (60~223 chars, 在 0.5*min=59.5 ~ 1.5*max=223.5 之间)
+        # 但仍 invalid 的响应来测试 retry 机制。16/14 chars 这种 wildly off 的
+        # 响应会触发 _is_wildly_off 早 fail，由 test_wildly_off_first_attempt_calls_model_once 单独覆盖。
+        _retry_invalid = (
+            "今天给大家推荐几款家居好物，质量好价格实惠，款式新颖百搭耐看，"
+            "欢迎选购下单，每一款都经过精心挑选，性价比超高，"
+            "值得入手，错过可惜，赶紧加购下单吧。"
+        )
         deepseek.side_effect = [
-            "请告诉我您想要的主题是什么？",
-            "今天介绍厨房收纳，欢迎关注。",
+            _retry_invalid,
+            _retry_invalid,
             valid,
         ]
         result = generate_script_by_topic_detailed(

@@ -204,11 +204,13 @@ def _compose_cached_segments(seg_files: list[str], seg_durations: list[float],
     command = [FFMPEG, "-y"]
     for segment in seg_files:
         command.extend(["-i", segment])
+    # v3.1: 去掉硬编码 bt709 色彩标签（之前强制写这 4 个 tag 会让源片若标的是 bt601
+    # 或其他色空间时被 ffmpeg 隐性转色，导致"没选扰动也有色彩变化"）。
+    # 现在只保留 -pix_fmt yuv420p（兼容性需要），色空间交给播放器按源 tag 渲染。
     command.extend([
         "-filter_complex", ";".join(filter_parts), "-map", f"[{output_label}]",
         *_h264_encoder_args("4M"), "-pix_fmt", "yuv420p", "-r", str(fps), "-an",
-        "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
-        "-color_range", "tv", output,
+        output,
     ])
     run_ffmpeg(command, desc=f"单次组合拼接({len(seg_files)}段)", timeout=600)
     duration = get_media_duration(output) or sum(group_durations)
@@ -620,10 +622,9 @@ def render_simple(script: dict, output_path: str, audio_path: str,
         concat_video, total_video_dur = _compose_cached_segments(
             seg_files, seg_durations, clips, fps, tmpdir, perturbation=perturbation,
         )
-        _batch_color_holder = [
-            "-colorspace", "bt709", "-color_primaries", "bt709",
-            "-color_trc", "bt709", "-color_range", "tv",
-        ]
+        # v3.1: 跟 render_simple 对齐——不再给 batch 共享输出加 bt709 tag。
+        # 同 batch 内的色彩一致性靠 tpad/trim 链路自然保证。
+        _batch_color_holder = []
 
         # 实时进度：进入最终合成（字幕+音频+BGM）
         if clip_id is not None:
@@ -643,11 +644,20 @@ def render_simple(script: dict, output_path: str, audio_path: str,
         target_frames = clock["target_video_frames"]
         target_samples = clock["target_audio_samples"]
         actual_video_frames = int(round(total_video_dur * fps))
+        # v3.1: 动态画面短于目标不再直接 raise。tpad=stop_mode=clone 会在最终合成
+        # 阶段用 clone 帧补到精确 target_frames（每多 1 帧 1/fps 秒静止画面），视频
+        # 长度仍然是 audio 决定的 final_dur 不会变长，画面尾部会多一小段静态尾
+        # 但总时长与配音对齐。如缺帧太多（>2s）则在 log 标 warn 让用户感知。
         if actual_video_frames < target_frames - 1:
-            raise RuntimeError(
-                f"动态画面 {total_video_dur:.3f}s < 目标 {final_dur:.3f}s，"
-                f"缺少 {target_frames - actual_video_frames} 帧，拒绝使用明显静止帧补齐"
-            )
+            shortfall_frames = target_frames - actual_video_frames
+            shortfall_sec = shortfall_frames / fps
+            if shortfall_sec > 2.0:
+                _log(
+                    f"⚠️ 动态画面 {total_video_dur:.3f}s 短于目标 {final_dur:.3f}s "
+                    f"({shortfall_frames} 帧 / {shortfall_sec:.1f}s)，"
+                    f"最终合成用 tpad=clone 补足 — 视频末尾会有 ~{shortfall_sec:.1f}s 静态画面"
+                )
+            # 不 raise：让下方 _vf 链路 (tpad + trim=end_frame=target_frames) 补帧
         if bgm_path and os.path.exists(bgm_path):
             bgm_dur = get_media_duration(bgm_path)
             if bgm_dur and bgm_dur > final_dur + 1.0:

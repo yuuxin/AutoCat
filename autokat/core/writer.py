@@ -190,12 +190,23 @@ def _build_prompt(topic: str, style: str,
             f"- 即使引用模板中的占位逻辑，也必须改写成抽象的情绪/场景表达，绝不能凭空捏造具体外观描述。\n"
         )
 
-    # ── 长度硬约束：把 target_chars_min/max 注入 prompt ──
+    # ── 长度硬约束 + 输出格式硬约束 ──
+    # v3.1: 把长度要求升级为"系统会强制 trim 超过 max 的部分，少于 min 拒收"
+    #       + 显式禁止 hashtag、emoji、markdown、前缀导语（之前在要求列表里已有，
+    #       但模型依旧会输出，这次提到【字数硬性要求】同一段强化权重）。
     length_hint = ""
     if target_chars_min and target_chars_max:
         length_hint = (
             f"\n【字数硬性要求】必须严格控制在 {target_chars_min}-{target_chars_max} 个字符之间。"
-            f"少于 {target_chars_min} 视频会短于目标时长，多于 {target_chars_max} 视频会超过目标时长。"
+            f"少于 {target_chars_min} 视频会短于目标时长（系统拒收），"
+            f"多于 {target_chars_max} 视频会超过目标时长（系统强制截断到 {target_chars_max} 字）。\n"
+            f"**绝对禁止**输出：\n"
+            f"  - 以'好的'/'文案:'/'以下是'/'当然'等导语开头的元描述\n"
+            f"  - 任何形式的 # 标签（如 #经典单品 #品质保证）\n"
+            f"  - emoji 字符（🌟✨🎉🔥💥 等）\n"
+            f"  - markdown 标记（### 标题 / **加粗** / 列表符号 - 或 1.）\n"
+            f"  - 中英文方括号元描述（【惊讶式】/[BGM]/[旁白] 等）\n"
+            f"**直接以正文第一句开头，不要任何前缀。**"
         )
     else:
         length_hint = "\n文案长度：5-8 句话，100-200 字。"
@@ -527,7 +538,7 @@ def _collapse_runs(s: str) -> str:
     return s
 
 
-def _clean_result(text: str) -> str:
+def _clean_result(text: str, topic: str = None) -> str:
     """AI 文案后处理: 清洗模型常见的污染输出 (元描述/emoji/markdown/前缀)"""
     if not text:
         return ""
@@ -561,6 +572,21 @@ def _clean_result(text: str) -> str:
     text = re.sub(emoji_pattern, "", text)
     # 4. 去除 markdown 标记 (### 标题 / **加粗** / - 列表 / 1. 有序列表)
     text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    # 4b. 去除行内 "# xxx" hashtag 标签 (如 "#经典单品 #品质保证")
+    #     行首或行内的 hashtag 都剥，避免在成片里出现 #标签
+    text = re.sub(r'#\S+', '', text)
+    # 4c. 修复孤字/残字: 当 1-2 个汉字被标点/空格孤立夹在中间时 (如 "节女鞋")，
+    #     极有可能是 tokenizer 截断。删掉这个孤字让前后语义连续，或替换为 topic 前两字。
+    #     规则: 前后都是空格或标点，自身是 1-2 个汉字，单独成"词"。
+    # 用 topic 的前 2 个汉字作为兜底替换词；无 topic 则删掉孤字让前后连贯
+    _topic_fill = ""
+    if topic:
+        _topic_fill = re.sub(r'\s+', '', topic)[:2] or topic[:1]
+    text = re.sub(
+        r'(?<=[\s，。！？!?、；;,.])([一-鿿]{1,2})(?=[\s，。！？!?、；;,.]|$)',
+        lambda _m: _topic_fill if (_topic_fill and _m.group(1) != _topic_fill) else '',
+        text,
+    )
     text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
     text = re.sub(r'\*([^*]+)\*', r'\1', text)
     text = re.sub(r'^\s*[-*+]\s+', '', text, flags=re.MULTILINE)
@@ -623,6 +649,20 @@ _PROMOTION_WORDS = ("限时", "抢购", "特价", "特惠", "优惠", "秒杀", 
 
 def _content_char_count(text: str) -> int:
     return len(re.sub(r"\s+", "", text or ""))
+
+
+def _is_wildly_off(text: str, min_chars: int, max_chars: int) -> bool:
+    """检查模型输出是否严重偏离目标字数 (说明模型没理解长度约束)。
+
+    阈值:
+      - 输出 > 1.5x max_chars: 太长，模型没在控制
+      - 输出 < 0.5x min_chars: 太短，模型没在控制
+    返回 True 时调用方应跳过剩余 retry 直接走 fallback。
+    """
+    if not text:
+        return True
+    actual = _content_char_count(text)
+    return actual > max_chars * 1.5 or actual < min_chars * 0.5
 
 
 def _topic_terms(topic: str) -> list[str]:
@@ -840,7 +880,23 @@ def generate_script_by_topic_detailed(
             except Exception as _call_err:
                 raw = None
                 print(f"[文案质量] {backend_name} 调用失败: {_call_err}")
-            result = _clean_result(raw) if raw else ""
+            result = _clean_result(raw, topic=topic) if raw else ""
+            # 强制 trim 到字数范围 (本地模型经常无视 prompt 长度要求)
+            if result and (target_chars_min or target_chars_max):
+                result = _enforce_char_limit(
+                    result,
+                    min_chars=target_chars_min,
+                    max_chars=target_chars_max,
+                )
+            # 早 fail: 首次输出严重偏离目标范围 (>1.5x 或 <0.5x)，模型明显
+            # 没理解长度约束——不再浪费后续 retry，直接 break 让 fallback 兜底
+            if attempt == 1 and target_chars_min and target_chars_max and result:
+                if _is_wildly_off(result, target_chars_min, target_chars_max):
+                    print(
+                        f"[文案质量] {backend_name} 首次输出严重偏离目标范围，"
+                        f"跳过剩余重试，fallback 兜底"
+                    )
+                    break
             if _target_lang:
                 source_quality = validate_script_quality(
                     result, topic, lang="zh", detail=detail, features=features,
