@@ -308,6 +308,26 @@ def _call_deepseek_api(prompt: str, max_tokens: int = 512,
             content = result["choices"][0]["message"]["content"]
             return content.strip()
 
+    except urllib.error.HTTPError as e:
+        # v3.2: 针对 401/403/429 等常见 HTTP 错误给出可操作的提示,
+        # 而不是只看 print 日志猜问题。
+        try:
+            err_body = e.read().decode("utf-8", errors="replace")[:400]
+        except Exception:
+            err_body = ""
+        if e.code == 401:
+            msg = (f"API Key 认证失败 (401)。请到 platform.deepseek.com 检查 Key "
+                   f"是否已过期/被禁用，然后到 AI 对话框重新填入。")
+        elif e.code == 402:
+            msg = "账户余额不足 (402)。请到 platform.deepseek.com 充值。"
+        elif e.code == 429:
+            msg = "请求频率超限 (429)。请等几分钟后重试或减小并发。"
+        else:
+            msg = f"HTTP {e.code} 错误。响应: {err_body}"
+        print(f"[DeepSeek] {msg}")
+        # 改用 raise 让上游 DeepSeekWriterProvider.generate 接住, 在 UI 日志里
+        # 显示完整路径 (Keychain 路径 / 文件路径 / 错误原因)
+        raise RuntimeError(f"DeepSeek API {msg}") from e
     except Exception as e:
         print(f"[DeepSeek] API 调用失败: {e}")
         return None
