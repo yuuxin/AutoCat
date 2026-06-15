@@ -1831,9 +1831,6 @@ class MainWindow(QMainWindow):
         lang_input.addItems(["中文", "泰文", "英文"])
         lang_input.setCurrentIndex(0)
         form.addRow("语言:", lang_input)
-        # 语速滑块（edge-tts rate，-50~+50%）— 拖动时实时算字数
-        from PySide6.QtWidgets import QSlider
-        from PySide6.QtCore import Qt
         ai_rate = QSlider(Qt.Horizontal)
         ai_rate.setRange(-50, 50)
         ai_rate.setValue(0)
