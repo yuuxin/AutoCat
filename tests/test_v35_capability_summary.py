@@ -45,12 +45,14 @@ class CapabilitySummaryPromptTests(unittest.TestCase):
             self.assertIn(example, prompt, f"v3.7: 提示词必须含场景示例 '{example}'")
 
     def test_forbidden_keeps_specific_attributes_only(self):
-        """v3.7: 合并的【禁止】段仍含 detail/features 未提供的具体属性提示"""
+        """v3.17: 【禁止】段已从 prompt 删除 (validation 后端仍 enforce),
+        prompt 不再含颜色/尺寸/材质/配件 提示"""
         prompt = self._get_prompt_with_capability()
-        # v3.7 【禁止】段提到 颜色/尺寸/材质/配件 等
-        self.assertIn("材质", prompt)
-        self.assertIn("颜色", prompt)
-        # 不再要求 "品牌/价格" (这些 v3.7 不在 prompt 里 - 由 validation 把守)
+        # v3.17: 颜色/尺寸/材质/配件 已不在 prompt (validation 仍 reject)
+        # 验证 prompt 确实删干净了, 防止未来回潮
+        for kw in ("材质", "颜色", "尺寸", "配件"):
+            self.assertNotIn(kw, prompt,
+                f"v3.17: prompt 不应再含 '{kw}' (该段已删, 走 validation 后端)")
 
     def test_summary_field_not_flagged_as_forbidden(self):
         """v3.5 核心: capability_summary 里的 "鞋子" "特写" "通勤" 不会被跨品类误伤"""

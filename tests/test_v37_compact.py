@@ -49,18 +49,23 @@ class AntiLeakCompactnessTests(unittest.TestCase):
                 f"v3.7: helper 不应再含 '{f}' (被模型拷贝过的反例)")
 
     def test_no_three_banned_sections(self):
-        """v3.7 核心: 3 个'禁止'段已合并为 1 个【禁止】段, 不重复堆叠"""
+        """v3.17: 【禁止】段已从 prompt 删除 (用户反馈 prompt 是把
+        validation 规则再背一遍, 对模型没新信息还占 token)。
+        validation 后端仍按 _FABRICATED_PROCESS_CLAIMS /
+        _OVERCLAIMS_NO_SUPPORT / _CROSS_CATEGORY_FORBIDDEN 严格把关。
+        """
         prompt = _build_prompt(
             "春夏女鞋", "种草推荐", detail=None, features=None,
             lang="zh",
         ) + _format_capability_summary_prompt("鞋子/特写/通勤/自然光")
-        # 旧版有 3 段 【禁止】 / 【视觉信息缺失 · 禁止编造外观】 / 【禁止捏造】
-        old_section_markers = ("【视觉信息缺失 · 禁止编造外观】", "【禁止捏造】")
+        # v3.17: 旧版 3 段【禁止】全部从 prompt 删除, prompt 不应再含任何「禁止」字眼
+        old_section_markers = (
+            "【禁止】", "【禁止捏造】", "【视觉信息缺失 · 禁止编造外观】",
+            "【视觉信息缺失】",
+        )
         for marker in old_section_markers:
             self.assertNotIn(marker, prompt,
-                f"v3.7: 不应再有 '{marker}' 段, 已合并到【禁止】")
-        # 应该有新的【禁止】段
-        self.assertIn("【禁止】", prompt, "v3.7: 应该有合并的【禁止】段")
+                f"v3.17: prompt 不应再有 '{marker}' 段, 全部由 validation 后端把关")
 
 
 class ValidationSofteningTests(unittest.TestCase):

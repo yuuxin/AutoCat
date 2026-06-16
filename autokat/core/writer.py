@@ -223,14 +223,11 @@ def _build_prompt(topic: str, style: str,
 
     # v3.2: 【禁止捏造设计过程 / 过度承诺 / 跨品类】 — 始终启用, 与 validation 对应
     # 极简措辞以避免 prompt 过长 (test_core_unit 期望 < 1000 字符)
-    # v3.7 合并: 视觉缺失 + 禁止捏造 + 反泄漏 3 段 -> 1 段【禁止】
-    no_fabrication_hint = (
-        f"\n【禁止】违反任一会被 validate_script_quality 拒收:\n"
-        f"1) 不编造外观 (颜色/尺寸/材质/配件), 没提供 detail/features 时只写情绪/场景/身份认同\n"
-        f"2) 不编造设计过程/设计师故事 (匠心/手工/精雕细琢/设计师/灵感/反复打磨等)\n"
-        f"3) 不写无支撑的过度营销词 (完美展现/完美呈现/完美融合/绝佳/艺术品/极致/独一无二/殿堂级/顶配/全球首发/颠覆性)\n"
-        f"4) 不跨品类 (鞋类不能写 衣/裤/裙/包/帽; 反之亦然)\n"
-    )
+    # v3.17 用户反馈: prompt 里这个【禁止】段是把 validation 规则再背一遍,
+    # 对模型没新信息但又容易让模型刻意绕开措辞导致 prompts 变长。
+    # validation 后端仍按 _FABRICATED_PROCESS_CLAIMS / _OVERCLAIMS_NO_SUPPORT /
+    # _CROSS_CATEGORY_FORBIDDEN 严格把关, 删除该段不影响 reject 行为, 只让 prompt 更短。
+    no_fabrication_hint = ""
 
     # ── 长度硬约束 + 输出格式硬约束 ──
     # v3.1: 把长度要求升级为"系统会强制 trim 超过 max 的部分，少于 min 拒收"
@@ -976,9 +973,12 @@ _UNSUPPORTED_PRODUCT_CLAIMS = (
 _PROMOTION_WORDS = ("限时", "抢购", "特价", "特惠", "优惠", "秒杀", "直降", "折扣")
 
 # v3.2: 凭空捏造的设计过程/设计师故事 — 未提供素材细节时不能编造
+# v3.17 用户反馈: 「匠心」是常用词, 不算捏造, 允许使用。变体「匠心独运/打造/呈现」
+# 包含「匠心」也应一并放行, 否则仍被拒收。
+# 但「设计师/手工/精雕细琢/精挑细选/反复打磨/千锤百炼/每一寸细节」等仍 reject —
+# 这些是真正在编造不存在的设计过程。
 _FABRICATED_PROCESS_CLAIMS = (
     "设计灵感", "设计故事", "设计理念", "设计哲学",
-    "匠心", "匠心独运", "匠心打造", "匠心呈现",
     "设计师", "设计师的故事", "设计师的灵感",
     "手工打造", "手工制作", "纯手工",
     "精雕细琢", "精心打造", "精心设计", "精挑细选",
@@ -1010,6 +1010,20 @@ _CROSS_CATEGORY_FORBIDDEN = {
     ("帽",): ("衣服", "衣物", "鞋子"),
 }
 
+# v3.17: 把搭配描述关键词提取为模块级常量 — 之前是 validate_script_quality
+# 内的局部变量, 测试和外部代码无法引用。提到顶层后跨品类检查和测试
+# 守护都用同一份, 避免漂移。
+# 用户反馈: 「看语义不是只看关键字」, 之前 _STYLING_PRE 太窄, 「适合搭/配搭/
+# 映衬/衬托/衬」等常见搭配词都漏了, 导致 "鞋适合搭连衣裙" 等被误杀。
+_STYLING_PRE = (
+    # 原始 9 个 (v3.2 引入)
+    "搭配", "配上", "配着", "配", "和", "与", "跟", "百搭", "相配", "相称", "适配",
+    # v3.17 新增 — 用户报告 适合/配搭/映衬/衬托/衬/搭 都被误判
+    "适合", "配搭", "映衬", "衬托", "衬", "搭",
+)
+# v3.17: 跨品类前缀窗口 6→12, 捕捉更远的搭配词 (如 "这双百搭的鞋子与
+# 连衣裙搭配起来" 这种长距离搭配)
+_STYLING_PREFIX_WINDOW = 12
 _TOPIC_CATEGORY_KEYS = (
     ("女鞋", "鞋子", "男鞋", "童鞋", "运动鞋", "皮鞋", "高跟鞋", "平底鞋",
      "靴子", "凉鞋", "拖鞋", "袜子", "鞋"),
@@ -1150,14 +1164,15 @@ def validate_script_quality(
     # 注: 用「子句」不是「句子」 — 句子以 。！？? 结束, 但一个句子里可能有
     # 多个并列子句 (以 ，, 隔开), 跨品类检查需要按子句粒度判定, 否则
     # "穿上这款女鞋, 您将不再仅仅是一件衣服" 会被误判为 on-topic。
+    # v3.17 用户反馈: 「看语义不是只看关键字」 — 之前 _STYLING_PRE 太窄,
+    # 「适合搭/配搭/映衬/衬托/衬」等常见搭配词都漏了, 导致 "鞋适合搭连衣裙" /
+    # "鞋配搭小裙子" 等被误杀。同时把前缀窗口 6→12, 捕捉距离更远的搭配词。
     category = _detect_topic_category(topic)
     if category:
         forbidden = []
         for cat_keys, bad_words in _CROSS_CATEGORY_FORBIDDEN.items():
             if category in cat_keys:
                 forbidden.extend(bad_words)
-        _STYLING_PRE = ("搭配", "配上", "配着", "配", "和", "与",
-                        "跟", "百搭", "相配", "相称", "适配")
         _CLAUSE_RE = re.compile(r"[。！？?；;，,]+")
         _clause_spans = []  # list of (start, end) for each non-empty clause
         _pos = 0
@@ -1181,7 +1196,8 @@ def validate_script_quality(
             flag_this = False
             for match in re.finditer(re.escape(w), text):
                 # 规则 1: 前缀是搭配标记 → 算搭配描述, 跳过
-                prefix = text[max(0, match.start() - 6):match.start()]
+                # v3.17: 6→12 提到模块级常量 _STYLING_PREFIX_WINDOW, 测试可引用
+                prefix = text[max(0, match.start() - _STYLING_PREFIX_WINDOW):match.start()]
                 if any(p in prefix for p in _STYLING_PRE):
                     continue
                 # 规则 2: 找该 word 所在子句, 看是否提到 topic

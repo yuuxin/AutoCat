@@ -56,32 +56,37 @@ class PerfectOverclaimTests(unittest.TestCase):
                 f"v3.11: '{kw}' 仍应 reject (clear overclaim), reasons={r.get('reasons')}")
 
 
-class PromptValidationConsistencyTests(unittest.TestCase):
-    """v3.9 修 2: prompt 加上常见 overclaim 短语, 防止模型误用"""
+class PromptValidationDecouplingTests(unittest.TestCase):
+    """v3.17: prompt 与 validation 解耦 — validation 黑名单 (3 字: 艺术品/颠覆性/革命性)
+    不再需要在 prompt 重复列出 (用户反馈 prompt 是把 validation 规则再背一遍,
+    对模型没新信息, 反而占 token)。
+    关键: validation 后端仍按 _OVERCLAIMS_NO_SUPPORT 严格 reject,
+    prompt 只是引导, 不替代 validation。
+    """
 
-    def test_prompt_lists_common_overclaim_phrases(self):
-        """prompt 应含 完美展现/完美呈现/完美融合/绝佳 (v3.8 漏了)"""
+    def test_prompt_does_not_list_overclaim_blacklist(self):
+        """v3.17: prompt 不应含 完美展现/完美呈现/完美融合/绝佳 等 overclaim 词
+        (validation 后端只 reject 艺术品/颠覆性/革命性 3 字, 不会 reject 完美XX)"""
         prompt = _build_prompt(
             "春夏女鞋", "种草推荐", detail=None, features=None,
             lang="zh",
             target_chars_min=107, target_chars_max=156,
         )
         for phrase in ["完美展现", "完美呈现", "完美融合", "绝佳"]:
-            self.assertIn(phrase, prompt,
-                f"v3.9: prompt 应含 '{phrase}' 提示模型避开")
+            self.assertNotIn(phrase, prompt,
+                f"v3.17: prompt 不应再列 '{phrase}' (validation 已放宽放行, 列出反而误导)")
 
-    def test_validation_list_matches_prompt(self):
-        """validation 黑名单 应 <= prompt 提示 + 常用词 (1 个差也算)"""
-        prompt = _build_prompt(
-            "春夏女鞋", "种草推荐", detail=None, features=None,
-            lang="zh",
-            target_chars_min=107, target_chars_max=156,
-        )
-        # v3.8 漏报的字 (v3.9 加回了) - 这些必须在 prompt 里能找到
-        must_be_in_prompt = ["完美展现", "完美呈现", "完美融合", "绝佳"]
-        missing = [p for p in must_be_in_prompt if p not in prompt]
-        self.assertEqual(missing, [],
-            f"v3.9: validation 拒绝的 overclaim 短语必须在 prompt 提示, missing={missing}")
+    def test_validation_still_rejects_clear_overclaim(self):
+        """v3.17 回归保护: 3 个 clear overclaim (艺术品/颠覆性/革命性) 仍 reject,
+        即便 prompt 不再提及 — 验证 validation 后端独立 enforce"""
+        for kw in ["艺术品", "颠覆性", "革命性"]:
+            text = f"这款鞋是{kw}级别的设计, 让你走在时尚尖端。"
+            r = validate_script_quality(text, "春夏女鞋", lang="zh",
+                                         target_chars_min=50, target_chars_max=200)
+            overclaim_reasons = [x for x in r.get("reasons", [])
+                                 if "过度承诺" in x]
+            self.assertGreater(len(overclaim_reasons), 0,
+                f"v3.17 回归: '{kw}' 仍应 reject (clear overclaim), reasons={r.get('reasons')}")
 
 
 if __name__ == "__main__":

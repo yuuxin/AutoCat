@@ -309,7 +309,9 @@ class UserReportedBadOutputsTests(unittest.TestCase):
 class ConstantCoverageTests(unittest.TestCase):
 
     def test_fabricated_claims_covers_user_patterns(self):
-        for kw in ["设计灵感", "设计师", "匠心独运", "手工打造", "精雕细琢",
+        # v3.17: 匠心 已被用户允许 (从 _FABRICATED_PROCESS_CLAIMS 移除, 包含它的
+        # 变体「匠心独运/打造/呈现」也一并放行, 否则仍被拒)
+        for kw in ["设计灵感", "设计师", "手工打造", "精雕细琢",
                    "精心打造", "每一寸细节"]:
             self.assertIn(kw, _FABRICATED_PROCESS_CLAIMS,
                           f"_FABRICATED_PROCESS_CLAIMS 必须覆盖「{kw}」")
