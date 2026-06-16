@@ -124,6 +124,27 @@ _ANGLES = [
 ]
 
 
+def _format_capability_summary_prompt(capability_summary: str) -> str:
+    """v3.5 (方案 A): 把切片分析出的素材能力摘要拼到 prompt 里。
+
+    - 旧版用负面措辞 ("不得编造素材无法支持的画面") 堵死了小模型,
+      让 Qwen 0.5B 走投无路自己编产品名 (如 "无界运动鞋")。
+    - 新版改成正向引导 ("可以用这些能力描述具体场景"),
+      给可操作的例子 (特写/通勤/户外自然光),
+      让小模型照搬 summary 里的 (主体/景别/场景/动作/角色) 写脚本。
+    - "禁止"只剩 detail/features 未明确提供的具体属性 (材质/品牌/价格/型号),
+      由 validate_script_quality 把守。
+
+    Returns: 一段直接 append 到 prompt 末尾的字符串。
+    """
+    return (
+        "\n【已选素材能力摘要】" + capability_summary
+        + "\n可以用这些能力描述具体场景 (例: '特写展示细节', '通勤穿搭场景',"
+        + " '户外自然光', '细节镜头搭配指南')\。"
+        + "禁止凭空捏造 detail/features 未明确提供的具体属性 (材质/品牌/价格/型号)\。"
+    )
+
+
 def _build_prompt(topic: str, style: str,
                   detail: Optional[str] = None,
                   features: Optional[str] = None,
@@ -1167,15 +1188,29 @@ def generate_script_by_topic_detailed(
                 video_type=video_type,
             )
             if material_capabilities:
-                prompt += (
-                    "\n已选素材能力摘要：" + material_capabilities
-                    + "\n文案只能围绕这些可展示能力组织表达，不得编造素材无法支持的画面。"
-                )
+                # v3.5 (方案 A): 把"不得编造素材无法支持的画面"改成"可以引用这些能力"。
+                # 详见 _format_capability_summary_prompt 文档。字面常量也由同函数导出,
+                # 测试 (test_v35_capability_summary) 走 _format_capability_summary_prompt
+                # 拿到精确字符串, 避免与运行时 prompt 漂移。
+                prompt += _format_capability_summary_prompt(material_capabilities)
             if progress_callback:
                 progress_callback(
                     backend_name, attempt, max_attempts,
                     "正在生成" if not last_reasons else "；".join(last_reasons),
                 )
+            # v3.5 后台打印: 完整 prompt 写到 stderr, 标 [writer.debug] 便于 grep。
+            # AI 文案生成时方便调试 (检查切片摘要是否被引用、few-shot 是否照搬等)。
+            # 默认开启; 性能开销 < 1ms/prompt (2124 chars 字符串拷贝)。
+            import sys
+            try:
+                print(
+                    f"\n[writer.debug] ===== AI PROMPT (topic={topic}, style={style}, "
+                    f"target={target_chars_min}-{target_chars_max}, attempt={attempt}/{max_attempts}) "
+                    f"=====\n{prompt}\n===== END PROMPT =====\n",
+                    file=sys.stderr, flush=True,
+                )
+            except Exception:
+                pass
             try:
                 raw = provider_obj.generate(prompt, max_tokens=_max_tokens)
             except RuntimeError:
