@@ -2073,7 +2073,8 @@ class MainWindow(QMainWindow):
                 ai_status_label.setText(f"✅ 已生成 {len(ai_results)}/{count_input.value()} 条合格文案")
                 ai_progress_bar.setValue(len(ai_results))
                 gen_btn.setEnabled(len(ai_results) < count_input.value())
-                use_btn.setEnabled(len(ai_results) >= count_input.value())
+                # v3.11 修: 至少 1 条即可使用, 不必等齐 5 条
+                use_btn.setEnabled(len(ai_results) > 0)
                 result_area.setText(txt)
                 result_area.setVisible(True)
             worker.result_signal.connect(_accept_generated)

@@ -23,26 +23,37 @@ class PerfectOverclaimTests(unittest.TestCase):
             self.assertEqual(overclaim_reasons, [],
                 f"v3.9: '完美' (常用词) 不应触发过度承诺 fail, text={text!r}, reasons={r.get('reasons')}")
 
-    def test_perfect_preserves_overclaim_phrases(self):
-        """'完美展现' / '完美呈现' / '完美融合' 仍应被 reject (3 个 overclaim 短语保留)"""
+    def test_perfect_zhanxian_phrase_passes_v311(self):
+        """v3.11: '完美展现' / '完美呈现' / '完美融合' 放行 (用户要求形容词可放行)"""
         for phrase in ["完美展现", "完美呈现", "完美融合"]:
-            text = f"这款鞋{phrase}了优雅气质, 真的太好看了。"
+            text = f"这款鞋{phrase}了优雅气质, 真的太好看了。春夏搭配浅色长裙清新自然。"
             r = validate_script_quality(text, "春夏女鞋", lang="zh",
                                          target_chars_min=50, target_chars_max=200)
             overclaim_reasons = [x for x in r.get("reasons", [])
-                                 if "过度承诺" in x or "overclaim" in x.lower()]
-            self.assertGreater(len(overclaim_reasons), 0,
-                f"v3.9: '{phrase}' 仍应触发过度承诺 fail, reasons={r.get('reasons')}")
+                                 if "过度承诺" in x]
+            self.assertEqual(overclaim_reasons, [],
+                f"v3.11: '{phrase}' 应放行 (常用营销词), reasons={r.get('reasons')}")
 
-    def test_juejia_still_rejected(self):
-        """'绝佳' 是明确 overclaim, 仍应 reject"""
-        text = "这款鞋绝佳适合任何场合, 真的是必备单品。"
+    def test_juejia_passes_v311(self):
+        """v3.11: '绝佳' 放行 (用户要求形容词可放行)"""
+        text = "这款鞋绝佳适合任何场合, 真的是必备单品。春夏搭配浅色长裙清新自然。"
         r = validate_script_quality(text, "春夏女鞋", lang="zh",
                                      target_chars_min=50, target_chars_max=200)
         overclaim_reasons = [x for x in r.get("reasons", [])
-                             if "过度承诺" in x or "overclaim" in x.lower()]
-        self.assertGreater(len(overclaim_reasons), 0,
-            f"v3.9: '绝佳' 仍应 reject, reasons={r.get('reasons')}")
+                             if "过度承诺" in x]
+        self.assertEqual(overclaim_reasons, [],
+            f"v3.11: '绝佳' 应放行, reasons={r.get('reasons')}")
+
+    def test_clear_overclaim_still_rejected_v311(self):
+        """v3.11: 艺术品/颠覆性/革命性 (3 个最 clear overclaim) 仍 reject"""
+        for kw in ["艺术品", "颠覆性", "革命性"]:
+            text = f"这款鞋是{kw}级别的设计, 让你走在时尚尖端。春夏搭配浅色长裙清新自然。"
+            r = validate_script_quality(text, "春夏女鞋", lang="zh",
+                                         target_chars_min=50, target_chars_max=200)
+            overclaim_reasons = [x for x in r.get("reasons", [])
+                                 if "过度承诺" in x]
+            self.assertGreater(len(overclaim_reasons), 0,
+                f"v3.11: '{kw}' 仍应 reject (clear overclaim), reasons={r.get('reasons')}")
 
 
 class PromptValidationConsistencyTests(unittest.TestCase):

@@ -56,14 +56,15 @@ class FabricatedProcessClaimsTests(unittest.TestCase):
         text = "完美展现每一寸细节，每一步都精心打造。"
         result = validate_script_quality(text, "时尚女鞋", lang="zh")
         self.assertFalse(result["valid"])
-        # 同时命中 捏造设计过程 和 无支撑过度承诺
+        # v3.11: "完美展现" 不再 reject (用户要求放行),
+        # 但 "精心打造/每一寸细节" 仍 reject (设计过程)
         self.assertTrue(
             any("设计过程" in r for r in result["reasons"]),
             f"「精心打造」「每一寸细节」应被标记, 实际={result['reasons']}",
         )
-        self.assertTrue(
+        self.assertFalse(
             any("过度承诺" in r for r in result["reasons"]),
-            f"「完美展现」应被标记, 实际={result['reasons']}",
+            f"v3.11: '完美展现' 不应 reject (放行), 实际={result['reasons']}",
         )
 
 
@@ -313,13 +314,18 @@ class ConstantCoverageTests(unittest.TestCase):
             self.assertIn(kw, _FABRICATED_PROCESS_CLAIMS,
                           f"_FABRICATED_PROCESS_CLAIMS 必须覆盖「{kw}」")
 
-    def test_overclaims_covers_user_patterns(self):
-        # v3.9: 删 "完美" (常用形容词, 不是 overclaim; 完美适合你的风格 = reasonable)
-        # 保留 完美展现/完美呈现/完美融合 (3 个 overclaim 短语) + 绝佳/全新升级
-        for kw in ["完美展现", "完美呈现", "完美融合", "绝佳", "全新升级",
-                   "艺术品", "独一无二", "极致"]:
+    def test_overclaims_v311_allow_common_adjectives(self):
+        # v3.11: 放宽 overclaim (用户反馈"完美之类的形容词可以放行")
+        # 验证以下常用形容词都不在 _OVERCLAIMS_NO_SUPPORT (放行)
+        for kw in ["完美", "完美展现", "完美呈现", "完美融合",
+                   "绝佳", "全新升级", "极致", "独一无二",
+                   "殿堂级", "顶配", "全球首发"]:
+            self.assertNotIn(kw, _OVERCLAIMS_NO_SUPPORT,
+                             f"v3.11: 放宽允许使用 '{kw}'")
+        # 保留的 3 个 clear overclaim 仍 reject
+        for kw in ["艺术品", "颠覆性", "革命性"]:
             self.assertIn(kw, _OVERCLAIMS_NO_SUPPORT,
-                          f"_OVERCLAIMS_NO_SUPPORT 必须覆盖「{kw}」")
+                          f"v3.11: '{kw}' 是 clear overclaim 仍 reject")
 
     def test_cross_category_covers_shoes_to_clothes(self):
         # 鞋 → 不能出现 衣服/衣物
