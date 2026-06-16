@@ -314,7 +314,10 @@ class ConstantCoverageTests(unittest.TestCase):
                           f"_FABRICATED_PROCESS_CLAIMS 必须覆盖「{kw}」")
 
     def test_overclaims_covers_user_patterns(self):
-        for kw in ["完美", "艺术品", "独一无二", "极致", "全新升级"]:
+        # v3.9: 删 "完美" (常用形容词, 不是 overclaim; 完美适合你的风格 = reasonable)
+        # 保留 完美展现/完美呈现/完美融合 (3 个 overclaim 短语) + 绝佳/全新升级
+        for kw in ["完美展现", "完美呈现", "完美融合", "绝佳", "全新升级",
+                   "艺术品", "独一无二", "极致"]:
             self.assertIn(kw, _OVERCLAIMS_NO_SUPPORT,
                           f"_OVERCLAIMS_NO_SUPPORT 必须覆盖「{kw}」")
 
