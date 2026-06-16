@@ -305,6 +305,10 @@ def _build_prompt(topic: str, style: str,
         length_hint = (
             f"目标 **{_target_ideal} 字** (范围 {target_chars_min}-{target_chars_max}, "
             f"偏差 ±15% 仍可接受)。\n"
+            # v3.13 改 B: 加 "不要在 1-2 句后就结束" 强提示 (用户反馈
+            # Qwen 0.5B 经常 30/60/78 字就停 — 全是 1-2 句).
+            f"⚠️ 至少 **4 句** (4 个句号), **不要在 1-2 句后就结束** "
+            f"— 短于 80 字 = 不合格。\n"
             f"\n【参考结构 — 3 句共 ~{_target_ideal-30} 字】\n"
             f"\"{_EX1}\" (类似开场)\n"
             f"\"{_EX2}\" (场景/细节展开)\n"
@@ -1189,7 +1193,7 @@ def generate_script_by_topic_detailed(
                 retry_hint = (
                     f"\n【重要 — EXTEND 扩写, 不要重写!】\n"
                     f"上一版 {_prev_len} 字, 还差 {_gap} 字 (目标 {target_chars_min}-{target_chars_max}, "
-                    f"理想 {(_prev_len + target_chars_min) // 2} 字)。\n"
+                    f"理想 {(target_chars_min + target_chars_max) // 2 if (target_chars_min and target_chars_max) else 0} 字)。\n"
                     f"请在末尾添加 1-2 句 (例: 场景细节/情绪总结/行动呼吁), "
                     f"**不要从头重写**: \n"
                     f"```\n{_prev}\n```\n"
