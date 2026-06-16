@@ -31,23 +31,26 @@ class CapabilitySummaryPromptTests(unittest.TestCase):
                           "v3.5: 旧负面措辞应删除, 不再堵死 AI")
 
     def test_new_positive_wording_present(self):
-        """v3.5: 新版 '可以用这些能力描述具体场景' 引导 AI 真的用 summary"""
+        """v3.7: '内部参考, 不要原文复述' 引导 AI 用 summary 但不要原样抄"""
         prompt = self._get_prompt_with_capability()
-        self.assertIn("可以用这些能力描述具体场景", prompt,
-                      "v3.5: 必须有 '可以用这些能力' 的正向引导")
+        # v3.7 简短 1 行版
+        self.assertIn("内部参考", prompt, "v3.7: 必须有 '内部参考' 标识")
+        self.assertIn("不要原文复述", prompt, "v3.7: 必须有 '不要原文复述' 引导")
 
     def test_new_suggests_concrete_examples(self):
-        """v3.5: 新版给了 3 个具体例子 (特写展示/通勤/户外自然光) 让小模型照搬"""
+        """v3.5/v3.7: 给具体场景例子让小模型照搬 (v3.7 简化到 1 行的 "用例")"""
         prompt = self._get_prompt_with_capability()
-        for example in ("特写展示", "通勤穿搭", "户外自然光"):
-            self.assertIn(example, prompt, f"v3.5: 提示词必须含示例 '{example}'")
+        # v3.7 改用更短的 "用例: 特写/通勤/自然光" 1 行
+        for example in ("特写", "通勤", "自然光"):
+            self.assertIn(example, prompt, f"v3.7: 提示词必须含场景示例 '{example}'")
 
     def test_forbidden_keeps_specific_attributes_only(self):
-        """v3.5: 仍禁止 detail/features 未提供的具体属性 (材质/品牌/价格)"""
+        """v3.7: 合并的【禁止】段仍含 detail/features 未提供的具体属性提示"""
         prompt = self._get_prompt_with_capability()
+        # v3.7 【禁止】段提到 颜色/尺寸/材质/配件 等
         self.assertIn("材质", prompt)
-        self.assertIn("品牌", prompt)
-        self.assertIn("价格", prompt)
+        self.assertIn("颜色", prompt)
+        # 不再要求 "品牌/价格" (这些 v3.7 不在 prompt 里 - 由 validation 把守)
 
     def test_summary_field_not_flagged_as_forbidden(self):
         """v3.5 核心: capability_summary 里的 "鞋子" "特写" "通勤" 不会被跨品类误伤"""
@@ -96,8 +99,9 @@ class DebugPromptPrintTests(unittest.TestCase):
                       "v3.5: stderr 必须含 '===== END PROMPT =====' 收尾标头")
         self.assertIn(TOPIC, err_output,
                       "v3.5: stderr 必须含 topic 上下文 (方便 grep)")
-        self.assertIn("【已选素材能力摘要", err_output,
-                      "v3.5: 切片能力摘要段必须在 stderr 里")
+        # v3.7: helper 段头改为 "【能力摘要 - 内部参考, 不要原文复述】"
+        self.assertIn("【能力摘要", err_output,
+                      "v3.7: 切片能力摘要段必须在 stderr 里")
 
     def test_prompt_contains_capability_summary_when_provided(self):
         """如果调用方传了 material_capabilities, 必须出现在 prompt 打印里"""

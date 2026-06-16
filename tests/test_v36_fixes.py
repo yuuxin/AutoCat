@@ -137,55 +137,68 @@ class OpenerVariationTests(unittest.TestCase):
                           f"v3.6: 5 个 variation_index 必须给 5 个不同首句, got {openers}")
 
     def test_old_rigid_opener_not_default(self):
-        """v3.6 关键: '想为日常穿搭多一点灵感' 不再是默认首句 (旧版强制)"""
+        """v3.7 关键: '想为日常穿搭多一点灵感' 不再是默认首句 (旧版强制)"""
         prompt_0 = self._first_example(0)
-        # 提取【参考结构】段 (含 4 句范例), 该段是 few-shot 范例实际生效的部分。
+        # 提取【参考结构】段 (含 3 句范例, v3.7 简化), 该段是 few-shot 范例实际生效的部分。
         # 反泄漏/反套用提示词里出现 "想为日常穿搭多一点灵感" 是把它列为反例 (正确),
         # 真正有问题的是它出现在【参考结构】里被当作 _EX1 抄。
         import re
-        ref_block_match = re.search(r'【参考结构.*?末尾输出', prompt_0, re.DOTALL)
+        # v3.7 参考结构段后接的是 "**不写**前缀导语" 而不是 "末尾输出"
+        ref_block_match = re.search(r'【参考结构.*?\*\*不写\*\*', prompt_0, re.DOTALL)
         self.assertIsNotNone(ref_block_match,
-                              "v3.6: prompt 应该含【参考结构】段")
+                              "v3.7: prompt 应该含【参考结构】段")
         ref_block = ref_block_match.group(0)
         self.assertNotIn("想为日常穿搭多一点灵感", ref_block,
-                          "v3.6: 【参考结构】段不应再用旧版强制首句 '想为日常穿搭多一点灵感'")
+                          "v3.7: 【参考结构】段不应再用旧版强制首句 '想为日常穿搭多一点灵感'")
         self.assertIn("没想到时尚女鞋", ref_block,
-                       "v3.6: 【参考结构】首句应为 variation 0 的 _OPENERS[0]")
+                       "v3.7: 【参考结构】首句应为 variation 0 的 _OPENERS[0]")
 
 
 class AntiLeakCapabilitySummaryTests(unittest.TestCase):
     """v3.6 修 3: 切片能力摘要不再泄漏到正文"""
 
     def test_anti_leak_marker_present(self):
-        """helper 必须含反泄漏指令关键词"""
+        """v3.7: helper 必须含反泄漏指令关键词 (1 行简短版)"""
         prompt = _format_capability_summary_prompt("鞋子/特写/通勤/自然光")
-        # 至少含一个反泄漏关键词
-        keywords = ("严禁", "反泄漏", "绝对不要把", "不要列点", "内部参考")
+        # v3.7 极简 1 行, 关键词改为 "内部参考, 不要原文复述"
+        keywords = ("内部参考", "不要原文复述", "能力摘要")
         hits = [k for k in keywords if k in prompt]
         self.assertGreaterEqual(len(hits), 2,
-            f"v3.6: helper 必须含反泄漏指令, got keywords: {hits}")
+            f"v3.7: helper 必须含反泄漏指令, got keywords: {hits}")
+
+    def test_helper_is_one_line_v37(self):
+        """v3.7 关键: helper 必须从 6 行压成 1 行 (v3.6 6 行反而被模型拷贝)"""
+        prompt = _format_capability_summary_prompt("鞋子/特写/通勤/自然光")
+        # v3.7 实现: "\n【能力摘要...】<capability> | 用例: ..."
+        # 所以整段只有 1 个 \n (在最开头), 真实换行数 <= 1
+        n_real_newlines = prompt.count(chr(10))
+        self.assertLessEqual(n_real_newlines, 1,
+            f"v3.7: helper 必须 1 行 (real \\n <= 1), got {n_real_newlines}")
+        # 长度也应该比 v3.6 的 6 行短很多 (< 200 chars)
+        self.assertLess(len(prompt), 200,
+            f"v3.7: helper 长度应 < 200 chars, got {len(prompt)}")
 
     def test_no_leak_instruction_in_caller_output(self):
-        """调用 _build_prompt + _format_capability_summary_prompt 后, 提示词必须含反泄漏"""
+        """v3.7: 调用 _build_prompt + _format_capability_summary_prompt 后, 提示词必须含反泄漏"""
         from autokat.core.writer import _format_capability_summary_prompt
         prompt = _build_prompt(
             "时尚女鞋", "种草推荐", detail=None, features=None,
             lang="zh",
             target_chars_min=107, target_chars_max=142,
         ) + _format_capability_summary_prompt("鞋子/特写/通勤/自然光")
-        self.assertIn("严禁", prompt,
-                       "v3.6: 完整 prompt 必须含 '严禁' 反泄漏指令")
+        self.assertIn("不要原文复述", prompt,
+                       "v3.7: 完整 prompt 必须含 '不要原文复述' 反泄漏指令")
 
     def test_does_not_leak_in_stdout_during_generation(self):
-        """端到端: AI 生成 1 条文案, 生成结果不应泄漏 '女鞋/初夏/...' 标签堆叠"""
+        """v3.7: 端到端, prompt 必须含 v3.7 反泄漏指令 (简短版)"""
         TOPIC = "时尚女鞋"
         LEAK_SUMMARY = "鞋子/特写/通勤穿搭/自然光/百搭"
-        # mock 模拟一个会泄漏的旧版 AI 输出
-        leaky_output = "女鞋、鞋子、特写、通勤穿搭、自然光、百搭 想要为日常穿搭带来更多变化..."
         captured_stderr = io.StringIO()
         with patch("autokat.core.writer.DEEPSEEK_API_KEY", ""), \
              patch("autokat.core.writer._call_local_model",
-                   return_value=leaky_output), \
+                   return_value="想为日常穿搭多一点灵感, 其实一双时尚女鞋就能带来很大的变化。"
+                                "通勤穿搭一双合适的鞋, 通勤逛街约会都能轻松切换。"
+                                "百搭的款式配什么都自然, 让你省心又自在。"), \
              redirect_stderr(captured_stderr):
             try:
                 result = generate_script_by_topic_detailed(
@@ -197,13 +210,12 @@ class AntiLeakCapabilitySummaryTests(unittest.TestCase):
                 text = result.get("text", "")
             except Exception:
                 text = ""
-        # v3.6 提示词里加了反泄漏指令, 但这是 AI 行为不可控 — 这个测试只验证
-        # prompt 里确实有反泄漏指令, 不验证 AI 是否遵守
         err = captured_stderr.getvalue()
-        self.assertIn("严禁", err,
-                       "v3.6: stderr 打印的 prompt 必须含 '严禁' 反泄漏指令")
-        self.assertIn("反泄漏", err,
-                       "v3.6: stderr 打印的 prompt 必须含 '反泄漏' 段头")
+        # v3.7 简短版指令 (没有 严禁/反泄漏 关键词)
+        self.assertIn("不要原文复述", err,
+                       "v3.7: stderr 打印的 prompt 必须含 '不要原文复述' 指令")
+        self.assertIn("内部参考", err,
+                       "v3.7: stderr 打印的 prompt 必须含 '内部参考' 标识")
 
 
 if __name__ == "__main__":

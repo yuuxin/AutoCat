@@ -13,19 +13,23 @@ class StrictLengthPromptTests(unittest.TestCase):
         prompt = self._get_prompt()
         self.assertIn("124", prompt, "v3.4: prompt 必须含精确目标字数 124")
 
-    def test_prompt_specifies_4_sentence_structure(self):
+    def test_prompt_specifies_3_sentence_structure_v37(self):
+        """v3.7: few-shot 4 句 -> 3 句 (适配 25-30s 短视频)"""
         prompt = self._get_prompt()
-        self.assertIn("4 个短句", prompt, "v3.4: prompt 必须明确要求 4 个短句")
+        # v3.7 改为 3 句结构, 不再硬编码 "4 个短句"
+        self.assertIn("3 句共", prompt, "v3.7: prompt 必须明确要求 3 句结构")
 
     def test_prompt_has_self_check_marker_instruction(self):
         prompt = self._get_prompt()
         self.assertIn("[字数:XXX]", prompt, "v3.4: prompt 必须含 [字数:XXX] 自检行")
 
     def test_prompt_has_few_shot_example(self):
+        """v3.7: 3 句 few-shot (适配 25-30s)"""
         prompt = self._get_prompt()
         self.assertIn("参考结构", prompt, "v3.4: prompt 必须含参考结构小节")
         quoted = re.findall(r'"[^"]{10,60}"', prompt)
-        self.assertGreaterEqual(len(quoted), 4, f"v3.4: prompt 必须含 4+ 句带引号的示例, 实际 {len(quoted)}")
+        # v3.7 改 3 句
+        self.assertGreaterEqual(len(quoted), 3, f"v3.7: prompt 必须含 3+ 句带引号的示例, 实际 {len(quoted)}")
 
     def test_prompt_warns_about_rejection_range(self):
         prompt = self._get_prompt()
