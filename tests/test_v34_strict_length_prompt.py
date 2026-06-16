@@ -21,7 +21,9 @@ class StrictLengthPromptTests(unittest.TestCase):
 
     def test_prompt_has_self_check_marker_instruction(self):
         prompt = self._get_prompt()
-        self.assertIn("[字数:XXX]", prompt, "v3.4: prompt 必须含 [字数:XXX] 自检行")
+        # v3.8 删了 [字数:XXX] marker (系统不用, 反而占字数)
+        # 改为检查 [字数:XXX] 不再出现, 但 _clean_result 仍可剥
+        self.assertNotIn("[字数:XXX]", prompt, "v3.8: 删了 [字数:XXX] marker")
 
     def test_prompt_has_few_shot_example(self):
         """v3.7: 3 句 few-shot (适配 25-30s)"""

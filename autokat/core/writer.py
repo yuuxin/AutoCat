@@ -299,15 +299,17 @@ def _build_prompt(topic: str, style: str,
         _EX1 = _OPENERS[variation_index % len(_OPENERS)]
         _mid = _MID_VARIANTS[variation_index % len(_MID_VARIANTS)]
         _EX2, _EX3, _EX4 = _mid[0], _mid[1], _mid[2]
-        # v3.7 精简: 字数指令 1 段 -> 1 行, few-shot 4 句 -> 3 句 (适配 25-30s)
+        # v3.8 优化: 删 [字数:XXX] marker (系统不用, 反而占字数),
+        # 加精确目标 "{target_ideal} 字" 减少 ambiguity
+        # 范围 107-156 → 直接说 "目标 124 字" (用户更清楚要打多少字)
         length_hint = (
-            f"目标 {target_chars_min}-{target_chars_max} 字 (理想 ~{_target_ideal}),"
-            f" 结尾输出 [字数:XXX], 范围外直接拒收。\n"
+            f"目标 **{_target_ideal} 字** (范围 {target_chars_min}-{target_chars_max}, "
+            f"偏差 ±15% 仍可接受)。\n"
             f"\n【参考结构 — 3 句共 ~{_target_ideal-30} 字】\n"
             f"\"{_EX1}\" (类似开场)\n"
             f"\"{_EX2}\" (场景/细节展开)\n"
             f"\"{_EX3}\" (情绪/行动收尾)\n"
-            f"**不写**前缀导语 / #标签 / emoji / markdown / 方括号元描述, 结尾一行 [字数:XXX]"
+            f"**不写**前缀导语 / #标签 / emoji / markdown / 方括号元描述"
         )
     else:
         length_hint = "\n文案长度：5-8 句话，100-200 字。"
@@ -948,15 +950,13 @@ def validate_script_quality(
         reasons.append("检测到追问、拒答或元回复")
     if require_topic and not any(term in text for term in _topic_terms(topic)):
         reasons.append("正文未围绕选题")
-    # v3.2 优化: 字数 ±5% 容差, 边界 case 不再硬拒。
-    # 107-142 的范围容许 102-149, 模型微小偏离不再触发 3 次重试。
-    # 极端偏离 (如 83 < 107) 仍然会被拒, 不会让视频明显短于目标。
-    if target_chars_min and char_count < int(target_chars_min * 0.95):
-        reasons.append(f"字数不足: {char_count} < {target_chars_min}")
-    if target_chars_max and char_count > int(target_chars_max * 1.05):
-        reasons.append(f"字数超限: {char_count} > {target_chars_max}")
-    # (上面 5% 旧检查保留, 兜底. v3.4 提示词已升级为精确目标 + few-shot + 自检行,
-    #  实际命中率 ~90%, 真超 5% 的才是真的有问题, 仍应被拒)
+    # v3.8 优化: 字数 ±15% 容差 (用户反馈太严, 偏差不大应接受)
+    # 107-156 的范围容许 91-179, 解决 Qwen 0.5B 反复生成 71-83 字 fail 的问题
+    # 极端偏离 (<91 或 >179) 才硬拒, 避免视频明显短/长于目标
+    if target_chars_min and char_count < int(target_chars_min * 0.85):
+        reasons.append(f"字数不足: {char_count} < {target_chars_min} (允许 ±15%)")
+    if target_chars_max and char_count > int(target_chars_max * 1.15):
+        reasons.append(f"字数超限: {char_count} > {target_chars_max} (允许 ±15%)")
     if re.search(r"[{【\[][^}\]】]*[}】\]]|(?:xx|XX)", text):
         reasons.append("包含占位符或元描述")
     if re.search(r"(?:—{2,}|-{2,})\s*[！!。.]|[——-]{2,}\s*$", text):
@@ -1180,15 +1180,17 @@ def generate_script_by_topic_detailed(
             if last_reasons and _previous_outputs:
                 _prev = _previous_outputs[-1]
                 _prev_len = len(_prev)
-                # 强指引: 扩写而不是重写
+                # v3.8: EXTEND 提示更具体 (告诉模型还差多少字)
+                # 解决 Qwen 0.5B 反复欠字数 (71-83 字 vs 107+ 目标)
+                _gap = max(1, target_chars_min - _prev_len) if target_chars_min else 0
                 retry_hint = (
                     f"\n【重要 — EXTEND 扩写, 不要重写!】\n"
-                    f"上一版你只输出了 {_prev_len} 字 (目标至少 {target_chars_min} 字, "
-                    f"范围 {target_chars_min}-{target_chars_max})。\n"
-                    f"请在前一版基础上 EXTEND 加内容, 而不是从头重写: \n"
+                    f"上一版 {_prev_len} 字, 还差 {_gap} 字 (目标 {target_chars_min}-{target_chars_max}, "
+                    f"理想 {(_prev_len + target_chars_min) // 2} 字)。\n"
+                    f"请在末尾添加 1-2 句 (例: 场景细节/情绪总结/行动呼吁), "
+                    f"**不要从头重写**: \n"
                     f"```\n{_prev}\n```\n"
                     f"具体未通过: {';'.join(last_reasons)}\n"
-                    f"建议: 在上一版末尾添加 1-2 句 (例: 场景细节, 情绪总结, 行动呼吁)。\n"
                 )
             elif last_reasons:
                 retry_hint = (
