@@ -685,6 +685,43 @@ class MainWindow(QMainWindow):
     # ══════════════════════════════════════════════════════════
     # 侧边栏
     # ══════════════════════════════════════════════════════════
+    def _load_app_logo_pixmap(self, height: int = 28) -> Optional[QPixmap]:
+        """v3.14: 加载 APP 官方 logo (design/icon_candidates/06-light-tech-timeline-cat.png,
+        build_app.py:339 选定的源) 并按指定高度缩放.
+
+        查找顺序:
+        1. $AUTOKAT_APP_ICON (构建期设置, 指向 .icns)
+        2. <project_root>/design/icon_candidates/06-light-tech-timeline-cat.png
+        3. <project_root>/dist/autokat.iconset/icon_256x256.png (built 后的 fallback)
+
+        Returns None if no file found — caller should fall back to text only.
+        """
+        from PySide6.QtCore import QSize
+        from PySide6.QtGui import QPixmap
+        from PySide6.QtCore import Qt
+        candidates = []
+        env_icon = os.environ.get("AUTOKAT_APP_ICON")
+        if env_icon:
+            candidates.append(Path(env_icon))
+        candidates.append(
+            Path(__file__).resolve().parent.parent.parent
+            / "design" / "icon_candidates" / "06-light-tech-timeline-cat.png"
+        )
+        candidates.append(
+            Path(__file__).resolve().parent.parent.parent
+            / "dist" / "autokat.iconset" / "icon_256x256.png"
+        )
+        for path in candidates:
+            if path.exists() and path.is_file():
+                pm = QPixmap(str(path))
+                if pm.isNull():
+                    continue
+                # 按高度等比缩放
+                if pm.height() != height:
+                    pm = pm.scaledToHeight(height, Qt.TransformationMode.SmoothTransformation)
+                return pm
+        return None
+
     def _build_sidebar(self) -> QWidget:
         w = QWidget()
         w.setObjectName("sidebar")
@@ -692,9 +729,21 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(12, 16, 12, 16)
         layout.setSpacing(8)
         # Logo
-        logo = QLabel("🚀 AutoCat")
-        logo.setStyleSheet("font-size:20px; font-weight:800; color:#2563EB; padding:10px 4px 14px 4px; letter-spacing:0.5px;")
-        layout.addWidget(logo)
+        # v3.14: 用 APP 官方图标 (design/icon_candidates/06-light-tech-timeline-cat.png,
+        # build_app.py:339 选定的源) 替换 🚀 emoji
+        logo_row = QHBoxLayout()
+        logo_row.setContentsMargins(0, 10, 0, 14)
+        logo_row.setSpacing(8)
+        logo_icon = QLabel()
+        _logo_pm = self._load_app_logo_pixmap(height=28)
+        if _logo_pm is not None:
+            logo_icon.setPixmap(_logo_pm)
+        logo_row.addWidget(logo_icon)
+        logo_text = QLabel("AutoCat")
+        logo_text.setStyleSheet("font-size:20px; font-weight:800; color:#2563EB; letter-spacing:0.5px;")
+        logo_row.addWidget(logo_text)
+        logo_row.addStretch()
+        layout.addLayout(logo_row)
         # 筛选标签(顶部"新建任务"按钮已移到工作台右上,保持侧边栏极简)
         filter_layout = QHBoxLayout()
         filter_layout.setSpacing(4)
