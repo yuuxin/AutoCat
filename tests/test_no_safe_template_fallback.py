@@ -58,7 +58,7 @@ class NoSafeTemplateFallbackInScriptGenTests(unittest.TestCase):
             f"v3.3: 永久错误不应再被「手动录入」包装, 实际: {err!r}")
 
     def test_wildly_off_raises_with_manual_input_hint(self):
-        """v3.4.4: wildly_off 早 fail 已删除, 3 次都调模型, 然后 raise 提示手动录入"""
+        """v3.16: 主循环 3 次 + post-extend 安全网 1 次 = 4 次模型调用, 然后 raise 提示手动录入"""
         call_count = [0]
 
         def fake_generate(self, prompt, max_tokens):
@@ -75,8 +75,10 @@ class NoSafeTemplateFallbackInScriptGenTests(unittest.TestCase):
                     target_chars_min=119, target_chars_max=142,
                     max_attempts=3,
                 )
-        self.assertEqual(call_count[0], 3,
-                         "v3.4.4: wildly_off 早 fail 已删除, 应调满 max_attempts=3 次")
+        # v3.16: 主循环 3 次 + post-extend 1 次 = 4 次
+        # post-extend 拿到 5 字版本 (同样 < 119), 1 次 extend 后 break, raise
+        self.assertEqual(call_count[0], 4,
+                         "v3.16: 主循环 3 次 + post-extend 安全网 1 次, 总计 4 次")
         self.assertIn("手动录入", str(ctx.exception))
 
     def test_build_safe_script_function_kept_but_unused(self):

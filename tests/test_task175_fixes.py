@@ -109,15 +109,15 @@ class RetryShortCircuitTests(unittest.TestCase):
                     max_attempts=3,
                 )
 
-        # v3.4.4: wildly_off 早 fail 已删除, 模型被调满 3 次
-        self.assertEqual(call_count[0], 3,
-                         f"v3.4.4: 应调满 max_attempts=3 次, 实际 {call_count[0]} 次")
+        # v3.16: 主循环 3 次 + post-extend 安全网 1 次 (同样被 5 字卡住, 1 次 extend 后 break) = 4 次
+        self.assertEqual(call_count[0], 4,
+                         f"v3.16: 主循环 3 次 + post-extend 1 次 = 4 次, 实际 {call_count[0]} 次")
         # v3.2: 异常信息必须含手动录入建议 (不再兜底模板)
         # 注意: wildly-off 早 fail 路径 _is_wildly_off 直接 raise, 还没经过
         # quality check 收集 reasons, 所以异常里不会有 topic 词。
         err = str(ctx.exception)
         self.assertIn("手动录入", err,
-                       "v3.2: AI 失败时异常必须提示用户手动录入文案 (不要兜底模板)")
+                      "v3.2: AI 失败时异常必须提示用户手动录入文案 (不要兜底模板)")
 
     def test_in_range_output_succeeds_on_first_try(self):
         """正常长度的输出应该 1 次过，不需要 fallback。"""

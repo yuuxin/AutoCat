@@ -307,14 +307,26 @@ def _build_prompt(topic: str, style: str,
             f"偏差 ±15% 仍可接受)。\n"
             # v3.13 改 B: 加 "不要在 1-2 句后就结束" 强提示 (用户反馈
             # Qwen 0.5B 经常 30/60/78 字就停 — 全是 1-2 句).
-            f"⚠️ 至少 **4 句** (4 个句号), **不要在 1-2 句后就结束** "
-            f"— 短于 80 字 = 不合格。\n"
-            f"\n【参考结构 — 3 句共 ~{_target_ideal-30} 字】\n"
-            f"\"{_EX1}\" (类似开场)\n"
-            f"\"{_EX2}\" (场景/细节展开)\n"
-            f"\"{_EX3}\" (情绪/行动收尾)\n"
-            f"**不写**前缀导语 / #标签 / emoji / markdown / 方括号元描述"
-        )
+        f"⚠️ 至少 **4 句** (4 个句号), **不要在 1-2 句后就结束** "
+        f"— 短于 80 字 = 不合格。\n"
+        f"\n【参考结构 — 3 句共 ~{_target_ideal-30} 字】\n"
+        f"\"{_EX1}\" (类似开场)\n"
+        f"\"{_EX2}\" (场景/细节展开)\n"
+        f"\"{_EX3}\" (情绪/行动收尾)\n"
+        # v3.16: 把"不写"换成显式字数计算规则, 解决"模型按全部字符数 / 系统按
+        # 清洗后字符数"导致的偏差 (hashtag/emoji/markdown 不算但模型会算)。
+        # 给出具体对照示例, 让模型在生成时就按系统规则计数。
+        f"**字数计算规则** (与系统校验完全一致, 严格按此):\n"
+        f"- 算: 中文字 + 标点 (。！？, ,) + 字母 + 数字\n"
+        f"- **不算**: 空格 / 换行 / hashtag (#xxx) / emoji / markdown 标记 / 方括号元描述\n"
+        f"- 也就是说: 你写的每 1 个中文字/标点都算 1 字; 写了 #标签 / emoji / markdown\n"
+        f"  不会被算进字数, 写出来反而白白占位置, 一定要避免。\n"
+        f"- 对照示例: 「一穿上就放不下, 春夏的女鞋真的能改变整身穿搭。\"\n"
+        f"  = **31 字** (中文+标点都算; 没有 # 标签 / emoji / 空格 / markdown)\n"
+        f"- 常见误区: 「#经典单品 #品质保证」写出来占 12 字符, 系统只按 0 字算。\n"
+        f"  千万不要靠加 hashtag 凑字数。\n"
+        f"**不写**前缀导语 / #标签 / emoji / markdown / 方括号元描述"
+    )
     else:
         length_hint = "\n文案长度：5-8 句话，100-200 字。"
     # v3.4.1: 把示例里 {topic} 占位替换为实际 topic 词,
@@ -810,6 +822,145 @@ def _enforce_char_limit(text: str, min_chars=None, max_chars=None) -> str:
     return text
 
 
+# v3.16: 字数根因彻底修复 — 字数计算双层防御 ───────────────────────
+# 用户报告 (任务 568 follow-up):
+#   模型输出 75 字 (含 #经典单品 等 hashtag) → _clean_result 剥 hashtag
+#   后只剩 67 字 → 触发「字数不足: 67 < 107」拒收, 3 次 retry 都救不回来。
+#
+# 根因 (证据 — autokat/core/writer.py 第 763 行 #\S+ 剥 hashtag):
+#   模型按"全部字符"计数 (含 hashtag/emoji/markdown/方括号/空格/换行)
+#   系统按"清洗后字符"计数 (去掉上面所有)
+#   差距通常 4-15 字; 当模型输出接近下限时, 清洗后必然掉到下限之下。
+#
+# 方案 = 两层防御:
+#   1. [Prompt 层] 在 _build_prompt 里写清"字数 = 字符数 (不含 hashtag/
+#      emoji/markdown/方括号/空格/换行)" + 给出具体对照示例, 让模型在
+#      生成时就按系统规则计数, 减少偏差。
+#   2. [后处理层] 主循环重试耗尽后, 用 _post_extend_if_short 调用模型
+#      做"聚焦扩写" (与主 prompt 解耦, 不混入其他要求), 用更长版本
+#      替换原版, 把字数不达标问题兜底修掉。
+# ──────────────────────────────────────────────────────────────────
+
+def _build_extend_prompt(
+    text: str,
+    gap: int,
+    target_min: int,
+    target_max: int,
+    topic: str,
+) -> str:
+    """v3.16: 聚焦「扩写」prompt, 与主生成 prompt 解耦.
+
+    与 _build_prompt 的 EXTEND hint 不同:
+      - 主 prompt 里 EXTEND hint 混在生成要求里, 模型常常忽略直接重写
+      - 本 prompt 是纯扩写任务, 没有"重写"的选项, 模型只能添加新内容
+    """
+    _max_new = max(1, gap + 10)  # 多给 10 字 buffer, 防止清洗后还差几字
+    return (
+        f"你是一个文案续写助手。给你一段已生成的带货文案, 请在末尾自然衔接 1-3 句, "
+        f"让总字数达到 {target_min}-{target_max} 字。\n"
+        f"\n"
+        f"【字数规则 — 严格按此计算, 与系统校验完全一致】\n"
+        f"- 字数 = 字符数 (中文字 + 标点 + 字母 + 数字)\n"
+        f"- 不计: 空格 / 换行 / hashtag (#) / emoji / markdown 标记 / 方括号元描述\n"
+        f"- 也就是说: 你写的中文/标点/字母/数字都算字数; #hashtag 和 emoji 会被忽略不算\n"
+        f"\n"
+        f"【原始文案 (已清洗, 当前 {_content_char_count(text)} 字, 还差 {gap} 字)】\n"
+        f"```\n{text}\n```\n"
+        f"\n"
+        f"【要求】\n"
+        f"1. 只在末尾添加 1-3 句 (约 {_max_new} 字), 不要修改或重写前面的内容\n"
+        f"2. 风格保持一致, 话题围绕: {topic}\n"
+        f"3. 不要写: 前缀导语 / #标签 / emoji / markdown / 方括号元描述 / 数字编号\n"
+        f"4. 输出: 完整文案 (原文 + 新增内容, 中间用句号/逗号自然衔接), 不要写任何解释\n"
+        f"\n"
+        f"请开始续写 (只输出完整文案, 不要解释)。"
+    )
+
+
+def _post_extend_if_short(
+    text: str,
+    target_min: int,
+    target_max: int,
+    topic: str,
+    provider_obj,
+    max_extend_attempts: int = 2,
+) -> tuple:
+    """v3.16: 后处理自动扩写 — 字数兜底修复.
+
+    当主生成 prompt 的所有 retry 都用完, 仍然字数不足时调用。
+    与主循环的 EXTEND hint 不同:
+      - 本函数聚焦且独立: prompt 只问"扩写", 不混入其他质量要求
+      - 用 _clean_result 清洗 extend 输出, 比较清洗后字数
+      - 取清洗后字数更多的版本 (避免被模型"重写缩水")
+      - 最多 max_extend_attempts 次, 失败返回原文本, 不抛异常
+
+    Returns:
+        (final_text, final_count, extend_attempts_made)
+    """
+    if not text or not target_min:
+        return text, _content_char_count(text or ""), 0
+
+    best_text = text
+    best_count = _content_char_count(text)
+
+    # v3.16.1: 用 model_calls 单独记录实际调用的 model 次数, 语义清晰
+    # (attempt_idx - 1 在 "raw 空 / clean 空 / 异常" 路径会少算 1 次)
+    model_calls = 0
+    for attempt_idx in range(1, max_extend_attempts + 1):
+        # 已经达标就直接返回 (避免不必要调用)
+        if best_count >= target_min:
+            return best_text, best_count, model_calls
+
+        gap = target_min - best_count
+        extend_prompt = _build_extend_prompt(
+            text=best_text, gap=gap,
+            target_min=target_min, target_max=target_max,
+            topic=topic,
+        )
+        model_calls += 1
+        try:
+            raw_extended = provider_obj.generate(extend_prompt, max_tokens=512)
+        except Exception as _call_err:
+            # 网络/瞬时错误: 记录日志返回原文本, 不阻断主流程
+            print(
+                f"[文案后处理] post-extend attempt {attempt_idx} 调用失败: {_call_err}"
+            )
+            return best_text, best_count, model_calls
+
+        if not raw_extended:
+            print(f"[文案后处理] post-extend attempt {attempt_idx} 返回空, 停止")
+            return best_text, best_count, model_calls
+
+        # 必须 _clean_result: 模型可能又写了 hashtag/emoji/元描述, 这些
+        # 不算字数, 反而把清洗后字数拉低
+        cleaned_extended = _clean_result(raw_extended, topic=topic)
+        if not cleaned_extended:
+            print(
+                f"[文案后处理] post-extend attempt {attempt_idx} 清洗后为空 (纯元描述), 停止"
+            )
+            return best_text, best_count, model_calls
+
+        new_count = _content_char_count(cleaned_extended)
+        old_count = _content_char_count(best_text)
+
+        # 关键决策: 清洗后字数更多的才采纳, 否则保留旧版
+        if new_count > old_count:
+            best_text = cleaned_extended
+            best_count = new_count
+            print(
+                f"[文案后处理] post-extend attempt {attempt_idx}: "
+                f"{old_count} → {new_count} 字 (gap {gap} → {max(0, target_min - new_count)})"
+            )
+        else:
+            # 模型重写后字数不增反减, 不采纳
+            print(
+                f"[文案后处理] post-extend attempt {attempt_idx}: "
+                f"清洗后 {new_count} 字 ≤ 当前 {old_count} 字, 不采纳, 停止"
+            )
+            break
+
+    return best_text, best_count, model_calls
+
 _META_REPLY_PATTERNS = (
     "请告诉我", "请提供", "需要更多信息", "需要您提供", "想要的主题",
     "我可以为您", "我能为您", "这样我就能", "作为ai", "作为 AI",
@@ -1302,11 +1453,59 @@ def generate_script_by_topic_detailed(
             # v3.4.3: 记录本版 (清洗后) 输出, 下一 attempt 让模型 EXTEND 而不是重写
             if result:
                 _previous_outputs.append(result)
+            # v3.16: 跟踪最后一轮的清洗后结果, 主循环全部失败时走 post-extend 安全网
+            _last_cleaned_result = result
             last_reasons = quality["reasons"] or ["模型未返回有效正文"]
             print(
                 f"[文案质量] {backend_name} 第 {attempt}/{max_attempts} 次不合格: "
                 + "；".join(last_reasons)
             )
+
+    # v3.16: 字数根因彻底修复 — 主循环全部 retry 失败后, 启用 post-extend 安全网。
+    # 原因: 模型按"全部字符"计数 (含 hashtag/emoji/markdown/方括号/空格), 系统按
+    # "清洗后字符"计数, 清洗后通常少 4-15 字。当模型输出接近下限时, 必然掉到下限
+    # 之下, 3 次重写都救不回来。post-extend 用聚焦"扩写"prompt 让模型在已知 result
+    # 上加内容, 解决"模型/系统字数规则不一致"导致的字数不足。
+    if (
+        _last_cleaned_result
+        and target_chars_min
+        and target_chars_max
+        and _content_char_count(_last_cleaned_result) < target_chars_min
+    ):
+        try:
+            _post_text, _post_count, _post_attempts = _post_extend_if_short(
+                text=_last_cleaned_result,
+                target_min=target_chars_min,
+                target_max=target_chars_max,
+                topic=topic,
+                provider_obj=provider_obj,
+            )
+            if _post_text != _last_cleaned_result and _post_count >= target_chars_min:
+                _post_quality = validate_script_quality(
+                    _post_text, topic, lang=lang,
+                    target_chars_min=target_chars_min,
+                    target_chars_max=target_chars_max,
+                    detail=detail, features=features,
+                    accepted_texts=accepted_texts,
+                )
+                if _post_quality["valid"]:
+                    print(
+                        f"[文案后处理] post-extend 救场成功 ({_post_attempts} 次), "
+                        f"最终 {_post_count} 字 (>= {target_chars_min})"
+                    )
+                    return {
+                        "text": _post_text,
+                        "source": backend_name,
+                        "quality": _post_quality,
+                    }
+                else:
+                    print(
+                        f"[文案后处理] post-extend 救场后仍不合格: "
+                        + "；".join(_post_quality["reasons"])
+                    )
+        except Exception as _post_err:
+            # post-extend 自身出错 (不应阻断主 raise 路径)
+            print(f"[文案后处理] post-extend 抛异常 (不影响 raise): {_post_err}")
 
     # v3.2: 移除 build_safe_script 兜底 (用户报告: 兜底模板「无意义」)。
     # AI 重试耗尽后, 直接 raise 清晰错误, 异常路径直达 UI 日志, 用户看到后
