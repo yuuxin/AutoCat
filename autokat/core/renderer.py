@@ -200,16 +200,31 @@ def _compose_cached_segments(seg_files: list[str], seg_durations: list[float],
     if spatial_filter:
         filter_parts.append(f"[{output_label}]{spatial_filter}[perturbed]")
         output_label = "perturbed"
+    # v3.15 修: 之前在 output 用 "-pix_fmt yuv420p" 强制转换像素格式, ffmpeg 在编码器
+    # 阶段会把源片 PC range (0-255) 隐性转成 TV range (16-235), 即便不选任何扰动,
+    # 用户也能看到颜色发灰偏暗 (v3.1 注释里说的 '没选扰动也有色彩变化' 根因).
+    # 改用 filter chain 的 format=yuv420p (不改色阶, 只改 wrapper), 保持源片原色.
+    # 注意: 不加 setrange, ffmpeg 不会改 color_range, 源片是 PC 就是 PC, TV 就是 TV.
+    if not perturbation:
+        # 用户没选扰动 → 严格保色, 不许 ffmpeg 做任何隐式转换.
+        # 源片标记的 color_space/color_primaries/color_trc/color_range 全部透传.
+        filter_parts.append(
+            f"[{output_label}]format=yuv420p,"
+            f"setparams=color_primaries=1:color_trc=1:colorspace=1:color_range=1"
+            f"[vout]"
+        )
+    else:
+        # 有扰动: 走原路径, ffmpeg 仍按 source 参数渲染 (但允许 auto-conversion 兜底,
+        # 避免 concat 时不同 color_space 报错)
+        filter_parts.append(f"[{output_label}]format=yuv420p[vout]")
+    output_label = "vout"
     output = os.path.join(tmpdir, "composed.mp4")
     command = [FFMPEG, "-y"]
     for segment in seg_files:
         command.extend(["-i", segment])
-    # v3.1: 去掉硬编码 bt709 色彩标签（之前强制写这 4 个 tag 会让源片若标的是 bt601
-    # 或其他色空间时被 ffmpeg 隐性转色，导致"没选扰动也有色彩变化"）。
-    # 现在只保留 -pix_fmt yuv420p（兼容性需要），色空间交给播放器按源 tag 渲染。
     command.extend([
-        "-filter_complex", ";".join(filter_parts), "-map", f"[{output_label}]",
-        *_h264_encoder_args("4M"), "-pix_fmt", "yuv420p", "-r", str(fps), "-an",
+        "-filter_complex", ";".join(filter_parts), "-map", "[vout]",
+        *_h264_encoder_args("4M"), "-r", str(fps), "-an",
         output,
     ])
     run_ffmpeg(command, desc=f"单次组合拼接({len(seg_files)}段)", timeout=600)
@@ -652,11 +667,20 @@ def render_simple(script: dict, output_path: str, audio_path: str,
             shortfall_frames = target_frames - actual_video_frames
             shortfall_sec = shortfall_frames / fps
             if shortfall_sec > 2.0:
-                _log(
+                # v3.15 修: 之前用 _log() 触发 NameError (任务 568 第 4/5 条失败根因)
+                # _log 只在 render_videos_4stage 函数内定义, 此处不可见.
+                # 改用 print + logging 双写, 保证不影响渲染流程.
+                _shortfall_msg = (
                     f"⚠️ 动态画面 {total_video_dur:.3f}s 短于目标 {final_dur:.3f}s "
                     f"({shortfall_frames} 帧 / {shortfall_sec:.1f}s)，"
                     f"最终合成用 tpad=clone 补足 — 视频末尾会有 ~{shortfall_sec:.1f}s 静态画面"
                 )
+                print(f"[渲染] {_shortfall_msg}")
+                try:
+                    import logging as _logging
+                    _logging.getLogger(__name__).warning(_shortfall_msg)
+                except Exception:
+                    pass
             # 不 raise：让下方 _vf 链路 (tpad + trim=end_frame=target_frames) 补帧
         if bgm_path and os.path.exists(bgm_path):
             bgm_dur = get_media_duration(bgm_path)
@@ -701,6 +725,19 @@ def render_simple(script: dict, output_path: str, audio_path: str,
                 f"trim=end_frame={target_frames}",
                 "setpts=PTS-STARTPTS",
             ]
+        # v3.15 修: 用户反馈 "不差异化扰动" 时颜色仍变化. 之前在 output flag
+        # 用 -pix_fmt yuv420p, ffmpeg 编码器会做 PC range (0-255) → TV range (16-235)
+        # 隐性转色阶, 即便不选扰动也发灰偏暗.
+        # 修复: 把 format=yuv420p 移到 -vf filter chain 末尾, 不改色阶只改 wrapper;
+        # 没选扰动时再加 setparams 把 color_primaries/trc/space/range 全标 1 (unspecified),
+        # 让 ffmpeg/播放器按源片原始元数据渲染, 严格保色.
+        if not perturbation:
+            _vf_parts.append(
+                "format=yuv420p,"
+                "setparams=color_primaries=1:color_trc=1:colorspace=1:color_range=1"
+            )
+        else:
+            _vf_parts.append("format=yuv420p")
         cmd.extend(["-vf", ",".join(_vf_parts)])
 
         if bgm_path and os.path.exists(bgm_path):
@@ -727,9 +764,10 @@ def render_simple(script: dict, output_path: str, audio_path: str,
         cmd.extend(enc_args)
         # v2.4: 最终输出, 透传 _batch_color_holder (同 batch 同池共享)
         cmd.extend([
-            "-pix_fmt", "yuv420p", "-r", str(fps),
+            "-r", str(fps),
             *_batch_color_holder,
             # v2.4: 透传源片颜色元数据, 不强制写成 bt709/tv (HDR 源会保留 BT.2020+HLG)
+            # v3.15: format=yuv420p 已移到 -vf filter chain (避免 ffmpeg 编码器隐式 PC→TV 转色阶)
             "-c:a", "aac", "-b:a", "192k",
             "-ar", str(SAMPLE_RATE),
             output_path,
