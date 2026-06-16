@@ -1662,6 +1662,32 @@ class MainWindow(QMainWindow):
         form = QFormLayout()
         topic_input = QLineEdit()
         topic_input.setPlaceholderText("例如：春夏单鞋、厨房收纳...")
+        # v3.12: 根据用户当前勾选的素材推断默认选题 (仅在空时填充,
+        # 用户随时可手动编辑覆盖). 推断失败 / 无选中时保持原 placeholder.
+        _topic_hint_label = QLabel("")
+        _topic_hint_label.setStyleSheet(
+            "color:#6B7280; font-size:11px; background:transparent; padding:0;"
+        )
+        _topic_hint_label.setVisible(False)
+        form.addRow("", _topic_hint_label)
+        try:
+            from autokat.core.material_analysis import infer_topic
+            _selected_ids = sorted(
+                int(mid) for mid in
+                getattr(self, "_wiz_selected_materials", set()) or set()
+            )
+            if _selected_ids and not topic_input.text():
+                _inferred = infer_topic(_selected_ids)
+                if _inferred:
+                    topic_input.setText(_inferred)
+                    _topic_hint_label.setText(
+                        f"✨ 已根据所选 {len(_selected_ids)} 个素材自动推断"
+                        f"（可手动编辑）"
+                    )
+                    _topic_hint_label.setVisible(True)
+        except Exception:
+            # 推断失败属于非关键路径, 保持原 placeholder, 不阻塞对话框
+            pass
         form.addRow("选题 *:", topic_input)
 
         # v3.2: B+C 设计 — 视频类型为主控 (默认显示), 文案风格藏在 ⚙ 高级 后面

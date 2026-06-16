@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -255,6 +256,72 @@ def capability_summary(material_ids: list[int] | None = None) -> str:
     for row in rows:
         values.extend(part for part in row["capability_summary"].split("、") if part)
     return "、".join(dict.fromkeys(values))[:300]
+
+
+def infer_topic(material_ids: list[int] | None = None) -> str:
+    """根据所选素材推断一个简洁的选题字符串 (用于 AI 文案对话框默认填充).
+
+    策略:
+      1. 取每个素材 material_analysis.subject 字段 (仅 status='done' 的分析,
+         local vision tag); 返回出现频次最高者; 平局时按第一次出现的顺序.
+      2. 兜底: 若所有素材都没有可用 subject, 用第一个素材的 display_name
+         (或 file_path 的 stem) 作为 fallback.
+      3. 任何异常 / 无输入 → 返回空串 "" (调用方应当把空串视为 '无法推断').
+
+    说明:
+      - 不会修改数据库, 不会触发任何模型推理; 只查本地 SQLite.
+      - 用户可在 UI 里手动编辑推断结果, 不强制覆盖.
+      - tie-break 自己实现 (Counter.most_common(1) 在 heap 实现里平局不稳定).
+    """
+    if not material_ids:
+        return ""
+    conn = get_conn()
+    try:
+        marks = ",".join("?" for _ in material_ids)
+        rows = conn.execute(
+            f"SELECT m.id AS mid, ma.subject, ma.status, "
+            f"m.display_name, m.file_path "
+            f"FROM materials m "
+            f"LEFT JOIN material_analysis ma ON ma.material_id = m.id "
+            f"WHERE m.id IN ({marks})",
+            material_ids,
+        ).fetchall()
+    finally:
+        conn.close()
+
+    # 按输入 id 顺序索引, 避免依赖 SQL 返回顺序
+    by_id: dict[int, object] = {r["mid"]: r for r in rows}
+
+    # 1. 多数主体 (按输入顺序; 平局保留首次出现)
+    subjects: list[str] = []
+    for mid in material_ids:
+        r = by_id.get(mid)
+        if not r:
+            continue
+        # 只采纳 status='done' 的分析; pending/running/failed 视为无 subject
+        if r["status"] != "done":
+            continue
+        subj = (r["subject"] or "").strip()
+        if subj:
+            subjects.append(subj)
+    if subjects:
+        counts = Counter(subjects)
+        best_count = max(counts.values())
+        # 自己实现 stable tie-break: 第一次遍历, 首个达 best_count 的胜出
+        for s in subjects:
+            if counts[s] == best_count:
+                return s
+
+    # 2. 兜底 — 第一个有 display_name / stem 的素材 (按输入顺序)
+    for mid in material_ids:
+        r = by_id.get(mid)
+        if not r:
+            continue
+        name = (r["display_name"] or "").strip() or Path(r["file_path"]).stem.strip()
+        if name:
+            return name
+
+    return ""
 
 
 def analyze_text_intent(text: str) -> dict:
