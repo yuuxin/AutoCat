@@ -2026,6 +2026,8 @@ class MainWindow(QMainWindow):
                                     lang=ai_lang, extra_instruction=extra,
                                     target_chars_min=target_min,
                                     target_chars_max=target_max,
+                                    target_duration_min=dmin,
+                                    target_duration_max=dmax,
                                     accepted_texts=accepted,
                                     progress_callback=quality_progress,
                                     provider=_captured_provider,

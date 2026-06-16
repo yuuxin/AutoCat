@@ -96,7 +96,7 @@ class DebugPromptPrintTests(unittest.TestCase):
                       "v3.5: stderr 必须含 '===== END PROMPT =====' 收尾标头")
         self.assertIn(TOPIC, err_output,
                       "v3.5: stderr 必须含 topic 上下文 (方便 grep)")
-        self.assertIn("【已选素材能力摘要】", err_output,
+        self.assertIn("【已选素材能力摘要", err_output,
                       "v3.5: 切片能力摘要段必须在 stderr 里")
 
     def test_prompt_contains_capability_summary_when_provided(self):

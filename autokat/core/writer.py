@@ -135,13 +135,23 @@ def _format_capability_summary_prompt(capability_summary: str) -> str:
     - "禁止"只剩 detail/features 未明确提供的具体属性 (材质/品牌/价格/型号),
       由 validate_script_quality 把守。
 
+    v3.6 修 3: 加显式禁止把摘要内容复制到正文 — 实测 Qwen 0.5B 会把
+    "女鞋/初夏/稳定展示/..." 这种 summary 标签原样写到文案第一段,
+    然后才接真正的脚本, 拉低正文质量且干扰字数检查。
+
     Returns: 一段直接 append 到 prompt 末尾的字符串。
     """
     return (
-        "\n【已选素材能力摘要】" + capability_summary
-        + "\n可以用这些能力描述具体场景 (例: '特写展示细节', '通勤穿搭场景',"
-        + " '户外自然光', '细节镜头搭配指南')\。"
-        + "禁止凭空捏造 detail/features 未明确提供的具体属性 (材质/品牌/价格/型号)\。"
+        "\n【已选素材能力摘要 — 内部参考, 严禁作为文案正文输出】" + capability_summary
+        + "\n【v3.6 反泄漏 — 必读】下面这几行 (摘要标签/示例/禁止项) 是给你的"
+        + " 内部参考, 不是要你写进文案的素材。"
+        + " **绝对不要把 '女鞋/初夏/通勤/...' 这类标签原样抄到文案第一段**,"
+        + " 不要列点、不要 '标签1/标签2/...'。"
+        + " 请把这些能力**消化成自然的口播内容**, 直接以正文中文句开头。"
+        + "\n【可用能力】可以用这些能力描述具体场景 (例: '特写展示细节',"
+        + " '通勤穿搭场景', '户外自然光', '细节镜头搭配指南')。"
+        + "\n【禁止项】禁止凭空捏造 detail/features 未明确提供的具体属性"
+        + " (材质/品牌/价格/型号), 这一项由 validate_script_quality 把守。"
     )
 
 
@@ -153,6 +163,8 @@ def _build_prompt(topic: str, style: str,
                   variation_index: int = 0,
                   target_chars_min: Optional[int] = None,
                   target_chars_max: Optional[int] = None,
+                  target_duration_min: Optional[float] = None,
+                  target_duration_max: Optional[float] = None,
                   video_type: Optional[str] = None) -> str:
     """构建 LLM prompt
 
@@ -165,6 +177,8 @@ def _build_prompt(topic: str, style: str,
         extra_instruction: 额外指令
         variation_index: 用于在 batch 中循环选择不同角度/句式
         target_chars_min/max: 目标字数范围（硬约束）
+        target_duration_min/max: 目标时长范围（秒），用于在 prompt 头部
+            把硬编码的 "30-60 秒" 替换成实际值。None 时回退 30-60s。
     """
     lang_map = {"zh": "中文", "th": "泰文", "en": "英文"}
     lang_text = lang_map.get(lang, "中文")
@@ -192,8 +206,16 @@ def _build_prompt(topic: str, style: str,
         template_block = f"模板参考：\n{template}"
     else:
         # 都没填：完全不引用占位符，让 AI 围绕 topic 自由发挥
+        # v3.6 修 1: 改用实际 target_duration_min/max, 不能再硬编码 30-60 秒
+        # (用户配 25-30 秒时, 提示词和实际不符会让 AI 偏向写 30-60s 的长度)
+        if target_duration_min is not None and target_duration_max is not None:
+            _dur_lo = max(1, int(round(target_duration_min)))
+            _dur_hi = max(_dur_lo, int(round(target_duration_max)))
+            _dur_str = f"{_dur_lo}-{_dur_hi} 秒"
+        else:
+            _dur_str = "30-60 秒"
         template_block = (
-            f"围绕「{topic}」自由创作一段 30-60 秒的口播文案。\n"
+            f"围绕「{topic}」自由创作一段 {_dur_str} 的口播文案。\n"
             f"不要使用任何占位符（如【】、{{}}、xx、XX），所有内容必须围绕 {topic} 写实。"
         )
 
@@ -202,6 +224,9 @@ def _build_prompt(topic: str, style: str,
     diversity_hint = (
         f"\n【多样性硬约束】\n"
         f"- 本次文案使用以下角度撰写: {angle}。\n"
+        f"- **【v3.6 加强】开场句必须独特**: 不要使用'想为日常穿搭多一点灵感'这种"
+        f" 高频套话开场, 不要照搬本批次其他文案的句式、用词或结构。"
+        f" 哪怕看起来自然, 也属于重复。\n"
         f"- 每次生成必须使用完全不同的开场句式和情绪角度, 禁止套用'姐妹们''家人们''朋友们'等高频套话开场(除非该角度本身强烈要求)。\n"
         f"- 句式、过渡词、收尾都必须与同批次的其他文案明显不同, 避免'真的太香了''直接拉满''绝绝子'等模板化表达。\n"
         f"- **禁止复读机**: 同一句话、同一短语、同一关键词在文中出现次数 <=1 次。"
@@ -262,10 +287,50 @@ def _build_prompt(topic: str, style: str,
         # v3.4.1: 4 句示例中第 1 句用 {topic} 占位, 强迫模型把实际 topic 词织进文案,
         # 否则 1 句 4 段示例会让模型照搬结构, 但漏掉「正文未围绕选题」检查需要的 topic 词。
         # 3-4 句保持抽象, 避免和 topic 关键词冲突触发跨品类检查。
-        _EX1 = "想为日常穿搭多一点灵感, 其实{topic}就能带来很大的变化。"
-        _EX2 = "春夏季节一双合适的鞋, 能让整个人的状态都松弛自然起来。"
-        _EX3 = "百搭的设计不挑任何风格, 通勤逛街约会都能轻松切换。"
-        _EX4 = "用舒服的步调走出自己的味道, 让每个普通一天都多一点新鲜感。"
+        # v3.6 修 2: _EX1 (首句) 必须随 variation_index 轮换。
+        # 旧版固定 8 个 variation_index 全用同一个
+        # "想为日常穿搭多一点灵感, 其实{topic}就能带来很大的变化。",
+        # 5 条文案全抄同一首句, "禁止套用开场" hint 压不住 few-shot 复制惯性。
+        # 现在 8 组不同首句, 配合更强的 anti-copy 提示, 每条文案的开场必须明显不同。
+        _OPENERS = [
+            # 0: 反差/震惊
+            "没想到{topic}还能这样, 真的是打开新世界了。",
+            # 1: 限时/稀缺
+            "这个季节真的强烈推荐{topic}, 错过又要等一年。",
+            # 2: 痛点->方案
+            "以前每次换季都头疼, 直到遇见{topic}才彻底解决。",
+            # 3: 数据/对比
+            "对比了十款, 最后还是{topic}最值得入手。",
+            # 4: 反问/调侃
+            "姐妹们, 你们还在为穿搭烦恼吗? 其实{topic}就够了。",
+            # 5: 生活片段
+            "那天逛街, 朋友的一句话让我重新认识了{topic}。",
+            # 6: 连续追问
+            "为什么很多人都在买{topic}? 因为它真的解决了三个问题。",
+            # 7: 旧 vs 新
+            "以前的鞋子又闷又磨脚, 换了{topic}之后走路都变轻盈。",
+        ]
+        # v3.6 修 2: 3-4 句也轻微轮换, 避免 5 条文案的中段也雷同
+        _MID_VARIANTS = [
+            [
+                "春夏季节一双合适的鞋, 能让整个人的状态都松弛自然起来。",
+                "百搭的设计不挑任何风格, 通勤逛街约会都能轻松切换。",
+                "用舒服的步调走出自己的味道, 让每个普通一天都多一点新鲜感。",
+            ],
+            [
+                "穿上它整个人的气质都提升了一个档次。",
+                "不管是上班通勤还是周末出游, 都能轻松驾驭。",
+                "那种从脚底升起的舒适感, 一整天都不会累。",
+            ],
+            [
+                "轻盈的鞋面透气不闷脚, 走多远都不觉得累。",
+                "经典的版型怎么搭配都不会出错, 实用性拉满。",
+                "每一次低头看它, 都觉得今天的心情也跟着变好。",
+            ],
+        ]
+        _EX1 = _OPENERS[variation_index % len(_OPENERS)]
+        _mid = _MID_VARIANTS[variation_index % len(_MID_VARIANTS)]
+        _EX2, _EX3, _EX4 = _mid[0], _mid[1], _mid[2]
         length_hint = (
             f"\n【字数硬性要求 — 决定是否被采纳】\n"
             f"本次必须输出恰好 {_target_ideal} 字 (可接受范围 {target_chars_min}-{target_chars_max} 字, 容差 ±8%)。\n"
@@ -1114,6 +1179,8 @@ def generate_script_by_topic_detailed(
     extra_instruction: Optional[str] = None,
     target_chars_min: Optional[int] = None,
     target_chars_max: Optional[int] = None,
+    target_duration_min: Optional[float] = None,
+    target_duration_max: Optional[float] = None,
     accepted_texts: Optional[list[str]] = None,
     progress_callback=None,
     max_attempts: int = 3,
@@ -1185,6 +1252,8 @@ def generate_script_by_topic_detailed(
                 variation_index=_variation_index + attempt - 1,
                 target_chars_min=target_chars_min,
                 target_chars_max=target_chars_max,
+                target_duration_min=target_duration_min,
+                target_duration_max=target_duration_max,
                 video_type=video_type,
             )
             if material_capabilities:
