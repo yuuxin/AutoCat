@@ -1960,7 +1960,9 @@ class MainWindow(QMainWindow):
         dur_row = QHBoxLayout()
         dur_min = QSpinBox()
         dur_min.setRange(5, 300)
-        dur_min.setValue(15)
+        # v3.18 用户反馈: AI 辅助文案默认时长 15-30s → 改为 20-30s
+        # (短视频主流是 20s+ 的「中长种草」, 15s 太短支撑不了产品介绍)
+        dur_min.setValue(20)
         dur_min.setSuffix("s")
         dur_label = QLabel(" ~ ")
         dur_max = QSpinBox()
