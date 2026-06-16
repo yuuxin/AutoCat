@@ -2063,10 +2063,13 @@ class MainWindow(QMainWindow):
                     margin=0,
                 )[2]
                 estimated_seconds = char_count / max(1, cps)
+                # v3.10 修: 显示 _ai_results_list, 用户能看到所有已生成脚本
+                # (之前 hidden, result_area 又被 error 替换, 用户感觉 "全都没了")
                 self._ai_results_list.addItem(
                     f"📄 文案 #{len(ai_results)} · {char_count}字符 · "
                     f"约{estimated_seconds:.1f}s · {source} · 相似度{similarity:.0%}"
                 )
+                self._ai_results_list.setVisible(True)
                 ai_status_label.setText(f"✅ 已生成 {len(ai_results)}/{count_input.value()} 条合格文案")
                 ai_progress_bar.setValue(len(ai_results))
                 gen_btn.setEnabled(len(ai_results) < count_input.value())
@@ -2074,12 +2077,18 @@ class MainWindow(QMainWindow):
                 result_area.setText(txt)
                 result_area.setVisible(True)
             worker.result_signal.connect(_accept_generated)
-            worker.error_signal.connect(lambda err: (
-                result_area.setText("❌ " + err),
-                ai_status_label.setText("❌ 生成失败"),
-                ai_progress_bar.setVisible(False),
-                gen_btn.setEnabled(True),
-            ))
+            # v3.10 修: error 不再 REPLACE result_area (会覆盖最新有效脚本)
+            # 而是保留 result_area 显示的最近一条有效脚本, error 只更新 status label
+            # 用户可以从 _ai_results_list 看到所有已生成的脚本
+            def _on_error(err):
+                # 只在 result_area 还是空或显示 "正在生成" 时才覆盖, 否则保留
+                current = result_area.toPlainText().strip()
+                if not current or "正在生成" in current or "准备" in current:
+                    result_area.setText("❌ " + err[:200])
+                ai_status_label.setText(f"❌ 部分生成失败: {err[:80]}...")
+                ai_progress_bar.setVisible(False)
+                gen_btn.setEnabled(True)
+            worker.error_signal.connect(_on_error)
             # Keep worker reference to prevent GC
             self._ai_gen_worker = worker; dlg._gen_worker = worker
             import weakref
