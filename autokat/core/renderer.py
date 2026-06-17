@@ -90,9 +90,20 @@ def _get_encoder_label() -> str:
     return "libx264（CPU）"
 
 
-def _h264_encoder_args(bitrate: str = "8M") -> list:
-    """Return the stable, color-consistent H.264 encoder settings."""
-    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]
+def _h264_encoder_args(bitrate: str = "8M", preserve_color: bool = False) -> list:
+    """Return the stable H.264 encoder settings.
+
+    v3.24 修: preserve_color=True 时加 -x264-params range=pc, 真正阻止 libx264
+    隐式 PC(0-255)→TV(16-235) 转色阶. 之前 v3.15 只在 filter chain 末尾加
+    setparams=range=1 (unspecified), 只能改元数据标签, 不能阻止编码器实际
+    转换 → 成品仍发灰偏暗. 这次在编码器层也强制 PC 输出, 元数据+实际像素
+    值都对齐到源片, 真正保色.
+    """
+    args = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]
+    if preserve_color:
+        # 强制 x264 输出 PC range + 不写 color metadata (让播放器按源片 tag 渲染)
+        args.extend(["-x264-params", "range=pc:colorprim=unspecified:transfer=unspecified:colospace=unspecified"])
+    return args
 
 # ── 59 种 xfade 转场效果 ──
 XFADE_TRANSITIONS = [
@@ -224,7 +235,7 @@ def _compose_cached_segments(seg_files: list[str], seg_durations: list[float],
         command.extend(["-i", segment])
     command.extend([
         "-filter_complex", ";".join(filter_parts), "-map", "[vout]",
-        *_h264_encoder_args("4M"), "-r", str(fps), "-an",
+        *_h264_encoder_args("4M", preserve_color=not perturbation), "-r", str(fps), "-an",
         output,
     ])
     run_ffmpeg(command, desc=f"单次组合拼接({len(seg_files)}段)", timeout=600)
@@ -663,9 +674,12 @@ def render_simple(script: dict, output_path: str, audio_path: str,
         # 阶段用 clone 帧补到精确 target_frames（每多 1 帧 1/fps 秒静止画面），视频
         # 长度仍然是 audio 决定的 final_dur 不会变长，画面尾部会多一小段静态尾
         # 但总时长与配音对齐。如缺帧太多（>2s）则在 log 标 warn 让用户感知。
+        # v3.24 修: shortfall_sec 提到 if 块外, 让 tpad 实际用 shortfall 补足 (任务 754
+        # 第 4/5 条失败: 之前 stop_duration=1/fps 仅补 1 帧 ≈33ms, 远不够填 2.97s 缺口).
+        shortfall_sec = max(0.0, (target_frames - actual_video_frames) / fps)
         if actual_video_frames < target_frames - 1:
             shortfall_frames = target_frames - actual_video_frames
-            shortfall_sec = shortfall_frames / fps
+            shortfall_sec = shortfall_frames / fps  # 局部刷新 (同上, 保留冗余以便 log 引用)
             if shortfall_sec > 2.0:
                 # v3.15 修: 之前用 _log() 触发 NameError (任务 568 第 4/5 条失败根因)
                 # _log 只在 render_videos_4stage 函数内定义, 此处不可见.
@@ -714,14 +728,14 @@ def render_simple(script: dict, output_path: str, audio_path: str,
                 font_size=script.get("font_size"),
             )
             _vf_parts = [
-                f"tpad=stop_mode=clone:stop_duration={1 / fps:.9f}",
+                f"tpad=stop_mode=clone:stop_duration={shortfall_sec:.6f}",
                 f"trim=end_frame={target_frames}",
                 "setpts=PTS-STARTPTS",
                 f"subtitles={srt_path}",
             ]
         else:
             _vf_parts = [
-                f"tpad=stop_mode=clone:stop_duration={1 / fps:.9f}",
+                f"tpad=stop_mode=clone:stop_duration={shortfall_sec:.6f}",
                 f"trim=end_frame={target_frames}",
                 "setpts=PTS-STARTPTS",
             ]
@@ -760,7 +774,7 @@ def render_simple(script: dict, output_path: str, audio_path: str,
                 "-map", "1:a:0",
             ])
 
-        enc_args = _h264_encoder_args(bitrate)
+        enc_args = _h264_encoder_args(bitrate, preserve_color=not perturbation)
         cmd.extend(enc_args)
         # v2.4: 最终输出, 透传 _batch_color_holder (同 batch 同池共享)
         cmd.extend([
