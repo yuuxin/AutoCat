@@ -2427,7 +2427,8 @@ class MainWindow(QMainWindow):
         row1 = QHBoxLayout()
         row1.setSpacing(12)
         self._wiz_enable_perturb = QCheckBox("\u542f\u7528\u5dee\u5f02\u5316\u6270\u52a8")
-        self._wiz_enable_perturb.setChecked(True)
+        # v3.23 默认不扰动 (用户要求)
+        self._wiz_enable_perturb.setChecked(False)
         self._wiz_enable_perturb.setStyleSheet("color:#111827; font-size:12px; font-weight:700;")
         row1.addWidget(self._wiz_enable_perturb)
         # v2.3: 4 个扰动档位全部中文标签，PERT_LEVELS 内部 key 仍是英文 (off/low/med/high)
@@ -2436,7 +2437,8 @@ class MainWindow(QMainWindow):
         for idx, lv in enumerate(PERT_LEVELS):
             rb = QRadioButton(_PERT_LABELS[idx] if idx < len(_PERT_LABELS) else lv)
             rb.setStyleSheet("color:#374151; font-size:12px;")
-            if lv == "med":
+            # v3.23: 默认选中 "off" (不扰动), 即使用户开了主开关强度也是 0
+            if lv == "off":
                 rb.setChecked(True)
             self._wiz_pert_level_group.addButton(rb, idx)
             row1.addWidget(rb)
