@@ -76,6 +76,66 @@ def estimate_chars_for_duration_range(
     target_max = int(ideal_hi * (1 + margin))
     return target_min, target_max
 
+
+# v3.19: 自适应字数 — 把 system 目标换算成 model 目标 ──────────────
+# 根因 (用户反复报「字数还是经常不够/超」):
+#   模型按"全部字符"计数 (含 hashtag/emoji/markdown/方括号/空格/换行)
+#   系统按"清洗后字符"计数. 实测清洗损失 0-17%, 取决于模型遵循 prompt 规则
+#   的严格度. 之前 prompt 写「目标 124 字」, 模型理解"写 124 字", 但系统
+#   清洗后可能只数出 105 字 → 字数不足.
+#
+# 方案: 不让模型匹配 system 目标, 而是给它「放大后的」目标. 让模型多写
+# 一些 (含 hashtag/emoji 空间), 清洗后恰好落在 system 范围里.
+#
+# 公式: system_count ≈ model_output × retention
+#  → model_output ≈ system_target / retention
+#
+# 实测 retention 区间 (用户样本):
+#   81 → 67 = 0.83, 98 → 94 = 0.96, 35 → 31 = 0.89, 56 → 56 = 1.00
+#   平均 ~0.92, 但保守取 0.75 (留 buffer) 防 regression.
+#
+# 20-30s (system 85-156) 不同 retention 的 model 目标:
+#   0.6: 告诉模型 141-260, 模型写 ~200 → 系统 120 ✓
+#   0.7: 告诉模型 121-222, 模型写 ~171 → 系统 119 ✓
+#   0.8: 告诉模型 106-195, 模型写 ~150 → 系统 120 ✓
+def compute_model_target(
+    system_min: Optional[int],
+    system_max: Optional[int],
+    retention: float = 0.75,
+) -> tuple:
+    """v3.19: 把 system 字数目标按 retention 比例放大, 作为给 model 的目标.
+
+    关键不变量: model_output × retention ≈ system_count.
+    默认 retention=0.75: 给模型 1.33x 目标, 让 hashtag/emoji 有 buffer,
+    清洗后系统计数能落入 system_min-max 范围.
+
+    Args:
+        system_min/max: 给 validate 的字数范围 (用户实际想要的范围)
+        retention: system_count / model_output 的经验值, 默认 0.75
+    Returns:
+        (model_min, model_max) 或 (None, None) 如果 system 目标不全
+    """
+    if not system_min or not system_max or system_min <= 0 or system_max <= 0:
+        return None, None
+    if retention <= 0 or retention > 1:
+        return system_min, system_max
+    # 加 1 防 0 边界, system_min+1 是给模型最起码的「比 system 多」的下限
+    model_min = max(system_min + 1, int(system_min / retention))
+    model_max = int(system_max / retention)
+    return model_min, model_max
+
+def _provider_obj_to_str(provider_obj) -> str:
+    """v3.19: 把 provider_obj (instance) 转回 provider 字符串,
+    给 generate_script_by_topic_detailed 用 (它只接受字符串).
+    """
+    if provider_obj is None:
+        return "local"
+    name = type(provider_obj).__name__
+    if "DeepSeek" in name:
+        return "deepseek"
+    return "local"
+
+
 from pathlib import Path
 from typing import Optional
 
@@ -1533,6 +1593,340 @@ def generate_script_by_topic_detailed(
         + f"\n请在 AI 辅助生成对话框下方的文本框中手动录入文案, "
         f"或检查 {backend_name} 配置 (Key/网络/模型名) 后重试。"
     )
+
+
+# v3.19 批量生成 — 1 次 model 调用生成 ≤20 条文案 ──────────────
+# 用户反馈: 一个任务 5 条文案, 之前要调 5 次 model (每次 1 条 + 3 retry +
+# post-extend = 最多 5 次/条, 5 条 = 25 次). 效率太低, 上下文 1M 完全是浪费.
+#
+# 方案: 1 次 model 调用生成 N 条, 用 === 文案N === 分隔. N>20 时分批,
+# 每批 ≤20 条 (避免超过 4k token 输出限制 + 等太久).
+#
+# 配套 v3.19 compute_model_target: 1 批的 model target 比 system target
+# 大 ~1.33x, 清洗后落入 system 范围.
+_BATCH_SCRIPT_SEPARATOR_RE = re.compile(r"===\s*文案\s*(\d+)\s*===")
+_BATCH_SCRIPT_MAX = 20
+
+
+def _parse_batch_output(raw: str, expected_count: int) -> list:
+    """v3.19: 按 === 文案N === 分隔符解析 model 批量输出.
+
+    返回 list of (index, content), 按 index 排序. 最多 expected_count 条.
+    """
+    if not raw or not raw.strip():
+        return []
+    parts = _BATCH_SCRIPT_SEPARATOR_RE.split(raw)
+    if len(parts) < 3:
+        return [(1, raw.strip())]
+    scripts = []
+    for i in range(1, len(parts) - 1, 2):
+        try:
+            idx = int(parts[i])
+        except (ValueError, TypeError):
+            continue
+        content = parts[i + 1].strip()
+        content = _BATCH_SCRIPT_SEPARATOR_RE.sub("", content).strip()
+        if content:
+            scripts.append((idx, content))
+    scripts.sort(key=lambda x: x[0])
+    return scripts[:expected_count]
+
+
+def _build_batch_prompt(
+    topic: str,
+    style: str,
+    count: int,
+    start_index: int,
+    target_chars_min: Optional[int],
+    target_chars_max: Optional[int],
+    retention: float,
+    extra_instruction: str = "",
+    lang: str = "zh",
+    detail: Optional[str] = None,
+    features: Optional[str] = None,
+    target_duration_min: Optional[float] = None,
+    target_duration_max: Optional[float] = None,
+    video_type: Optional[str] = None,
+) -> str:
+    """v3.19: 构造 batch prompt — 让 model 一次输出 N 条文案."""
+    _base = _build_prompt(
+        topic=topic, style=style, detail=detail, features=features,
+        lang=lang, extra_instruction=extra_instruction,
+        variation_index=0,
+        target_chars_min=target_chars_min,
+        target_chars_max=target_chars_max,
+        target_duration_min=target_duration_min,
+        target_duration_max=target_duration_max,
+        video_type=video_type,
+    )
+
+    _model_min, _model_max = compute_model_target(
+        target_chars_min, target_chars_max, retention
+    )
+    if _model_min and _model_max:
+        _model_ideal = (_model_min + _model_max) // 2
+        _size_hint = (
+            f"每条目标 **{_model_ideal} 字** (范围 {_model_min}-{_model_max} 字, "
+            f"清洗后系统应落在 {target_chars_min}-{target_chars_max} 字)"
+        )
+    else:
+        _size_hint = "每条约 100-200 字"
+
+    _angle_picks = [_ANGLES[(start_index + i) % len(_ANGLES)] for i in range(count)]
+    _angle_list = "\n".join(
+        f"  文案 {start_index + i + 1}: {_angle_picks[i]}"
+        for i in range(count)
+    )
+
+    _batch_header = (
+        f"\n【本批要求生成 {count} 条文案, 一次性输出】\n"
+        f"{_size_hint}\n"
+        f"每条用 === 文案{start_index + 1} === ... === 文案{start_index + count} === 分隔, "
+        f"中间不要任何解释/元描述/前缀导语。\n"
+        f"角度分配 (每条用不同角度, 不雷同):\n"
+        f"{_angle_list}\n"
+        f"\n请开始输出 (第 1 条到第 {count} 条, 用分隔符隔开):\n"
+    )
+
+    _base_without_footer = _base.rsplit("请直接输出文案", 1)[0]
+    return _base_without_footer + _batch_header
+
+
+def _generate_one_batch(
+    topic: str,
+    style: str,
+    count: int,
+    start_index: int,
+    target_chars_min: Optional[int],
+    target_chars_max: Optional[int],
+    provider_obj,
+    retention: float = 0.75,
+    extra_instruction: str = "",
+    lang: str = "zh",
+    detail: Optional[str] = None,
+    features: Optional[str] = None,
+    target_duration_min: Optional[float] = None,
+    target_duration_max: Optional[float] = None,
+    video_type: Optional[str] = None,
+    material_capabilities: Optional[str] = None,
+    accepted_texts: Optional[list] = None,
+    max_attempts: int = 2,
+) -> list:
+    """v3.19: 1 批 model 调用, 生成 ≤20 条文案. 失败条数走 single-call fallback."""
+    if accepted_texts is None:
+        accepted_texts = []
+    if count <= 0:
+        return []
+
+    backend_name = type(provider_obj).__name__
+
+    batch_prompt = _build_batch_prompt(
+        topic=topic, style=style, count=count, start_index=start_index,
+        target_chars_min=target_chars_min, target_chars_max=target_chars_max,
+        retention=retention, extra_instruction=extra_instruction,
+        lang=lang, detail=detail, features=features,
+        target_duration_min=target_duration_min,
+        target_duration_max=target_duration_max,
+        video_type=video_type,
+    )
+    if material_capabilities:
+        batch_prompt += _format_capability_summary_prompt(material_capabilities)
+
+    _max_tokens = max(2048, min(8192, count * 400))
+    if "DeepSeek" in backend_name and _max_tokens < 4096:
+        _max_tokens = 4096
+
+    raw = None
+    for batch_attempt in range(1, max_attempts + 1):
+        try:
+            raw = provider_obj.generate(batch_prompt, max_tokens=_max_tokens)
+            break
+        except RuntimeError:
+            raise
+        except Exception as _call_err:
+            print(f"[文案批量] {backend_name} 调用失败 (第 {batch_attempt}/{max_attempts} 次): {_call_err}")
+            if batch_attempt >= max_attempts:
+                raw = None
+                break
+
+    if not raw:
+        print(f"[文案批量] batch 调用全部失败, {count} 条全走 single-call fallback")
+        results = []
+        for i in range(count):
+            try:
+                single = generate_script_by_topic_detailed(
+                    topic=topic, style=style, detail=detail, features=features,
+                    lang=lang,
+                    extra_instruction=extra_instruction,
+                    target_chars_min=target_chars_min,
+                    target_chars_max=target_chars_max,
+                    target_duration_min=target_duration_min,
+                    target_duration_max=target_duration_max,
+                    accepted_texts=accepted_texts + [r["text"] for r in results],
+                    progress_callback=None,
+                    provider=_provider_obj_to_str(provider_obj),
+                    video_type=video_type,
+                    material_capabilities=material_capabilities,
+                )
+            except Exception:
+                continue
+            single["batch_idx"] = start_index + i
+            results.append(single)
+        return results
+
+    parsed = _parse_batch_output(raw, expected_count=count)
+
+    results = []
+    fallback_indices = []
+    for i, (parsed_idx, content) in enumerate(parsed):
+        cleaned = _clean_result(content, topic=topic)
+        quality = validate_script_quality(
+            cleaned, topic, lang=lang,
+            target_chars_min=target_chars_min,
+            target_chars_max=target_chars_max,
+            detail=detail, features=features,
+            accepted_texts=accepted_texts + [r["text"] for r in results],
+            require_topic=lang == "zh",
+        )
+        if quality["valid"]:
+            results.append({
+                "text": cleaned,
+                "source": backend_name + "_batch",
+                "quality": quality,
+                "batch_idx": start_index + i,
+            })
+        else:
+            fallback_indices.append((i, cleaned, quality))
+
+    if fallback_indices:
+        print(
+            f"[文案批量] batch 解析 {len(parsed)} 条, 其中 {len(fallback_indices)} 条不合格, "
+            f"走 single-call fallback"
+        )
+        for i, cleaned, q in fallback_indices:
+            _existing_texts = [r["text"] for r in results]
+            try:
+                single = generate_script_by_topic_detailed(
+                    topic=topic, style=style, detail=detail, features=features,
+                    lang=lang,
+                    extra_instruction=extra_instruction,
+                    target_chars_min=target_chars_min,
+                    target_chars_max=target_chars_max,
+                    target_duration_min=target_duration_min,
+                    target_duration_max=target_duration_max,
+                    accepted_texts=accepted_texts + _existing_texts,
+                    progress_callback=None,
+                    provider=_provider_obj_to_str(provider_obj),
+                    video_type=video_type,
+                    material_capabilities=material_capabilities,
+                )
+                single["batch_idx"] = start_index + i
+            except Exception as _fb_err:
+                print(f"[文案批量] single-call fallback 也失败 (idx={i}): {_fb_err}")
+                single = {
+                    "text": cleaned,
+                    "source": backend_name + "_batch_failed",
+                    "quality": q,
+                    "batch_idx": start_index + i,
+                }
+            while len(results) <= i:
+                results.append(single)
+            else:
+                results[i] = single
+
+    if len(results) < count:
+        print(
+            f"[文案批量] model 只输出 {len(results)} 条 (期望 {count}), "
+            f"缺少的 {count - len(results)} 条走 single-call fallback"
+        )
+        _existing_texts = [r["text"] for r in results]
+        for i in range(len(results), count):
+            try:
+                single = generate_script_by_topic_detailed(
+                    topic=topic, style=style, detail=detail, features=features,
+                    lang=lang,
+                    extra_instruction=extra_instruction,
+                    target_chars_min=target_chars_min,
+                    target_chars_max=target_chars_max,
+                    target_duration_min=target_duration_min,
+                    target_duration_max=target_duration_max,
+                    accepted_texts=accepted_texts + _existing_texts,
+                    progress_callback=None,
+                    provider=_provider_obj_to_str(provider_obj),
+                    video_type=video_type,
+                    material_capabilities=material_capabilities,
+                )
+                single["batch_idx"] = start_index + i
+                _existing_texts.append(single["text"])
+                results.append(single)
+            except Exception as _fb_err:
+                print(f"[文案批量] 补足 single-call 也失败 (idx={i}): {_fb_err}")
+                break
+
+    return results
+
+
+def generate_scripts_batch(
+    topic: str,
+    count: int,
+    target_chars_min: Optional[int],
+    target_chars_max: Optional[int],
+    provider_obj=None,
+    max_batch_size: int = _BATCH_SCRIPT_MAX,
+    retention: float = 0.75,
+    style: str = "种草推荐",
+    lang: str = "zh",
+    extra_instruction: str = "",
+    detail: Optional[str] = None,
+    features: Optional[str] = None,
+    target_duration_min: Optional[float] = None,
+    target_duration_max: Optional[float] = None,
+    video_type: Optional[str] = None,
+    material_capabilities: Optional[str] = None,
+    progress_callback=None,
+) -> list:
+    """v3.19: 批量生成 N 条文案, 自动按 max_batch_size (默认 20) 分批.
+
+    用户要求: 一个任务 5 条就 1 次调完, 500 条就分 25 批 (每批 20) 调完.
+    单批调用失败/部分不合格时, 自动 fallback 到 single-call.
+    """
+    if count <= 0:
+        return []
+    if max_batch_size <= 0:
+        max_batch_size = _BATCH_SCRIPT_MAX
+
+    batches = []
+    for batch_start in range(0, count, max_batch_size):
+        batch_size = min(max_batch_size, count - batch_start)
+        batches.append((batch_start, batch_size))
+
+    results = []
+    for batch_idx, (batch_start, batch_size) in enumerate(batches):
+        if progress_callback:
+            progress_callback(
+                "batch_start", batch_idx, len(batches),
+                f"批次 {batch_idx + 1}/{len(batches)}: 1 次调用生成 {batch_size} 条"
+            )
+        batch_results = _generate_one_batch(
+            topic=topic, style=style, count=batch_size, start_index=batch_start,
+            target_chars_min=target_chars_min, target_chars_max=target_chars_max,
+            provider_obj=provider_obj,  # _generate_one_batch 内部转字符串
+            extra_instruction=extra_instruction, lang=lang,
+            detail=detail, features=features,
+            target_duration_min=target_duration_min,
+            target_duration_max=target_duration_max,
+            video_type=video_type,
+            material_capabilities=material_capabilities,
+            accepted_texts=[r["text"] for r in results],
+        )
+        results.extend(batch_results)
+        if progress_callback:
+            progress_callback(
+                "batch_done", batch_idx, len(batches),
+                f"批次 {batch_idx + 1}/{len(batches)} 完成, 已生成 {len(results)}/{count} 条"
+            )
+
+    return results
 
 
 def generate_script_by_topic(
