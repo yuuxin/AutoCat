@@ -47,6 +47,14 @@ def _match_label(text: str, group: str, default: str) -> str:
 
 def _representative_image(material: dict) -> Image.Image:
     source = Path(material["file_path"])
+    # v3.22 守护: 启动时如果 DB 残留了测试 fixture 的 /tmp/xxx.mp4 假路径
+    # (来自 unit test 写入), 抽帧会触发 ffmpeg 报 'No such file' 把日志刷屏.
+    # 在调 ffmpeg 之前先 check 文件存在, 不存在直接 raise 让上层跳过/标记 failed.
+    if not source.exists() or not source.is_file():
+        raise FileNotFoundError(
+            f"素材文件不存在 (id={material.get('id')}, path={source}). "
+            f"该记录可能来自测试 fixture 残留, 建议清理 DB."
+        )
     if material["mat_type"] == "image":
         return Image.open(source).convert("RGB")
     with tempfile.TemporaryDirectory(prefix="autokat_analysis_") as tmp:
