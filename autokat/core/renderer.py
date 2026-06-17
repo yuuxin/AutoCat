@@ -1356,14 +1356,23 @@ def _render_task(task_id: int, workers: int = 2, batch_cfg: Optional[dict] = Non
             f"   🔬 启动{'全量' if force_full_deep else '抽样'}内容级 ASR/OCR 验收..."
         )
         deep_result = run_deep_validation(task_id, full=force_full_deep)
+        # v3.25 修: 之前 deep 验收失败会把 final_status 覆盖为 "failed" 并标 done=0,
+        # 但 mp4 文件已经全部在 output/ 里, 用户看到 4 个成品 + 任务 failed 困惑
+        # (任务 756 报告). 正确语义: 渲染成功=mp4 存在=任务 done, 深度验收是
+        # 内容质量维度仅作为警告/参考, 不阻塞任务状态.
         if deep_result.get("status") == "unavailable":
-            _log(f"   ⚠️ 深度验收不可用: {deep_result['reason']}")
+            _log(f"   ⚠️ 深度验收不可用: {deep_result['reason']} (不阻塞任务)")
         elif not deep_result.get("passed"):
-            final_status = "failed"
-            final_counts = get_task_clip_counts(task_id)
-            done_count = final_counts["done"]
-            update_task_status(task_id, "failed", done=done_count)
-            _log("   ❌ 内容级深度验收失败，未交付失败成片")
+            failed_videos = [
+                v.get("video", "?") for v in deep_result.get("videos", [])
+                if not v.get("passed")
+            ]
+            _log(
+                f"   ⚠️ 深度验收未通过 (不阻塞任务, mp4 已交付): {len(failed_videos)}/{len(deep_result.get('videos', []))} "
+                f"条 ASR/OCR 偏离, 详见 {deep_result.get('sample_indexes', [])}"
+            )
+            # 标记 quality_results 但 task status 仍按渲染结果 (done if all done)
+            _deep_warn = "深度验收偏离 (ASR/OCR sync) - 不阻塞交付"
         else:
             _log(
                 f"   ✅ 内容级深度验收通过 · {len(deep_result.get('videos', []))} 条 · "
