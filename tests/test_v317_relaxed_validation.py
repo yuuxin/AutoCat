@@ -62,15 +62,21 @@ class JiangxinAllowedTests(unittest.TestCase):
                 f"v3.17: '{sentence}' 应放行, reasons={r.get('reasons')}")
 
     def test_real_fabrication_still_rejected(self):
-        """回归保护: 真捏造 (设计师, 手工打造, 精雕细琢) 仍 reject."""
+        """v3.20 行为变更: 真捏造 (设计师, 手工打造, 精雕细琢) 现在放行.
+
+        v3.17 之前: _FABRICATED_PROCESS_CLAIMS 含 19 词, 上述词会 reject.
+        v3.20: 用户反馈「要求太严格了 是不是可以去掉」, 黑名单整体清空,
+        这些词都是自然种草话术, 不再 reject (但 unsupported_attributes
+        写 面料/材质 仍 reject, 跨品类仍 reject).
+        """
         for kw in ["设计师", "手工打造", "精雕细琢", "精心打造", "反复打磨",
                    "每一寸细节", "千锤百炼"]:
             text = f"这双鞋{kw}, 让你感受到独特的品质。"
             r = validate_script_quality(text, "时尚女鞋", lang="zh")
             process_reasons = [x for x in r.get("reasons", [])
                                if "捏造设计过程" in x or "设计师故事" in x]
-            self.assertGreater(len(process_reasons), 0,
-                f"v3.17 回归: '{kw}' 仍应 reject (真捏造), reasons={r.get('reasons')}")
+            self.assertEqual(len(process_reasons), 0,
+                f"v3.20 行为变更: '{kw}' 应放行 (黑名单已清空), reasons={r.get('reasons')}")
 
     def test_jiangxin_constant_removed_from_blacklist(self):
         """_FABRICATED_PROCESS_CLAIMS 不应再含 匠心."""
@@ -228,13 +234,13 @@ class ValidationBackendEnforcementTests(unittest.TestCase):
                 f"v3.17 回归: '{kw}' 仍应 reject, reasons={r.get('reasons')}")
 
     def test_fabrication_blacklist_still_enforced(self):
-        """真捏造 (设计师, 手工, 精雕细琢) 仍 reject."""
+        """v3.20 行为变更: 设计师/手工/精雕细琢 等放行 (黑名单整体清空)."""
         for kw in ["设计师", "手工打造", "精雕细琢", "精心打造", "每一寸细节"]:
             text = f"这双鞋{kw}, 让你感受到独特品质。"
             r = validate_script_quality(text, "时尚女鞋", lang="zh")
             process_reasons = [x for x in r.get("reasons", []) if "捏造设计过程" in x]
-            self.assertGreater(len(process_reasons), 0,
-                f"v3.17 回归: '{kw}' 仍应 reject, reasons={r.get('reasons')}")
+            self.assertEqual(len(process_reasons), 0,
+                f"v3.20 行为变更: '{kw}' 应放行 (黑名单已清空), reasons={r.get('reasons')}")
 
     def test_unsupported_attributes_still_enforced(self):
         """未提供 detail/features 时, 写 面料/材质 等硬数据仍 reject."""

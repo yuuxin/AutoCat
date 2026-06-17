@@ -210,7 +210,7 @@ def _compose_cached_segments(seg_files: list[str], seg_durations: list[float],
         # 源片标记的 color_space/color_primaries/color_trc/color_range 全部透传.
         filter_parts.append(
             f"[{output_label}]format=yuv420p,"
-            f"setparams=color_primaries=1:color_trc=1:colorspace=1:color_range=1"
+            f"setparams=color_primaries=1:color_trc=1:colorspace=1:range=1"
             f"[vout]"
         )
     else:
@@ -734,7 +734,7 @@ def render_simple(script: dict, output_path: str, audio_path: str,
         if not perturbation:
             _vf_parts.append(
                 "format=yuv420p,"
-                "setparams=color_primaries=1:color_trc=1:colorspace=1:color_range=1"
+                "setparams=color_primaries=1:color_trc=1:colorspace=1:range=1"
             )
         else:
             _vf_parts.append("format=yuv420p")

@@ -62,7 +62,7 @@ class V315ColorPreservationTests(unittest.TestCase):
         src = inspect.getsource(renderer._compose_cached_segments)
         self.assertIn("if not perturbation:", src,
             "v3.15: 应有 'if not perturbation' 分支")
-        self.assertIn("setparams=color_primaries=1:color_trc=1:colorspace=1:color_range=1", src,
+        self.assertIn("setparams=color_primaries=1:color_trc=1:colorspace=1:range=1", src,
             "v3.15: 不选扰动时应加 setparams=...1:1:1:1 保色")
         self.assertIn("format=yuv420p,", src,
             "v3.15: 应有 format=yuv420p filter (不转色阶)")
@@ -78,7 +78,7 @@ class V315ColorPreservationTests(unittest.TestCase):
         """v3.15: 主渲染路径不选扰动时也应加 setparams=...1:1:1:1."""
         from autokat.core import renderer
         src = inspect.getsource(renderer.render_simple)
-        self.assertIn("setparams=color_primaries=1:color_trc=1:colorspace=1:color_range=1", src,
+        self.assertIn("setparams=color_primaries=1:color_trc=1:colorspace=1:range=1", src,
             "v3.15: 主渲染不选扰动时应加 setparams=...1:1:1:1 保色")
 
 

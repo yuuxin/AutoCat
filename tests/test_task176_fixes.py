@@ -28,43 +28,46 @@ from autokat.core.writer import (
 # ── Issue 1a: 凭空捏造设计过程 ──────────────────────────────────
 
 class FabricatedProcessClaimsTests(unittest.TestCase):
-    """模型常凭空编造「设计师的故事/灵感/工艺」填充篇幅 — 必须拒收。"""
+    """v3.20 行为变更: _FABRICATED_PROCESS_CLAIMS 整体清空 (用户反馈太严格).
 
-    def test_rejects_designer_story(self):
+    旧版: 模型常凭空编造「设计师的故事/灵感/工艺」填充篇幅 — 拒收.
+    现在: 这些都是自然种草话术, 放行. unsupported_attributes (面料/材质)
+    和 跨品类 仍 reject.
+    """
+
+    def test_allows_designer_story_v320(self):
+        """v3.20 行为变更: 设计师/匠心独运/设计灵感 等放行."""
         text = (
             "每个款式的背后都有故事，都是设计师匠心独运的结果。"
             "春夏女鞋的搭配灵感来自日常生活中的细节观察。"
         )
-        result = validate_script_quality(text, "春夏女鞋", lang="zh")
-        reasons_str = " | ".join(result["reasons"])
-        self.assertFalse(result["valid"], f"应被拒收，reasons={reasons_str}")
+        result = validate_script_quality(text, "春夏女鞋", lang="zh",
+                                         target_chars_min=10, target_chars_max=300)
         self.assertTrue(
-            any("设计过程" in r or "捏造" in r for r in result["reasons"]),
-            f"应包含「捏造设计过程」原因，实际={result['reasons']}",
+            result["valid"],
+            f"v3.20: 设计师/匠心独运/设计灵感 应放行 (黑名单已清空), "
+            f"reasons={result['reasons']}",
         )
 
-    def test_rejects_handmade_claim(self):
+    def test_allows_handmade_claim_v320(self):
+        """v3.20 行为变更: 纯手工打造/精雕细琢 放行."""
         text = "这双女鞋纯手工打造，每一道工序都精雕细琢。"
-        result = validate_script_quality(text, "时尚女鞋", lang="zh")
-        self.assertFalse(result["valid"])
+        result = validate_script_quality(text, "时尚女鞋", lang="zh",
+                                         target_chars_min=10, target_chars_max=200)
         self.assertTrue(
-            any("设计过程" in r for r in result["reasons"]),
-            f"手工/工序/精雕细琢应被标记, 实际={result['reasons']}",
+            result["valid"],
+            f"v3.20: 纯手工打造/精雕细琢 应放行, reasons={result['reasons']}",
         )
 
-    def test_rejects_every_detail_claim(self):
-        text = "完美展现每一寸细节，每一步都精心打造。"
-        result = validate_script_quality(text, "时尚女鞋", lang="zh")
-        self.assertFalse(result["valid"])
-        # v3.11: "完美展现" 不再 reject (用户要求放行),
-        # 但 "精心打造/每一寸细节" 仍 reject (设计过程)
+    def test_allows_every_detail_claim_v320(self):
+        """v3.20 行为变更: 每一寸细节/精心打造/完美展现 放行."""
+        text = "时尚女鞋完美展现每一寸细节，每一步都精心打造。"
+        result = validate_script_quality(text, "时尚女鞋", lang="zh",
+                                         target_chars_min=10, target_chars_max=200)
         self.assertTrue(
-            any("设计过程" in r for r in result["reasons"]),
-            f"「精心打造」「每一寸细节」应被标记, 实际={result['reasons']}",
-        )
-        self.assertFalse(
-            any("过度承诺" in r for r in result["reasons"]),
-            f"v3.11: '完美展现' 不应 reject (放行), 实际={result['reasons']}",
+            result["valid"],
+            f"v3.20: 完美展现/每一寸细节/精心打造 全部放行, "
+            f"reasons={result['reasons']}",
         )
 
 
@@ -244,27 +247,23 @@ class DminEqualsDmaxRangeTests(unittest.TestCase):
 # ── Issue 1e: 用户实际给的 5 段 bad output 端到端检测 ──────────
 
 class UserReportedBadOutputsTests(unittest.TestCase):
-    """用户实际报告的 5 段 AI 文案 (task 176 follow-up) 全部应被拒收。"""
+    """v3.20: 仍应拒收的 AI 文案 (跨品类 + 过度承诺).
+
+    旧版 5 段全部应 reject, 但 v3.20 整体清空 _FABRICATED_PROCESS_CLAIMS 后,
+    含「精心打造/完美展现/每一寸细节/设计灵感/设计师匠心独运」的 #3 段
+    和含「经典/完美」的 #4 段都被放行 (用户反馈太严格).
+    现在只保留跨品类 (#1) 和过度承诺 (#5) 两段作为回归守护.
+    """
 
     BAD_OUTPUTS = [
-        # 1: 鞋子变成衣服 + 过度承诺
+        # 1: 鞋子变成衣服 + 衣物 (跨品类混淆, 仍 reject)
         "穿上我们的最新款春夏女鞋，让您的脚更加优雅。"
         "这款设计独特的鞋子，不仅拥有出色的舒适度，还具有时尚感。"
         "无论是日常出行还是特殊场合，都能让您从容应对。"
         "快来感受这款时尚魅力十足的女鞋吧！"
         "穿上这款春夏女鞋，您将不再仅仅是一件衣服，"
         "而是一件承载着您个性与品味的衣物。",
-        # 3: 完美展现 + 精心打造 + 每一寸细节
-        "已经选择了优质的女鞋进行展示，特别是一些设计独特、质感出色的款式。"
-        "每一步都精心打造，力求完美展现每一寸细节。"
-        "让我们一起走进春天的季节，感受不一样的时尚魅力吧！"
-        "接下来，我们来谈谈那些让人心动的设计灵感。"
-        "每个款式的背后都有故事，都是设计师匠心独运的结果。",
-        # 4: 经典 + 完美
-        "已经选择了合适的素材，让我们开始吧！"
-        "春夏，我们来挑选一双特别适合春天穿的女鞋——"
-        "一款经典的、舒适又时尚的春装必备之选！",
-        # 5: 艺术品 + 独一无二 + 独特见解
+        # 2: 艺术品 (过度承诺, 仍 reject)
         "已经选择了合适的素材，准备为即将上线的春季新品——女鞋进行介绍。"
         "在这个充满活力的季节里，我们特别挑选了这款设计独特的鞋子，"
         "让每一步都成为焦点。"
@@ -309,12 +308,12 @@ class UserReportedBadOutputsTests(unittest.TestCase):
 class ConstantCoverageTests(unittest.TestCase):
 
     def test_fabricated_claims_covers_user_patterns(self):
-        # v3.17: 匠心 已被用户允许 (从 _FABRICATED_PROCESS_CLAIMS 移除, 包含它的
-        # 变体「匠心独运/打造/呈现」也一并放行, 否则仍被拒)
+        # v3.20 行为变更: _FABRICATED_PROCESS_CLAIMS 整体清空 (用户反馈太严格)
+        # 旧版要求这些关键词必须 在 黑名单里 (assertIn), 现在要求 不在 (assertNotIn)
         for kw in ["设计灵感", "设计师", "手工打造", "精雕细琢",
                    "精心打造", "每一寸细节"]:
-            self.assertIn(kw, _FABRICATED_PROCESS_CLAIMS,
-                          f"_FABRICATED_PROCESS_CLAIMS 必须覆盖「{kw}」")
+            self.assertNotIn(kw, _FABRICATED_PROCESS_CLAIMS,
+                             f"v3.20: 「{kw}」必须从 _FABRICATED_PROCESS_CLAIMS 移除 (黑名单整体清空)")
 
     def test_overclaims_v311_allow_common_adjectives(self):
         # v3.11: 放宽 overclaim (用户反馈"完美之类的形容词可以放行")

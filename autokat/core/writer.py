@@ -1032,19 +1032,7 @@ _UNSUPPORTED_PRODUCT_CLAIMS = (
 )
 _PROMOTION_WORDS = ("限时", "抢购", "特价", "特惠", "优惠", "秒杀", "直降", "折扣")
 
-# v3.2: 凭空捏造的设计过程/设计师故事 — 未提供素材细节时不能编造
-# v3.17 用户反馈: 「匠心」是常用词, 不算捏造, 允许使用。变体「匠心独运/打造/呈现」
-# 包含「匠心」也应一并放行, 否则仍被拒收。
-# 但「设计师/手工/精雕细琢/精挑细选/反复打磨/千锤百炼/每一寸细节」等仍 reject —
-# 这些是真正在编造不存在的设计过程。
-_FABRICATED_PROCESS_CLAIMS = (
-    "设计灵感", "设计故事", "设计理念", "设计哲学",
-    "设计师", "设计师的故事", "设计师的灵感",
-    "手工打造", "手工制作", "纯手工",
-    "精雕细琢", "精心打造", "精心设计", "精挑细选",
-    "每一寸细节", "每一道工序", "每一处细节",
-    "反复打磨", "千锤百炼",
-)
+_FABRICATED_PROCESS_CLAIMS = ()
 
 # v3.2: 无具体数据/材质支撑的过度承诺词
 # v3.11: 用户反馈"完美之类的形容词可以放行, 允许使用"
@@ -1194,7 +1182,9 @@ def validate_script_quality(
     if re.search(r"(?:—{2,}|-{2,})\s*[！!。.]|[——-]{2,}\s*$", text):
         reasons.append("包含残缺标题或句子")
     promo_count = sum(text.count(word) for word in _PROMOTION_WORDS)
-    if promo_count > 2:
+    # v3.20: 堆叠阈值 > 2 → > 3 (容许 1 个促销段不拒)
+    # 营销文案常用 "限时特惠, 抢购从速" 一次, 不应 reject
+    if promo_count > 3:
         reasons.append(f"促销词堆叠: {promo_count} 次")
     if not detail and not features:
         claims = [
