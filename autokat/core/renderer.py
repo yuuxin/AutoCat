@@ -90,19 +90,28 @@ def _get_encoder_label() -> str:
     return "libx264（CPU）"
 
 
-def _h264_encoder_args(bitrate: str = "8M", preserve_color: bool = False) -> list:
+def _h264_encoder_args(bitrate: str = "8M", preserve_color: bool = False,
+                        source_color_range: str = "unknown") -> list:
     """Return the stable H.264 encoder settings.
 
-    v3.24 修: preserve_color=True 时加 -x264-params range=pc, 真正阻止 libx264
-    隐式 PC(0-255)→TV(16-235) 转色阶. 之前 v3.15 只在 filter chain 末尾加
-    setparams=range=1 (unspecified), 只能改元数据标签, 不能阻止编码器实际
-    转换 → 成品仍发灰偏暗. 这次在编码器层也强制 PC 输出, 元数据+实际像素
-    值都对齐到源片, 真正保色.
+    v3.24 修: preserve_color=True 时加 -x264-params, 真正阻止 libx264
+    隐式 PC(0-255)→TV(16-235) 转色阶.
+
+    v3.24.1 修: 之前 v3.24 强制 range=pc, 但源片若是 TV range 会被错解读
+    为 PC, 整体偏亮 7.3%. 改成根据 source_color_range 动态选:
+      - "tv"  (源片 limited): range=tv
+      - "pc"  (源片 full):    range=pc
+      - "unknown" (默认):     range=pc (现代源片多数 PC)
     """
     args = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]
     if preserve_color:
-        # 强制 x264 输出 PC range + 不写 color metadata (让播放器按源片 tag 渲染)
-        args.extend(["-x264-params", "range=pc:colorprim=unspecified:transfer=unspecified:colospace=unspecified"])
+        if source_color_range == "tv":
+            # 源片是 TV range, 输出也用 TV, 不做转换
+            x264_params = "range=tv:colorprim=unspecified:transfer=unspecified:colospace=unspecified"
+        else:
+            # 源片 PC 或 unknown, 输出 PC (v3.24 默认, 防止 PC→TV 偏暗)
+            x264_params = "range=pc:colorprim=unspecified:transfer=unspecified:colospace=unspecified"
+        args.extend(["-x264-params", x264_params])
     return args
 
 # ── 59 种 xfade 转场效果 ──
@@ -263,6 +272,9 @@ def _adaptive_worker_count(task_size: int) -> tuple[int, str]:
         f"任务 {task_size} 条→{task_limit}"
     )
     return workers, reason
+
+
+_TAIL_FREEZE_THRESHOLD = 0.5  # 秒, freezedetect 阈值 (与 _tail_freeze_duration 默认对齐)
 
 
 def _tail_freeze_duration(path: str, threshold: float = 0.5) -> float:
@@ -680,14 +692,24 @@ def render_simple(script: dict, output_path: str, audio_path: str,
         if actual_video_frames < target_frames - 1:
             shortfall_frames = target_frames - actual_video_frames
             shortfall_sec = shortfall_frames / fps  # 局部刷新 (同上, 保留冗余以便 log 引用)
-            if shortfall_sec > 2.0:
-                # v3.15 修: 之前用 _log() 触发 NameError (任务 568 第 4/5 条失败根因)
-                # _log 只在 render_videos_4stage 函数内定义, 此处不可见.
-                # 改用 print + logging 双写, 保证不影响渲染流程.
+            # v3.24.1 修: 之前 v3.24 用 tpad=stop_mode=clone 补 5.77s 静态画面, 用户
+            # 报 "拒绝使用明显静止帧补齐" (任务 568 旧根因 + 任务 755 新报). 短缺口
+            # (<= _TAIL_FREEZE_THRESHOLD 0.5s) tpad=clone 可接受 (freezedetect 不会
+            # 触发), 长缺口必须 raise 清晰错误让用户补素材, 而不是悄悄糊静态画面.
+            if shortfall_sec > _TAIL_FREEZE_THRESHOLD:
+                raise RuntimeError(
+                    f"动态画面 {total_video_dur:.3f}s 短于目标 {final_dur:.3f}s，"
+                    f"缺口 {shortfall_sec:.2f}s ({shortfall_frames} 帧)，"
+                    f"超过 tpad 容差 {_TAIL_FREEZE_THRESHOLD}s。"
+                    f"请补充素材或选择更多切片后重试，不要使用静止帧补齐。"
+                )
+            # 短缺口: 保留 v3.15 的 print warning (NameError 修复), 允许 tpad=clone 补
+            # (< 0.5s 静态尾, freezedetect 阈值 0.5s 不会触发, 用户体验可接受)
+            if shortfall_sec > 0:
                 _shortfall_msg = (
                     f"⚠️ 动态画面 {total_video_dur:.3f}s 短于目标 {final_dur:.3f}s "
-                    f"({shortfall_frames} 帧 / {shortfall_sec:.1f}s)，"
-                    f"最终合成用 tpad=clone 补足 — 视频末尾会有 ~{shortfall_sec:.1f}s 静态画面"
+                    f"({shortfall_frames} 帧 / {shortfall_sec:.2f}s)，"
+                    f"tpad=clone 补足 (短缺口, < {_TAIL_FREEZE_THRESHOLD}s)"
                 )
                 print(f"[渲染] {_shortfall_msg}")
                 try:
@@ -695,7 +717,6 @@ def render_simple(script: dict, output_path: str, audio_path: str,
                     _logging.getLogger(__name__).warning(_shortfall_msg)
                 except Exception:
                     pass
-            # 不 raise：让下方 _vf 链路 (tpad + trim=end_frame=target_frames) 补帧
         if bgm_path and os.path.exists(bgm_path):
             bgm_dur = get_media_duration(bgm_path)
             if bgm_dur and bgm_dur > final_dur + 1.0:
@@ -774,7 +795,19 @@ def render_simple(script: dict, output_path: str, audio_path: str,
                 "-map", "1:a:0",
             ])
 
-        enc_args = _h264_encoder_args(bitrate, preserve_color=not perturbation)
+        # v3.24.1: 检测源片 color_range 传给编码器, 避免 v3.24 强制 range=pc 让 TV 源片偏亮
+        try:
+            _src_info = get_media_info(concat_video)
+            _src_streams = _src_info.get("streams", [])
+            _v_stream = next((s for s in _src_streams if s.get("codec_type") == "video"), {})
+            _src_color_range = _v_stream.get("color_range", "unknown")
+            # ffprobe 返回 "tv"/"pc"/"unknown"/"unspecified"
+            if _src_color_range not in ("tv", "pc"):
+                _src_color_range = "unknown"
+        except Exception:
+            _src_color_range = "unknown"
+        enc_args = _h264_encoder_args(bitrate, preserve_color=not perturbation,
+                                      source_color_range=_src_color_range)
         cmd.extend(enc_args)
         # v2.4: 最终输出, 透传 _batch_color_holder (同 batch 同池共享)
         cmd.extend([

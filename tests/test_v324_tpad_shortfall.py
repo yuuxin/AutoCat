@@ -128,13 +128,19 @@ class H264EncoderArgsColorTests(unittest.TestCase):
         self.assertEqual(args, ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"])
 
     def test_main_render_passes_preserve_color(self):
-        """主渲染路径必须把 not perturbation 传给 _h264_encoder_args."""
+        """主渲染路径必须把 not perturbation 传给 _h264_encoder_args (v3.24.1 还会传 source_color_range)."""
         with open("/Users/lilei/work/code/AutoCat/autokat/core/renderer.py",
                   encoding="utf-8") as f:
             src = f.read()
         # 两处调用: line 238 (compose) + line 777 (main render)
+        # v3.24.1 改动: 主渲染还会传 source_color_range=..., 接受单/多行
+        self.assertIn('preserve_color=not perturbation', src)
+        self.assertIn('source_color_range=', src)
+        # 关键调用 1: compose 路径
         self.assertIn('_h264_encoder_args("4M", preserve_color=not perturbation)', src)
-        self.assertIn('_h264_encoder_args(bitrate, preserve_color=not perturbation)', src)
+        # 关键调用 2: main render 路径
+        self.assertIn('enc_args = _h264_encoder_args(', src)
+        self.assertIn('source_color_range=_src_color_range', src)
 
     def test_setparams_unspecified_still_present_for_metadata(self):
         """v3.24 注: filter chain 的 setparams=range=1 仍保留 (元数据标签),
@@ -143,3 +149,94 @@ class H264EncoderArgsColorTests(unittest.TestCase):
                   encoding="utf-8") as f:
             src = f.read()
         self.assertIn("setparams=color_primaries=1:color_trc=1:colorspace=1:range=1", src)
+
+
+
+# ── v3.24.1 第三部分: 长缺口 raise + 源片 color_range 动态选 ──
+from autokat.core.renderer import _TAIL_FREEZE_THRESHOLD
+
+
+class TpadShortfallThresholdTests(unittest.TestCase):
+    """v3.24.1: shortfall > 0.5s 必须 raise 清晰错误, 不再用 tpad=clone 糊弄.
+
+    之前 v3.24 用 tpad=stop_mode=clone 补 5.77s 静态画面 → 触发 freezedetect → 任务 755 失败.
+    用户问「是没用补充新的切片吗」, 答案是: 是的, 没用, 之前用静态帧糊弄. v3.24.1
+    改成: 长缺口 raise 让用户补素材, 短缺口 (≤ 0.5s) 才允许 tpad=clone.
+    """
+
+    def test_tail_freeze_threshold_constant(self):
+        """v3.24.1: _TAIL_FREEZE_THRESHOLD = 0.5 (与 _tail_freeze_duration 默认对齐)."""
+        self.assertEqual(_TAIL_FREEZE_THRESHOLD, 0.5)
+
+    def test_long_shortfall_raises_with_clear_message(self):
+        """v3.24.1: shortfall > 0.5s 源码必须有 raise RuntimeError + 提示「请补充素材」."""
+        with open("/Users/lilei/work/code/AutoCat/autokat/core/renderer.py",
+                  encoding="utf-8") as f:
+            src = f.read()
+        # 必须有 raise
+        self.assertIn("raise RuntimeError(", src)
+        # 必须有 "请补充素材" 或类似提示
+        self.assertTrue(
+            "请补充素材" in src or "补充素材" in src,
+            "v3.24.1: 长缺口 raise 错误信息必须提示用户补充素材",
+        )
+        # 必须有 "不要使用静止帧补齐" 提示 (与用户 568 旧诉求对齐)
+        self.assertIn("不要使用静止帧补齐", src,
+                       "v3.24.1: 错误信息应包含「不要使用静止帧补齐」, 呼应用户 568 旧诉求")
+
+    def test_short_shortfall_keeps_print_warning(self):
+        """v3.24.1: 短缺口 (< 0.5s) 保留 v3.15 的 print warning (向后兼容)."""
+        with open("/Users/lilei/work/code/AutoCat/autokat/core/renderer.py",
+                  encoding="utf-8") as f:
+            src = f.read()
+        # v3.15 守护: print(f"[渲染] "...) 必须保留
+        self.assertIn('print(f"[渲染] ', src,
+                       "v3.24.1: 短缺口必须保留 v3.15 的 print warning")
+
+
+class SourceColorRangeDetectionTests(unittest.TestCase):
+    """v3.24.1: 主渲染路径必须检测源片 color_range, 传给 x264-params.
+
+    之前 v3.24 强制 range=pc, 但源片若是 TV range 会被错解读为 PC → 整体偏亮 7.3%.
+    v3.24.1: get_media_info(concat_video) 取 color_range, 传给 _h264_encoder_args.
+    """
+
+    def test_h264_encoder_args_accepts_source_color_range(self):
+        """v3.24.1: 签名加 source_color_range 参数."""
+        import inspect
+        from autokat.core.renderer import _h264_encoder_args
+        sig = inspect.signature(_h264_encoder_args)
+        self.assertIn("source_color_range", sig.parameters)
+
+    def test_tv_source_uses_range_tv(self):
+        """v3.24.1: source=tv → x264-params range=tv (防止 TV→PC 偏亮)."""
+        from autokat.core.renderer import _h264_encoder_args
+        args = _h264_encoder_args("8M", preserve_color=True, source_color_range="tv")
+        self.assertIn("-x264-params", args)
+        params = args[args.index("-x264-params") + 1]
+        self.assertIn("range=tv", params)
+        self.assertNotIn("range=pc", params)
+
+    def test_pc_source_uses_range_pc(self):
+        """v3.24.1: source=pc → x264-params range=pc (防止 PC→TV 偏暗)."""
+        from autokat.core.renderer import _h264_encoder_args
+        args = _h264_encoder_args("8M", preserve_color=True, source_color_range="pc")
+        params = args[args.index("-x264-params") + 1]
+        self.assertIn("range=pc", params)
+        self.assertNotIn("range=tv", params)
+
+    def test_unknown_source_defaults_to_pc(self):
+        """v3.24.1: source=unknown → 默认 range=pc (现代源片多数 PC, 与 v3.24 一致)."""
+        from autokat.core.renderer import _h264_encoder_args
+        args = _h264_encoder_args("8M", preserve_color=True, source_color_range="unknown")
+        params = args[args.index("-x264-params") + 1]
+        self.assertIn("range=pc", params)
+
+    def test_main_render_detects_source_color_range(self):
+        """v3.24.1: 主渲染路径必须调 get_media_info 拿源片 color_range."""
+        with open("/Users/lilei/work/code/AutoCat/autokat/core/renderer.py",
+                  encoding="utf-8") as f:
+            src = f.read()
+        # 必须在 enc_args = _h264_encoder_args(...) 之前调 get_media_info
+        self.assertIn("get_media_info(concat_video)", src)
+        self.assertIn("_src_color_range", src)
