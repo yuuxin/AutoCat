@@ -9,6 +9,7 @@ from autokat.core.writer import (
     _build_batch_prompt,
     _content_char_count,
     _parse_batch_output,
+    compute_candidate_count,
     compute_model_target,
     generate_scripts_batch,
 )
@@ -103,6 +104,15 @@ class ComputeModelTargetTests(unittest.TestCase):
         sys_typical = int(model_typical * 0.75)
         self.assertGreaterEqual(sys_typical, 85)
         self.assertLessEqual(sys_typical, 156)
+
+    def test_candidate_count_small_batches(self):
+        self.assertEqual(compute_candidate_count(1), 3)
+        self.assertEqual(compute_candidate_count(5), 8)
+
+    def test_candidate_count_large_batches_uses_ratio(self):
+        self.assertEqual(compute_candidate_count(10), 13)
+        self.assertEqual(compute_candidate_count(20), 24)
+        self.assertEqual(compute_candidate_count(100), 115)
 
 
 class ParseBatchOutputTests(unittest.TestCase):
@@ -241,9 +251,30 @@ class GenerateScriptsBatchE2ETests(unittest.TestCase):
         batch_calls = sum(1 for p in provider.prompts_seen if "本批要求生成" in p)
         self.assertEqual(batch_calls, 2,
             f"v3.19: 25 条应分 2 批, 实际 batch_calls={batch_calls}")
-        # 至少 20 条从 batch 解析 (剩下可能因相似度 reject 走 fallback)
-        self.assertGreaterEqual(len(results), 20,
-            f"v3.19: 至少 20 条从 batch 解析, got {len(results)}")
+        # 新策略会筛掉重复候选, 不合格内容不再混入结果。
+        self.assertGreater(len(results), 0)
+        self.assertLessEqual(len(results), 25)
+
+    def test_overgenerated_candidates_filter_to_requested_count(self):
+        """要 5 条时请求 8 条候选, 只取其中 5 条合格结果."""
+        raw = "".join(
+            f"=== 文案{i+1} ===\n太短了。\n"
+            for i in range(3)
+        ) + "".join(
+            f"=== 文案{i+4} ===\n第 {i + 1} 条推荐, {self._good(i)}\n"
+            for i in range(5)
+        )
+        provider = _make_provider([raw])
+        with _patch_bwp(provider):
+            results = generate_scripts_batch(
+                topic="时尚女鞋", count=5,
+                target_chars_min=85, target_chars_max=156,
+                provider_obj=provider, max_batch_size=20,
+            )
+        self.assertEqual(provider.call_count, 1)
+        self.assertIn("8 条文案", provider.prompts_seen[0])
+        self.assertEqual(len(results), 5)
+        self.assertTrue(all(r["quality"]["valid"] for r in results))
 
     def test_failed_paragraphs_fall_back(self):
         """batch 中第 2 条太短, fallback 到 single-call 补上."""

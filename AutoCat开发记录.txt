@@ -1066,4 +1066,226 @@ https://partner.tiktokshop.com/docv2/page/upload-shoppable-video-file-202505#%E5
 https://partner.tiktokshop.com/docv2/page/post-shoppable-video-202603
 
 
+deepseek API keys
+sk-d5ecd7edced748eb9d9094eed24c7a5d
 
+想为日常穿搭多一点灵感，春夏女鞋也能带来很大的变化。一双舒适又时尚的鞋子，能让整个人的状态都松弛自然起来。百搭的设计，无论通勤还是约会都能轻松切换。让你的每一步都充满自信，走在自己的路上。让每个普通的日常都多一些新鲜感。想要了解更多关于春夏女鞋的信息？欢迎关注我，我会持续更新我的专业知识。
+
+云朵GEO怎么样   https://www.toutiao.com/article/7650434917469340203/?&source=m_redirect
+区域企业做GEO，必须知道这一点 https://www.toutiao.com/article/7650086040341873195/?&source=m_redirect
+
+
+
+sk-7523fe924b9a40a898801498a522e123
+1.AI文案生成的逻辑 在一次任务中 不要每次单独调用，例如一个任务是生成5条，那么一次性让生成5条，如果是500条，那么可以分几个批次去调用生成，不超过上下文长度或等待太久就可以，建议可以超过20条的 可以一个批次最大20条去生成
+2.为什么文案还是经常字数不够或超过，你控制太不精准，查看生成文案的日志 给出一个方案 ，要求去约束模型的生成结果而不是只截取，如果是模型计算字数和系统内的不一样，那么你要适配模型的逻辑去给他字数要求，例如模型生成字数是100而我们计算只有50 ，那么你就按照比例给出让他生成的字数。类似这样 验证是否可行。不要让我给你方法，你应该有更好的方法，考虑的维度更全才对。
+
+帮我打包AutoCat为dmg安装文件，适配苹果芯片，
+目标电脑可能是一套没有安装任何环境的新电脑或已经安装了部分前置环境的电脑，你要兼容这些，并非确保能顺利安装并能正确运行不闪退。
+
+
+
+我想做一个视频剪辑的agent mac桌面app类似剪映 ，可以自动化剪辑素材，可以手动调整字幕配音等，agent支持调用一些skill技能做流程化的剪辑：例如自动剪辑一个视频素材或多个视频素材的高光时刻，例如，自动总结一个长视频，用总结文案+多切片，合成几个精讲或解说并配音和字幕。可以增加skill，底层调用codex或claude code或hermes agent。
+
+
+
+
+安装完/Users/lilei/work/code/AutoCat/dist/AutoCat-3.0.1.dmg 运行闪退报错:
+Last login: Wed Jun 17 09:49:46 on console
+/Applications/AutoCat.app/Contents/MacOS/AutoCat ; exit;
+nana@nanadeMacBook-Air ~ % /Applications/AutoCat.app/Contents/MacOS/AutoCat ; exit;
+Traceback (most recent call last):
+  File "<stdin>", line 3, in <module>
+  File "/Applications/AutoCat.app/Contents/Resources/lib/python3.14/site-packages/autokat/models/db.py", line 3, in <module>
+    import sqlite3
+  File "/Applications/AutoCat.app/Contents/Resources/Python.framework/Versions/3.14/lib/python3.14/sqlite3/__init__.py", line 57, in <module>
+    from sqlite3.dbapi2 import *
+  File "/Applications/AutoCat.app/Contents/Resources/Python.framework/Versions/3.14/lib/python3.14/sqlite3/dbapi2.py", line 27, in <module>
+    from _sqlite3 import *
+ImportError: dlopen(/Applications/AutoCat.app/Contents/Resources/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/_sqlite3.cpython-314-darwin.so, 0x0002): Library not loaded: /opt/homebrew/opt/sqlite/lib/libsqlite3.dylib
+  Referenced from: <92CC8594-C099-3219-A4D3-A73F66F77F56> /Applications/AutoCat.app/Contents/Resources/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/_sqlite3.cpython-314-darwin.so (built for macOS 26.0 which is newer than running OS)
+  Reason: tried: '/Applications/AutoCat.app/Contents/Resources/native_libs/libsqlite3.dylib' (no such file), '/opt/homebrew/opt/sqlite/lib/libsqlite3.dylib' (no such file), '/System/Volumes/Preboot/Cryptexes/OS/opt/homebrew/opt/sqlite/lib/libsqlite3.dylib' (no such file), '/opt/homebrew/opt/sqlite/lib/libsqlite3.dylib' (no such file)
+
+Saving session...
+...saving history...truncating history files...
+...completed.
+Deleting expired sessions...none found.
+
+[进程已完成]
+
+只讨论，检查原因，写解决方案，不写代码。
+
+
+
+我希望的使用方式
+1.安装herness插件， 给我一个命令，直接安装herness在新项目中 或者手动复制到新文件项目目录中 
+2.在项目中使用herness  第一次使用时候自动触发提醒用户选择初始化项目(你自动判断是否新项目，走初始化流程，初始化流程完了，执行客户给的命令)
+3. 如果只是改个bug 或者 只是新模块 都不要让用户显式的去说xxx，不清楚的情况可以跟用户提问，让用户选择是走完整流程还是走模块还是调试bug， 或者用户输入里包含 /herness:new  新项目  /herness:model 新模块 /herness:debug  改bug 
+4.千万别让用户去写要基于xx文件 去改xx文件 这些文件名字 用户不可能记得住，你要考虑用户体验，我们既然是herness工程 那么就要能让用户尽量不改变使用习惯的情况下 安装咱们的herness工程流程进行开发
+5.基于以上你看还有什么更好的方案或者要补充的部分能够覆盖常规使用场景的，前提都是用户不要记住太多文件名字等 最多记住几个简单指令或者是让用户选择即可
+整体规划一下方案，不清楚的可以想我提问或者选择确认，最终我确认完再开发
+
+
+
+
+任务第二步，AI生成文案时候总是出现文案字数不够和文案内容描述超过限制的错误导致文案生成失败，我需要你检查并给出可行性方案，先不改代码，只给方案，需要确认的地方让我确认。
+
+补充一下是否可以考虑这样的方案：例如要生成5条，那么我一次调用的时候多生成几条，例如生成8条，这样返回结果里挑出5条合格的，如果8条都合格则也只挑出5条使用。这个方案是否可以降低整体失败的概率，只是浪费了生成的时间，只要稍微控制一下冗余的数量即可，例如数量级较小时候多冗余2-5条，数量级比较大时候可以冗余10%-20% 你觉着这个方案如何
+1.生成不够时，是否允许系统自动扩写 1-2 句，优先保证成功率？ 可以的
+超过字数时，你希望“模型压缩重写”还是“直接截断”？我建议压缩重写。 按照你的建议
+3.当用户没填细节/卖点时，是否默认禁止 AI 描述材质、工艺、功能性卖点，只写通用穿搭/使用场景/情绪价值？ 材质可以禁止，功能和工艺是可以稍微说一下的。
+
+
+我需要你按照这个复刻一版方案，豆包给了一些建议你可以参考：【
+# 阅读确认 + 完整原文核心提炼（基于这份EP.106 PDF文档）
+我已经完整读完你提供的废才俱乐部EP.106《毒舌产品经理5.0》全文，下面分「核心变革、完整架构目录、运行机制、原版缺陷、适配你本地Codex+CC Switch复刻改造方案」四部分整理，可直接交给Codex梳理开发思路。
+
+## 一、5.0 核心底层思想（和4.0最大变革）
+1. **放弃写死分步流程，只定义目标+验收标准+边界**
+   4.0习惯把每一步操作写死，模型升级后会被老旧流程限制发挥；5.0全部删除执行步骤，仅保留约束标准，过程交由模型自主规划。
+   例：4.0的bug-fixer几十行分步调试流程，5.0仅41行原则，调试路径模型自己安排。
+2. **新增核心能力：/goal 目标自驱指令**
+   4.0无整段自动化执行能力；5.0通过`goal-creator`自动生成可验证自驱指令，一整个开发阶段交给模型全自动跑，中途无需人工持续介入。
+3. **架构轻量化瘦身，降低维护成本**
+   整套体系纯规则文本仅928行；固定长期Sub-Agent从4个缩减为2个；进化链路从四层慢迭代改为即时短链，修改规则当场生效。
+4. **分层控制逻辑不变（三层骨架保留）**
+   - 前馈Guides：任务执行前注入标准（11个Skill）
+   - 反馈Sensors：执行后门禁校验（6个Hook+双阶段代码审查闭环）
+   - 进化Steering Loop：吸收用户反馈自动迭代规则
+
+## 二、完整目录结构（Codex专用标准工程）
+```
+项目根目录
+├── AGENTS.md               # 主控调度文件（仅171行，整套体系总入口）
+├── Product-Spec.md         # 自动生成产品需求基线
+├── Product-Spec-CHANGELOG.md # 需求变更日志
+├── Design-Brief.md         # 全局设计规范
+├── DEV-PLAN.md             # 分阶段开发计划
+├── 业务代码文件夹/
+├── .agents/
+│   └── skills/             # 11个Skill规则库（前馈引导层）
+│       ├── product-spec-builder   需求调研&PRD生成
+│       ├── design-brief-builder   设计标准生成
+│       ├── design-maker          对接MCP生成完整UI设计稿
+│       ├── dev-planner           技术选型+阶段拆分
+│       ├── dev-builder           代码开发规范
+│       ├── bug-fixer             Bug修复原则
+│       ├── code-review           两阶段代码审查
+│       ├── release-builder       打包发布+隐私审计
+│       ├── goal-creator          自动生成/goal自驱指令
+│       ├── evolution-engine      消化用户反馈、生成规则修改建议
+│       └── skill-builder         按需新建自定义Skill（兜底工具）
+└── .codex/
+    ├── config.toml          模型、MCP、代理配置（适配CC Switch）
+    ├── hooks.json           6个钩子脚本绑定规则
+    ├── hooks/
+    │   ├── pre-tool-shell.sh    提交前编译、清理占用端口
+    │   ├── auto-push.sh        校验通过自动推送代码
+    │   ├── stop-gate.sh        退出前强制完成审查
+    │   ├── mark-review-needed.sh 代码变更标记待审核
+    │   ├── detect-feedback-signal.sh 捕捉你的纠错反馈
+    │   └── check-evolution.sh   会话启动时处理进化队列
+    ├── agents/
+    │   ├── code-reviewer.toml  独立隔离审查子Agent
+    │   └── evolution-runner.toml 独立进化规则消化子Agent
+    ├── evolution/
+    │   ├── signals.jsonl       用户反馈原始信号队列
+    │   └── proposals.md       待用户确认规则修改方案
+    └── EVOLUTION.md            进化引擎全局规则
+```
+
+## 三、11个Skill详细职能
+### 流水线开发8个（需求→发布全链路）
+1. **product-spec-builder**
+   需求访谈七阶段深挖，主动对比竞品，区分MVP边界，禁止模糊需求直接开发；内置AI图像/视频/配音能力对照表，避免提出超出模型能力的需求。本Skill是唯一加厚模块，需求源头决定全项目质量。
+2. **design-brief-builder**
+   先区分产品形态（桌面工具/网页/对话Agent），把抽象“高级、简洁”转化为可量化设计参数（留白、配色、字重），提供选择题确认风格。
+3. **design-maker**
+   对接Figma/Pencil MCP，强制每个功能页面包含默认/空/加载/错误4种状态，优先复用组件，填充真实业务内容而非占位符。
+4. **dev-planner**
+   联网校验框架、组件兼容性；按依赖分层拆分Phase，高风险任务前置；硬性要求每个阶段可完整编译运行，不允许半成品堆积。
+5. **dev-builder**
+   代码开发纪律：修改前全局检索引用、优先复用组件、禁止假UI；完成必须附带编译运行输出作为证据。
+6. **bug-fixer**
+   仅保留核心原则：无证据不下判断、单次只修改一处、连续修复失败强制重新评估需求架构。
+7. **code-review**（整套质量底线）
+   双阶段闭环：
+   Stage1：逐条核对PRD，校验功能是否完整实现；
+   Stage2：代码质量、安全、UI还原校验；
+   新增两项强校验：引导真实性、测试真实性（杜绝假用例、虚假提示文案）。
+8. **release-builder**
+   核心红线：开发环境可用≠打包可用；发布前强制隐私审计，扫描明文密钥、本地路径等敏感信息，不通过禁止打包。
+
+### 体系管理3个（非业务流水线）
+1. **goal-creator**：自动生成合规`/goal`自驱指令，要求完成标准可通过命令、文件、日志举证，限制指令4000字符内无废话。
+2. **evolution-engine**：读取用户纠错信号，提炼通用规则修改方案，区分全局规则/项目专属偏好。
+3. **skill-builder**：仅进化引擎提议、用户确认后，才生成全新自定义Skill。
+
+## 四、两大固定隔离Sub-Agent（上下文防火墙）
+1. `code-reviewer.toml`
+   全新独立会话，不继承主Agent的开发假设，客观核对代码与需求；只输出问题不自动修复，保证审查中立。
+2. `evolution-runner.toml`
+   独立消化反馈，不受当前会话上下文干扰，客观产出规则优化建议。
+
+> 临时执行编码子Agent：开发阶段按需临时spawn，用完销毁，禁止嵌套spawn、禁止自行提交代码，提交权限收归主控。
+
+## 五、6个底层Hook（程序级硬性门禁，不受模型走神影响）
+1. pre-tool-shell：commit前编译校验、启动服务前释放端口
+2. auto-push：审查编译全部通过才推送远程保护分支
+3. stop-gate：代码未完成审查，禁止结束会话
+4. mark-review-needed：文件修改后自动标记待审核
+5. detect-feedback-signal：实时抓取你对AI的纠正、不满作为进化信号
+6. check-evolution：每次新建会话先处理积压进化建议
+
+## 六、进化系统（5.0重大升级）
+1. 4.0旧机制：同一反馈出现3次才纳入规则，效率极低；
+2. 5.0短链即时机制：
+   用户纠正→Hook捕获存入signals.jsonl→新开会话自动调用evolution-runner生成优化提案→逐条询问用户，同意立即写入规则，拒绝直接删除；
+3. 双向清理：不仅新增规则，自动扫描长期未触发、重复规则，建议删除控制总量；
+4. 分层存储：通用开发约束存入Skill，单个项目口味存入本地记忆，互不污染。
+
+## 七、标准全流程工作链路
+1. 用户描述原始想法 → product-spec-builder追问补全需求，输出Product-Spec.md
+2. 生成Design-Brief.md定义视觉规范（可选MCP生成完整设计稿）
+3. dev-planner产出分阶段开发计划DEV-PLAN.md
+4. dev-builder按Phase迭代编码
+5. 自动spawn code-reviewer双阶段审查
+6. 审查失败自动进入bug-fixer/dev-builder修复，循环至双通过
+7. Hook执行原子提交、自动推送
+8. 单阶段完成可使用`goal-creator`生成`/goal`，下一轮全自动执行整段开发
+9. 全部开发完成执行release-builder打包隐私审计
+10. 会话启动自动消化过往纠错，持续优化整套Agent规则
+
+## 八、原版体系固有短板（复刻升级重点，可交付Codex优化）
+1. 原生仅适配官方Codex，无CC Switch、MiniMax/DeepSeek多模型适配逻辑；
+2. 无上下文双层防护机制，仅依靠手动`/compact`压缩，缺少自动Token阈值管控；
+3. 设计规范、tokens、组件库为外置附件，无内置自动校验UI代码逻辑；
+4. 斜杠指令原生参数支持弱，缺少自定义拓展指令；
+5. 无多人格切换机制，评审语气固定；
+6. 缺少文件懒加载机制，每次会话全量读取所有MD文件，浪费大量Token；
+7. 安全沙箱管控薄弱，未限制高危终端、敏感目录读写；
+8. 无Qt剪辑工作台项目专属定制规则，通用化程度高、行业针对性弱。
+
+## 九、给Codex的复刻开发总任务（可直接复制发送）
+基于这份官方毒舌产品经理5.0完整架构，结合我本地环境（Codex + CC Switch代理 + MiniMax-M3 / DeepSeek-V4-Flash、Qt短视频剪辑工作台项目）完成自研复刻升级，要求：
+1. 完整还原官方11套Skill、双隔离Sub-Agent、6Hook、/goal自驱、即时进化全套架构；
+2. 补齐原版缺失配套文件：`tokens.css`、`spec-mono-components.md`、`skills-lock.json`设计约束底座；
+3. 针对原版8项短板逐项迭代优化；
+4. 深度对接CC Switch模型转发、上下文双层截断、手机远程配对、TUN网络排障逻辑；
+5. 全部配置适配Windows/macOS双系统，区分模型上下文阈值；
+6. 输出完整工程目录、所有MD/TOML/Shell脚本、配置注释、部署使用手册、故障排查文档；
+7. 内置剪辑项目专属UI组件、时间轴、转场、多模态生成校验规则。
+】 根据以上参考和5.0的思路，帮我复刻一份类似的提示词工程，可以用在我后续的开发环境，先出详细的计划不清楚的地方找我确认最好是给我选项，最后我确认完整再开发
+
+
+
+
+
+1.打包的app是要在多台用户的机器上安装使用的，
+2.机器操作系统的版本不确定是多少，不一定是最新的。
+3.机器可能新机器，什么软件和环境都没安装，更别说sqlite或Homebrew或Python了
+4.也许部分机器已经装了Python等
+5.你要考虑到这些情况并兼容，保障安装顺利并能正常打开运行。
+6.兼容其他我未提到但是属于常规的范围场景环境等。
+
+帮我安装herness到新的项目目录/Users/lilei/work/code/TestHerness

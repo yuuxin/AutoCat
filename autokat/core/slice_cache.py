@@ -12,7 +12,7 @@ from pathlib import Path
 
 from autokat.core.paths import DATA_ROOT
 from autokat.core.ffmpeg_utils import FFMPEG, get_media_info, run_ffmpeg
-from autokat.models.db import get_conn
+from autokat.models.db import get_conn, run_write_transaction
 
 
 CACHE_VERSION = "slice-v4-base-bt709"
@@ -62,16 +62,13 @@ class SliceCache:
         path = self.peek(cache_key)
         if path is None:
             return None
-        conn = get_conn()
-        try:
-            conn.execute(
+        run_write_transaction(
+            lambda conn: conn.execute(
                 "UPDATE cache_entries SET hit_count=hit_count+1,"
                 "last_accessed_at=datetime('now','localtime') WHERE cache_key=?",
                 (cache_key,),
             )
-            conn.commit()
-        finally:
-            conn.close()
+        )
         return path
 
     def build(self, cache_key: str, builder) -> Path:
@@ -84,39 +81,37 @@ class SliceCache:
             path = self.path_for(cache_key)
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_suffix(".building.mp4")
-            conn = get_conn()
-            try:
-                conn.execute(
+            run_write_transaction(
+                lambda conn: conn.execute(
                     "INSERT INTO cache_entries(cache_key,cache_type,file_path,status,build_count) "
                     "VALUES(?, 'slice', ?, 'building', 1) "
                     "ON CONFLICT(cache_key) DO UPDATE SET status='building',"
                     "build_count=cache_entries.build_count+1,error_msg=NULL",
                     (cache_key, str(path)),
                 )
-                conn.commit()
-            finally:
-                conn.close()
+            )
             try:
                 builder(tmp)
                 os.replace(tmp, path)
-                conn = get_conn()
-                conn.execute(
-                    "UPDATE cache_entries SET status='ready',size_bytes=?,"
-                    "last_accessed_at=datetime('now','localtime') WHERE cache_key=?",
-                    (path.stat().st_size, cache_key),
+                size_bytes = path.stat().st_size
+                run_write_transaction(
+                    lambda conn: conn.execute(
+                        "UPDATE cache_entries SET status='ready',size_bytes=?,"
+                        "last_accessed_at=datetime('now','localtime') WHERE cache_key=?",
+                        (size_bytes, cache_key),
+                    )
                 )
-                conn.commit()
-                conn.close()
                 return path
             except Exception as exc:
                 tmp.unlink(missing_ok=True)
-                conn = get_conn()
-                conn.execute(
-                    "UPDATE cache_entries SET status='failed',error_msg=? WHERE cache_key=?",
-                    (str(exc), cache_key),
+                error_text = str(exc)
+                run_write_transaction(
+                    lambda conn: conn.execute(
+                        "UPDATE cache_entries SET status='failed',error_msg=? "
+                        "WHERE cache_key=?",
+                        (error_text, cache_key),
+                    )
                 )
-                conn.commit()
-                conn.close()
                 raise
 
 

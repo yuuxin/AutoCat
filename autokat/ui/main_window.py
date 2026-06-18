@@ -37,6 +37,7 @@ from autokat.core.bgm import get_bgm_duration, split_bgm_to_segments
 from autokat.core.bgm import get_bgm_duration, split_bgm_to_segments
 from autokat.core.writer import (
     generate_script_by_topic, generate_script_by_topic_detailed,
+    generate_scripts_batch,
     validate_script_quality, estimate_chars_for_lang, estimate_chars_for_duration_range,
     list_styles, check_deepseek_available, set_deepseek_key, set_deepseek_config,
 )
@@ -1996,15 +1997,19 @@ class MainWindow(QMainWindow):
         ai_status_label = QLabel("")
         ai_status_label.setStyleSheet("color:#6B7280; font-size:11px; background:transparent;")
         progress_layout.addWidget(ai_status_label)
+        ai_latest_result_label = QLabel("")
+        ai_latest_result_label.setVisible(False)
+        ai_latest_result_label.setMaximumHeight(24)
+        ai_latest_result_label.setTextFormat(Qt.PlainText)
+        ai_latest_result_label.setStyleSheet(
+            "color:#374151; font-size:11px; background:#F9FAFB;"
+            "border:1px solid #E5E7EB; border-radius:5px; padding:3px 7px;"
+        )
+        progress_layout.addWidget(ai_latest_result_label)
         dlg_layout.addWidget(progress_widget)
-        self._ai_results_list = QListWidget()
-        self._ai_results_list.setMinimumHeight(180)
-        self._ai_results_list.setStyleSheet("QListWidget{background:#FFFFFF;border:1.5px solid #E5E7EB;border-radius:10px;padding:4px;}")
-        self._ai_results_list.setVisible(False)
-        dlg_layout.addWidget(self._ai_results_list)
         result_area = QTextEdit()
         result_area.setReadOnly(False)
-        result_area.setPlaceholderText("生成的文案将显示在这里...选择左侧列表可编辑...")
+        result_area.setPlaceholderText("最近生成的文案将显示在这里，可直接编辑...")
         result_area.setMinimumHeight(150)
         dlg_layout.addWidget(result_area)
         btn_row = QHBoxLayout()
@@ -2055,6 +2060,8 @@ class MainWindow(QMainWindow):
             ai_progress_bar.setRange(0, count_input.value())
             ai_progress_bar.setValue(0)
             ai_status_label.setText("正在准备...")
+            ai_latest_result_label.clear()
+            ai_latest_result_label.setVisible(False)
             result_area.setText("正在生成中...")
             # 后台线程生成
             ai_results = []
@@ -2090,36 +2097,46 @@ class MainWindow(QMainWindow):
                             target_min, target_max = estimate_chars_for_duration_range(
                                 ai_lang, dmin, dmax, rate,
                             )
-                            accepted = []
-                            for gi in range(ai_cnt):
-                                extra = f"，第{gi+1}条，目标时长{dmin}-{dmax}秒（{ai_lang}，语速{rate:+d}%）"
-                                def quality_progress(backend, attempt, total_attempts, message, _gi=gi):
-                                    self.progress_signal.emit(
-                                        _gi, ai_cnt,
-                                        f"第 {_gi + 1} 条 · {backend} 第 {attempt}/{total_attempts} 次：{message}",
-                                    )
-                                generated = generate_script_by_topic_detailed(
-                                    topic, style, detail, features,
-                                    lang=ai_lang, extra_instruction=extra,
-                                    target_chars_min=target_min,
-                                    target_chars_max=target_max,
-                                    target_duration_min=dmin,
-                                    target_duration_max=dmax,
-                                    accepted_texts=accepted,
-                                    progress_callback=quality_progress,
-                                    provider=_captured_provider,
-                                    video_type=_captured_video_type,
-                                    material_capabilities=__import__(
-                                        "autokat.core.material_analysis", fromlist=["capability_summary"]
-                                    ).capability_summary(
-                                        _captured_selected_materials or None
-                                    ),
+                            extra = f"，目标时长{dmin}-{dmax}秒（{ai_lang}，语速{rate:+d}%）"
+                            from autokat.core.ai_providers import build_writer_provider
+                            provider_obj = build_writer_provider(_captured_provider)
+                            material_caps = __import__(
+                                "autokat.core.material_analysis", fromlist=["capability_summary"]
+                            ).capability_summary(
+                                _captured_selected_materials or None
+                            )
+                            def batch_progress(backend, batch_idx, total_batches, message):
+                                done_hint = min(ai_cnt, batch_idx + 1)
+                                self.progress_signal.emit(
+                                    done_hint, ai_cnt,
+                                    f"{message}",
                                 )
-                                accepted.append(generated["text"])
+                            generated_list = generate_scripts_batch(
+                                topic=topic, count=ai_cnt,
+                                target_chars_min=target_min,
+                                target_chars_max=target_max,
+                                provider_obj=provider_obj,
+                                style=style,
+                                lang=ai_lang,
+                                extra_instruction=extra,
+                                detail=detail,
+                                features=features,
+                                target_duration_min=dmin,
+                                target_duration_max=dmax,
+                                video_type=_captured_video_type,
+                                material_capabilities=material_caps,
+                                progress_callback=batch_progress,
+                            )
+                            for gi, generated in enumerate(generated_list[:ai_cnt]):
                                 quality = generated["quality"]
                                 self.result_signal.emit(
                                     gi, generated["text"], generated["source"],
                                     quality["char_count"], quality["max_similarity"],
+                                )
+                            if len(generated_list) < ai_cnt:
+                                raise RuntimeError(
+                                    f"仅生成 {len(generated_list)}/{ai_cnt} 条合格文案，"
+                                    f"请减少数量或补充更明确的选题/卖点后重试。"
                                 )
                         finally:
                             _wr._LOAD_PROGRESS_CALLBACK = old_cb
@@ -2140,13 +2157,13 @@ class MainWindow(QMainWindow):
                     margin=0,
                 )[2]
                 estimated_seconds = char_count / max(1, cps)
-                # v3.10 修: 显示 _ai_results_list, 用户能看到所有已生成脚本
-                # (之前 hidden, result_area 又被 error 替换, 用户感觉 "全都没了")
-                self._ai_results_list.addItem(
-                    f"📄 文案 #{len(ai_results)} · {char_count}字符 · "
+                latest_summary = (
+                    f"最近生成：文案 #{len(ai_results)} · {char_count}字符 · "
                     f"约{estimated_seconds:.1f}s · {source} · 相似度{similarity:.0%}"
                 )
-                self._ai_results_list.setVisible(True)
+                ai_latest_result_label.setText(latest_summary)
+                ai_latest_result_label.setToolTip(latest_summary)
+                ai_latest_result_label.setVisible(True)
                 ai_status_label.setText(f"✅ 已生成 {len(ai_results)}/{count_input.value()} 条合格文案")
                 ai_progress_bar.setValue(len(ai_results))
                 gen_btn.setEnabled(len(ai_results) < count_input.value())
@@ -2155,9 +2172,7 @@ class MainWindow(QMainWindow):
                 result_area.setText(txt)
                 result_area.setVisible(True)
             worker.result_signal.connect(_accept_generated)
-            # v3.10 修: error 不再 REPLACE result_area (会覆盖最新有效脚本)
-            # 而是保留 result_area 显示的最近一条有效脚本, error 只更新 status label
-            # 用户可以从 _ai_results_list 看到所有已生成的脚本
+            # error 不覆盖最近一条有效文案，状态与最近结果摘要继续保留。
             def _on_error(err):
                 # 只在 result_area 还是空或显示 "正在生成" 时才覆盖, 否则保留
                 current = result_area.toPlainText().strip()

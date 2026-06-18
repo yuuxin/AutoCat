@@ -12,7 +12,7 @@ from pathlib import Path
 
 from autokat.core.ffmpeg_utils import FFMPEG, FFPROBE
 from autokat.core.timeline import SYNC_TOLERANCE_SECONDS
-from autokat.models.db import get_conn
+from autokat.models.db import get_conn, run_write_transaction
 
 
 class QualityPolicy:
@@ -80,8 +80,7 @@ def quick_validate(output_path: str, script: dict) -> dict:
 
 def record_result(task_id: int, clip_id: int, level: str, result: dict,
                   auto_fix_count: int = 0) -> None:
-    conn = get_conn()
-    try:
+    def _write(conn):
         run = conn.execute(
             "SELECT id FROM quality_runs WHERE task_id=? AND level=? ORDER BY id DESC LIMIT 1",
             (task_id, level),
@@ -100,9 +99,7 @@ def record_result(task_id: int, clip_id: int, level: str, result: dict,
             (run_id, clip_id, "passed" if result.get("passed") else "failed",
              auto_fix_count, reason, json.dumps(result, ensure_ascii=False)),
         )
-        conn.commit()
-    finally:
-        conn.close()
+    run_write_transaction(_write)
 
 
 def finalize_task_quality(task_id: int, total: int) -> dict:

@@ -26,6 +26,7 @@ from autokat.core.writer import (
     _content_char_count,
     _enforce_char_limit,
     _post_extend_if_short,
+    _post_compress_if_long,
     generate_script_by_topic_detailed,
 )
 
@@ -232,6 +233,53 @@ class PostExtendIfShortTests(unittest.TestCase):
             "v3.16: provider 抛异常应保留原文本, 不向上抛")
         # 异常路径仍计 1 次 (实际调过 model, 只是抛了), 语义: 调用次数而非成功次数
         self.assertEqual(attempts, 1, "v3.16: 异常路径实际调过 1 次 model")
+
+
+class PostCompressIfLongTests(unittest.TestCase):
+    """长文案不再硬截断, 而是用模型压缩重写。"""
+
+    def _make_provider(self, side_effects):
+        call_count = [0]
+        def generate(*args, **kwargs):
+            idx = call_count[0]
+            call_count[0] += 1
+            if idx >= len(side_effects):
+                return side_effects[-1]
+            return side_effects[idx]
+        provider = type("FakeProvider", (), {"generate": generate})()
+        return provider, call_count
+
+    def test_long_text_gets_compressed(self):
+        long_text = (
+            "时尚女鞋真的很适合日常穿搭, 不管通勤还是周末出门都能让整体造型更完整。"
+            "它可以搭配不同风格的衣服, 让普通一天多一点轻松感和仪式感。"
+        ) * 4
+        compressed = (
+            "时尚女鞋适合放进日常穿搭里, 通勤、逛街或周末出门都能自然衔接。"
+            "它不用夸张表达, 就能让整体造型更完整, 也让普通一天多一点轻松感。"
+            "选对一双合适的鞋, 出门前少一点纠结, 走路时也更自在。"
+        )
+        provider, call_count = self._make_provider([compressed])
+        result, count, attempts = _post_compress_if_long(
+            long_text, target_min=85, target_max=156,
+            topic="时尚女鞋", provider_obj=provider,
+        )
+        self.assertEqual(attempts, 1)
+        self.assertEqual(call_count[0], 1)
+        self.assertNotEqual(result, long_text)
+        self.assertLess(count, _content_char_count(long_text))
+        self.assertLessEqual(count, int(156 * 1.15))
+
+    def test_too_short_compression_rejected(self):
+        long_text = "时尚女鞋适合日常穿搭, 通勤逛街都能让造型更完整。" * 8
+        provider, call_count = self._make_provider(["太短了。"])
+        result, count, attempts = _post_compress_if_long(
+            long_text, target_min=85, target_max=156,
+            topic="时尚女鞋", provider_obj=provider,
+        )
+        self.assertEqual(attempts, 1)
+        self.assertEqual(result, long_text)
+        self.assertGreater(count, 156)
 
 
 # ── 端到端集成 (mock model 复现「模型+清洗双重偏差」) ─────────────

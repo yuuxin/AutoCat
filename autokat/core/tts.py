@@ -226,16 +226,33 @@ def _sanitize_for_tts(text: str) -> tuple[str, bool]:
     return s, True
 
 
-def _split_for_chunked_tts(text: str, max_chars: int = 600) -> list[str]:
+def _split_for_chunked_tts(text: str, max_chars: int = 600,
+                           force_split: bool = False) -> list[str]:
     """把长文本切分成长度可控的子段, 用于整段 TTS 失败时的回退.
 
     按优先级切分: 。！？!?\\n > ,;:，；：
     每个子段 ≤ max_chars 字符, 至少 5 个字符 (避免 sanitize 后变空).
     """
-    if len(text) <= max_chars:
+    if len(text) <= max_chars and not force_split:
         return [text]
     chunks: list[str] = []
     primary = re.split(r"(?<=[。！？!?\n])", text)
+    if force_split:
+        forced_chunks: list[str] = []
+        for piece in primary:
+            piece = piece.strip()
+            if not piece:
+                continue
+            if len(piece) <= max_chars:
+                forced_chunks.append(piece)
+            else:
+                forced_chunks.extend(
+                    _split_for_chunked_tts(
+                        piece, max_chars=max_chars, force_split=False,
+                    )
+                )
+        if len(forced_chunks) > 1:
+            return [c for c in forced_chunks if len(c.strip()) >= 5]
     buf = ""
     for piece in primary:
         if not piece:
@@ -275,7 +292,8 @@ def _spoken_text(text: str) -> str:
 
 def _generate_narration_chunked(chunks: list[str],
                                 voice: str, rate: str, pitch: str,
-                                output_path: str, lang: str) -> dict:
+                                output_path: str, lang: str,
+                                attempts_per_chunk: int = 3) -> dict:
     """整段 TTS 失败时的回退: 逐段 TTS 后 ffmpeg 拼接.
 
     Returns: 与 generate_narration 相同的 dict
@@ -290,13 +308,33 @@ def _generate_narration_chunked(chunks: list[str],
     for idx, chunk in enumerate(chunks):
         chunk_path = output_path.replace(".mp3", f"_chunk{idx}.mp3")
         chunk_files.append(chunk_path)
-        chunk_dur, chunk_boundaries = asyncio.run(
-            _generate_tts_with_boundaries(chunk, chunk_path, voice, rate, pitch)
-        )
+        chunk_dur = None
+        chunk_boundaries = []
+        chunk_exc = None
+        for attempt in range(1, attempts_per_chunk + 1):
+            try:
+                chunk_dur, chunk_boundaries = asyncio.run(
+                    _generate_tts_with_boundaries(
+                        chunk, chunk_path, voice, rate, pitch,
+                    )
+                )
+                if chunk_dur and chunk_dur >= 0.1 and chunk_boundaries:
+                    break
+                raise RuntimeError(
+                    f"音频或 WordBoundary 为空: duration={chunk_dur}, "
+                    f"boundaries={len(chunk_boundaries)}"
+                )
+            except Exception as exc:
+                chunk_exc = exc
+                chunk_dur, chunk_boundaries = None, []
+                if attempt < attempts_per_chunk:
+                    time.sleep(float(attempt))
         if not chunk_dur or chunk_dur < 0.1:
             raise RuntimeError(
-                f"chunk {idx+1}/{len(chunks)} TTS 失败: {chunk[:30]!r}…"
-            )
+                f"chunk {idx+1}/{len(chunks)} TTS 在 "
+                f"{attempts_per_chunk} 次尝试后失败: {chunk_exc or '无音频'}; "
+                f"文本 {chunk[:30]!r}"
+            ) from chunk_exc
         chunk_sentence_timings = build_phrase_timings(
             chunk_boundaries, source_text=chunk if lang == "zh" else None,
             max_chars=MAX_CAPTION_CHARS if lang == "zh" else 20,
@@ -306,22 +344,38 @@ def _generate_narration_chunked(chunks: list[str],
             s["end"] = s["end"] + current_offset
         all_sentences.extend(chunk_sentence_timings)
         current_offset += chunk_dur
+    for sentence_index, sentence in enumerate(all_sentences):
+        sentence["index"] = sentence_index
     concat_list = output_path + ".list.txt"
     with open(concat_list, "w") as f:
         for cf in chunk_files:
             f.write(f"file '{os.path.abspath(cf)}'\n")
     cmd = [FFMPEG, "-y", "-f", "concat", "-safe", "0",
            "-i", concat_list, "-c", "copy", output_path]
-    subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    concat_result = subprocess.run(
+        cmd, capture_output=True, text=True, timeout=60,
+    )
     os.remove(concat_list)
     for cf in chunk_files:
         if os.path.exists(cf):
             os.remove(cf)
+    if concat_result.returncode != 0 or not os.path.exists(output_path):
+        raise RuntimeError(
+            "TTS 分段音频拼接失败: "
+            + (concat_result.stderr or "ffmpeg 未生成输出")[-300:]
+        )
     total_duration = _probe_audio_duration(output_path) or current_offset
+    if lang == "zh":
+        output_path, all_sentences, total_duration = prepare_pcm_and_calibrate(
+            output_path, all_sentences, total_duration,
+        )
     return {
         "audio_path": output_path,
         "total_duration": total_duration,
         "sentences": all_sentences,
+        "timing_source": (
+            "word_boundary+pcm_vad" if lang == "zh" else "word_boundary"
+        ),
     }
 
 
@@ -558,25 +612,27 @@ def generate_narration(text: str,
             break
 
     if not total_duration or total_duration < 0.1:
-        # v3.21: 整段 9 次重试全失败时, 尝试按子段切分重试 (chunked fallback)
-        # 场景: 文本过长被 edge-tts 截断 / 包含 edge-tts 不接受的隐藏字符
-        chunks = _split_for_chunked_tts(text, max_chars=600)
-        if len(chunks) > 1:
-            try:
-                print(f"[TTS] 整段重试失败, 切分为 {len(chunks)} 段重试…")
-                return _generate_narration_chunked(
-                    chunks, voice, rate, pitch, audio_path, lang,
-                )
-            except Exception as fallback_exc:
-                print(f"[TTS] chunked 回退也失败: {fallback_exc}")
+        # 整段请求失败不一定是文本过长。Edge TTS 短时服务异常或单次请求
+        # 被拒绝时，几十到一百字的正常短文也可能连续返回 NoAudioReceived。
+        # 冷却后强制按标点拆成小请求，既绕开内容边界，也避开原重试窗口。
+        chunks = _split_for_chunked_tts(
+            text, max_chars=80, force_split=True,
+        ) or [text]
+        try:
+            time.sleep(3.0)
+            print(
+                f"[TTS] 整段重试失败, 冷却后切分为 "
+                f"{len(chunks)} 段重试…"
+            )
+            return _generate_narration_chunked(
+                chunks, voice, rate, pitch, audio_path, lang,
+            )
+        except Exception as fallback_exc:
+            print(f"[TTS] chunked 回退也失败: {fallback_exc}")
         raise RuntimeError(
             f"TTS 在 {len(_candidates) * _TTS_ATTEMPTS_PER_VOICE} 次尝试后仍失败: "
             f"{last_exc or 'unknown error'}. 文本预览: {text[:60]!r} "
             f"(sanitize 后长度 {len(text)} 字符)"
-        ) from last_exc
-        raise RuntimeError(
-            f"TTS 在 {len(_candidates) * _TTS_ATTEMPTS_PER_VOICE} 次尝试后仍失败: "
-            f"{last_exc or 'unknown error'}"
         ) from last_exc
     if lang == "zh":
         try:

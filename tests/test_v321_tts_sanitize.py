@@ -111,6 +111,19 @@ class SplitForChunkedTTSTests(unittest.TestCase):
         self.assertEqual(len(chunks), 1)
         self.assertEqual(chunks[0], "今天天气真好。")
 
+    def test_force_split_short_multi_sentence_text(self):
+        text = (
+            "没想到女鞋还能这样，真的是打开新世界了。"
+            "春夏时节，一双合适的鞋能让整个人状态都松弛自然起来。"
+            "百搭的设计不挑任何风格，通勤逛街约会都能轻松切换。"
+        )
+        chunks = _split_for_chunked_tts(
+            text, max_chars=80, force_split=True,
+        )
+        self.assertGreater(len(chunks), 1)
+        self.assertEqual("".join(chunks), text)
+        self.assertTrue(all(len(chunk) <= 80 for chunk in chunks))
+
     def test_long_text_split_by_period(self):
         text = "没有想到女鞋还能这样, 真的是打开新世界了。" * 20
         chunks = _split_for_chunked_tts(text, max_chars=80)
@@ -122,6 +135,38 @@ class SplitForChunkedTTSTests(unittest.TestCase):
         chunks = _split_for_chunked_tts("短句。短句。", max_chars=80)
         for c in chunks:
             self.assertGreaterEqual(len(c.strip()), 5)
+
+
+class GenerateNarrationRecoveryTests(unittest.TestCase):
+    """短文本整段失败后也必须进入强制拆句回退。"""
+
+    @patch("autokat.core.tts.prepare_pcm_and_calibrate")
+    @patch("autokat.core.tts._generate_narration_chunked")
+    @patch("autokat.core.tts._generate_tts_with_boundaries")
+    @patch("autokat.core.tts.time.sleep")
+    def test_short_text_uses_chunked_fallback_after_nine_failures(
+        self, _sleep, mock_generate, mock_chunked, _calibrate,
+    ):
+        mock_generate.side_effect = RuntimeError("No audio was received")
+        mock_chunked.return_value = {
+            "audio_path": "/tmp/recovered.mp3",
+            "total_duration": 12.0,
+            "sentences": [{"index": 0, "text": "恢复成功。", "start": 0, "end": 12}],
+        }
+        text = (
+            "没想到女鞋还能这样，真的是打开新世界了。"
+            "春夏时节，一双合适的鞋能让整个人状态都松弛自然起来。"
+            "百搭的设计不挑任何风格，通勤逛街约会都能轻松切换。"
+        )
+
+        result = generate_narration(
+            text, lang="zh", output_name="v321_short_recovery",
+        )
+
+        self.assertEqual(mock_generate.call_count, 9)
+        chunks = mock_chunked.call_args.args[0]
+        self.assertGreater(len(chunks), 1)
+        self.assertEqual(result["audio_path"], "/tmp/recovered.mp3")
 
 
 if __name__ == "__main__":

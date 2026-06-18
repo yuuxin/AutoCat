@@ -15,6 +15,7 @@
 import os
 import re
 import json
+import math
 
 
 # ── 按语速+语言+目标时长算预计文案字数 ──
@@ -123,6 +124,25 @@ def compute_model_target(
     model_min = max(system_min + 1, int(system_min / retention))
     model_max = int(system_max / retention)
     return model_min, model_max
+
+
+def compute_candidate_count(target_count: int) -> int:
+    """Return how many candidates to ask the model for before filtering.
+
+    The public API still returns ``target_count`` usable scripts at most. Extra
+    candidates are only a quality buffer, which lowers the chance that one bad
+    paragraph makes the whole AI generation feel failed.
+    """
+    target_count = max(0, int(target_count or 0))
+    if target_count <= 0:
+        return 0
+    if target_count == 1:
+        return 3
+    if target_count <= 5:
+        return target_count + 3
+    if target_count <= 20:
+        return target_count + max(3, math.ceil(target_count * 0.20))
+    return target_count + max(5, math.ceil(target_count * 0.15))
 
 def _provider_obj_to_str(provider_obj) -> str:
     """v3.19: 把 provider_obj (instance) 转回 provider 字符串,
@@ -269,7 +289,9 @@ def _build_prompt(topic: str, style: str,
             _dur_str = "30-60 秒"
         template_block = (
             f"围绕「{topic}」自由创作一段 {_dur_str} 的口播文案。\n"
-            f"不要使用任何占位符（如【】、{{}}、xx、XX），所有内容必须围绕 {topic} 写实。"
+            f"不要使用任何占位符（如【】、{{}}、xx、XX），所有内容必须围绕 {topic} 写实。\n"
+            f"未提供细节/卖点时: 不要编造材质、品牌、价格、型号、具体数据；"
+            f"可以写通用使用场景、轻量功能感受和非具体工艺质感。"
         )
 
     # ── 多样性约束：每条文案的开场句式 + 情绪角度必须不同 ──
@@ -775,6 +797,15 @@ def _clean_result(text: str, topic: str = None) -> str:
     if not text:
         return ""
     text = text.strip()
+    # 模型偶尔会把 prompt 末尾的内部能力示例一起续写进正文。
+    # 该内容不是文案，不能进入字幕或 TTS。
+    text = re.sub(
+        r'\s*[|｜]\s*用例\s*[:：].*$',
+        '',
+        text,
+        flags=re.DOTALL,
+    )
+    text = re.sub(r'\s*[（(]\s*结束\s*[）)]\s*$', '', text)
     # 0. 剥"先感叹/确认 → 再元描述"复合前缀 (如 "当然可以！以下是一段围绕XX的短视频带货文案：实际内容")
     #    v2.4: 用 re.match + 切片替代 re.sub, 绕开 Python regex 在多步回溯时静默不匹配的坑
     # v2.4: 用多条小正则逐个试, 绕开 Python regex 多步嵌套回溯时静默不匹配的坑
@@ -1017,6 +1048,148 @@ def _post_extend_if_short(
             break
 
     return best_text, best_count, model_calls
+
+
+def _build_compress_prompt(
+    text: str,
+    target_min: int,
+    target_max: int,
+    topic: str,
+) -> str:
+    """Prompt the model to shorten an overlong script without hard truncation."""
+    return (
+        f"你是一个短视频文案精修助手。下面文案太长, 请压缩成 {target_min}-{target_max} 字。\n"
+        f"\n"
+        f"【字数规则】\n"
+        f"- 字数 = 中文字 + 标点 + 字母 + 数字\n"
+        f"- 不计: 空格 / 换行 / hashtag / emoji / markdown / 方括号元描述\n"
+        f"\n"
+        f"【原文 ({_content_char_count(text)} 字)】\n"
+        f"```\n{text}\n```\n"
+        f"\n"
+        f"【要求】\n"
+        f"1. 保留主题: {topic}\n"
+        f"2. 保留口语化和行动感, 删除重复句、空话、过度形容\n"
+        f"3. 不要写前缀导语、解释、编号、#标签、emoji、markdown\n"
+        f"4. 只输出压缩后的完整文案\n"
+    )
+
+
+def _post_compress_if_long(
+    text: str,
+    target_min: int,
+    target_max: int,
+    topic: str,
+    provider_obj,
+    max_compress_attempts: int = 2,
+) -> tuple:
+    """Ask the model to compress overlong text instead of chopping it."""
+    if not text or not target_max:
+        return text, _content_char_count(text or ""), 0
+
+    best_text = text
+    best_count = _content_char_count(text)
+    model_calls = 0
+    for attempt_idx in range(1, max_compress_attempts + 1):
+        if best_count <= int(target_max * 1.15):
+            return best_text, best_count, model_calls
+
+        prompt = _build_compress_prompt(best_text, target_min, target_max, topic)
+        model_calls += 1
+        try:
+            raw = provider_obj.generate(prompt, max_tokens=512)
+        except Exception as _call_err:
+            print(f"[文案后处理] post-compress attempt {attempt_idx} 调用失败: {_call_err}")
+            return best_text, best_count, model_calls
+
+        cleaned = _clean_result(raw, topic=topic)
+        if not cleaned:
+            print(f"[文案后处理] post-compress attempt {attempt_idx} 清洗后为空, 停止")
+            return best_text, best_count, model_calls
+
+        new_count = _content_char_count(cleaned)
+        if target_min <= new_count <= int(target_max * 1.15):
+            print(
+                f"[文案后处理] post-compress attempt {attempt_idx}: "
+                f"{best_count} → {new_count} 字"
+            )
+            return cleaned, new_count, model_calls
+        if target_min and new_count < int(target_min * 0.85):
+            print(
+                f"[文案后处理] post-compress attempt {attempt_idx}: "
+                f"{new_count} 字过短, 不采纳"
+            )
+            return best_text, best_count, model_calls
+        if new_count < best_count:
+            best_text = cleaned
+            best_count = new_count
+            print(
+                f"[文案后处理] post-compress attempt {attempt_idx}: "
+                f"{_content_char_count(text)} → {new_count} 字, 继续校准"
+            )
+        else:
+            print(
+                f"[文案后处理] post-compress attempt {attempt_idx}: "
+                f"清洗后 {new_count} 字 ≥ 当前 {best_count} 字, 不采纳"
+            )
+            break
+
+    return best_text, best_count, model_calls
+
+
+def _repair_candidate_by_quality(
+    text: str,
+    quality: dict,
+    *,
+    topic: str,
+    lang: str,
+    target_chars_min: Optional[int],
+    target_chars_max: Optional[int],
+    detail: Optional[str],
+    features: Optional[str],
+    accepted_texts: Optional[list[str]],
+    provider_obj,
+) -> Optional[dict]:
+    """Try targeted repair for length-only candidate failures."""
+    if not text or not target_chars_min or not target_chars_max:
+        return None
+    reasons = quality.get("reasons") or []
+    if not any(("字数不足" in r or "字数超限" in r) for r in reasons):
+        return None
+
+    char_count = _content_char_count(text)
+    repaired = text
+    if char_count < int(target_chars_min * 0.85):
+        repaired, _, _ = _post_extend_if_short(
+            text=text, target_min=target_chars_min, target_max=target_chars_max,
+            topic=topic, provider_obj=provider_obj,
+        )
+    elif char_count > int(target_chars_max * 1.15):
+        repaired, _, _ = _post_compress_if_long(
+            text=text, target_min=target_chars_min, target_max=target_chars_max,
+            topic=topic, provider_obj=provider_obj,
+        )
+    else:
+        return None
+
+    if repaired == text:
+        return None
+    repaired_quality = validate_script_quality(
+        repaired, topic, lang=lang,
+        target_chars_min=target_chars_min,
+        target_chars_max=target_chars_max,
+        detail=detail, features=features,
+        accepted_texts=accepted_texts,
+        require_topic=lang == "zh",
+    )
+    if repaired_quality["valid"]:
+        return {
+            "text": repaired,
+            "source": type(provider_obj).__name__ + "_repaired",
+            "quality": repaired_quality,
+        }
+    print("[文案修复] 修复后仍不合格: " + "；".join(repaired_quality["reasons"]))
+    return None
 
 _META_REPLY_PATTERNS = (
     "请告诉我", "请提供", "需要更多信息", "需要您提供", "想要的主题",
@@ -1393,6 +1566,7 @@ def generate_script_by_topic_detailed(
     backends = [(backend_name, provider_obj.generate)]
 
     last_reasons = []
+    _last_cleaned_result = ""
 
     for backend_name, call_backend in backends:
         # v3.4.3: 记录之前 attempt 的输出, 重试时传给模型让它「扩写」而不是重写。
@@ -1473,13 +1647,8 @@ def generate_script_by_topic_detailed(
                 raw = None
                 print(f"[文案质量] {backend_name} 调用失败: {_call_err}")
             result = _clean_result(raw, topic=topic) if raw else ""
-            # 强制 trim 到字数范围 (本地模型经常无视 prompt 长度要求)
-            if result and (target_chars_min or target_chars_max):
-                result = _enforce_char_limit(
-                    result,
-                    min_chars=target_chars_min,
-                    max_chars=target_chars_max,
-                )
+            # 不在这里硬截断。过长文本交给 post-compress 模型压缩,
+            # 避免截到半句后又触发「字数不足」或语义残缺。
             # 早 fail: 首次输出严重偏离目标范围 (>1.5x 或 <0.5x)，模型明显
             # 没理解长度约束——不再浪费后续 retry，直接 break 让 fallback 兜底
             # v3.4.3: 保留 wildly_off 早 fail (模型完全跑偏, 重写也救不回来),
@@ -1572,6 +1741,46 @@ def generate_script_by_topic_detailed(
         except Exception as _post_err:
             # post-extend 自身出错 (不应阻断主 raise 路径)
             print(f"[文案后处理] post-extend 抛异常 (不影响 raise): {_post_err}")
+
+    if (
+        _last_cleaned_result
+        and target_chars_min
+        and target_chars_max
+        and _content_char_count(_last_cleaned_result) > int(target_chars_max * 1.15)
+    ):
+        try:
+            _post_text, _post_count, _post_attempts = _post_compress_if_long(
+                text=_last_cleaned_result,
+                target_min=target_chars_min,
+                target_max=target_chars_max,
+                topic=topic,
+                provider_obj=provider_obj,
+            )
+            if _post_text != _last_cleaned_result and _post_count <= int(target_chars_max * 1.15):
+                _post_quality = validate_script_quality(
+                    _post_text, topic, lang=lang,
+                    target_chars_min=target_chars_min,
+                    target_chars_max=target_chars_max,
+                    detail=detail, features=features,
+                    accepted_texts=accepted_texts,
+                )
+                if _post_quality["valid"]:
+                    print(
+                        f"[文案后处理] post-compress 救场成功 ({_post_attempts} 次), "
+                        f"最终 {_post_count} 字 (<= {target_chars_max} +15%)"
+                    )
+                    return {
+                        "text": _post_text,
+                        "source": backend_name,
+                        "quality": _post_quality,
+                    }
+                else:
+                    print(
+                        f"[文案后处理] post-compress 救场后仍不合格: "
+                        + "；".join(_post_quality["reasons"])
+                    )
+        except Exception as _post_err:
+            print(f"[文案后处理] post-compress 抛异常 (不影响 raise): {_post_err}")
 
     # v3.2: 移除 build_safe_script 兜底 (用户报告: 兜底模板「无意义」)。
     # AI 重试耗尽后, 直接 raise 清晰错误, 异常路径直达 UI 日志, 用户看到后
@@ -1701,17 +1910,19 @@ def _generate_one_batch(
     material_capabilities: Optional[str] = None,
     accepted_texts: Optional[list] = None,
     max_attempts: int = 2,
+    candidate_count: Optional[int] = None,
 ) -> list:
-    """v3.19: 1 批 model 调用, 生成 ≤20 条文案. 失败条数走 single-call fallback."""
+    """v3.19: 1 批 model 调用, 生成候选并筛出 count 条合格文案."""
     if accepted_texts is None:
         accepted_texts = []
     if count <= 0:
         return []
+    candidate_count = max(count, int(candidate_count or count))
 
     backend_name = type(provider_obj).__name__
 
     batch_prompt = _build_batch_prompt(
-        topic=topic, style=style, count=count, start_index=start_index,
+        topic=topic, style=style, count=candidate_count, start_index=start_index,
         target_chars_min=target_chars_min, target_chars_max=target_chars_max,
         retention=retention, extra_instruction=extra_instruction,
         lang=lang, detail=detail, features=features,
@@ -1722,7 +1933,7 @@ def _generate_one_batch(
     if material_capabilities:
         batch_prompt += _format_capability_summary_prompt(material_capabilities)
 
-    _max_tokens = max(2048, min(8192, count * 400))
+    _max_tokens = max(2048, min(8192, candidate_count * 400))
     if "DeepSeek" in backend_name and _max_tokens < 4096:
         _max_tokens = 4096
 
@@ -1764,7 +1975,7 @@ def _generate_one_batch(
             results.append(single)
         return results
 
-    parsed = _parse_batch_output(raw, expected_count=count)
+    parsed = _parse_batch_output(raw, expected_count=candidate_count)
 
     results = []
     fallback_indices = []
@@ -1783,18 +1994,35 @@ def _generate_one_batch(
                 "text": cleaned,
                 "source": backend_name + "_batch",
                 "quality": quality,
-                "batch_idx": start_index + i,
+                "batch_idx": start_index + len(results),
             })
+            if len(results) >= count:
+                break
         else:
             fallback_indices.append((i, cleaned, quality))
 
-    if fallback_indices:
+    if len(results) < count and fallback_indices:
         print(
             f"[文案批量] batch 解析 {len(parsed)} 条, 其中 {len(fallback_indices)} 条不合格, "
-            f"走 single-call fallback"
+            f"先修复, 不足再走 single-call fallback"
         )
         for i, cleaned, q in fallback_indices:
+            if len(results) >= count:
+                break
             _existing_texts = [r["text"] for r in results]
+            repaired = _repair_candidate_by_quality(
+                cleaned, q,
+                topic=topic, lang=lang,
+                target_chars_min=target_chars_min,
+                target_chars_max=target_chars_max,
+                detail=detail, features=features,
+                accepted_texts=accepted_texts + _existing_texts,
+                provider_obj=provider_obj,
+            )
+            if repaired:
+                repaired["batch_idx"] = start_index + len(results)
+                results.append(repaired)
+                continue
             try:
                 single = generate_script_by_topic_detailed(
                     topic=topic, style=style, detail=detail, features=features,
@@ -1810,23 +2038,15 @@ def _generate_one_batch(
                     video_type=video_type,
                     material_capabilities=material_capabilities,
                 )
-                single["batch_idx"] = start_index + i
+                single["batch_idx"] = start_index + len(results)
             except Exception as _fb_err:
                 print(f"[文案批量] single-call fallback 也失败 (idx={i}): {_fb_err}")
-                single = {
-                    "text": cleaned,
-                    "source": backend_name + "_batch_failed",
-                    "quality": q,
-                    "batch_idx": start_index + i,
-                }
-            while len(results) <= i:
-                results.append(single)
-            else:
-                results[i] = single
+                continue
+            results.append(single)
 
     if len(results) < count:
         print(
-            f"[文案批量] model 只输出 {len(results)} 条 (期望 {count}), "
+            f"[文案批量] 合格文案 {len(results)} 条 (期望 {count}), "
             f"缺少的 {count - len(results)} 条走 single-call fallback"
         )
         _existing_texts = [r["text"] for r in results]
@@ -1884,6 +2104,9 @@ def generate_scripts_batch(
         return []
     if max_batch_size <= 0:
         max_batch_size = _BATCH_SCRIPT_MAX
+    if provider_obj is None:
+        from autokat.core.ai_providers import build_writer_provider
+        provider_obj = build_writer_provider("local")
 
     batches = []
     for batch_start in range(0, count, max_batch_size):
@@ -1893,10 +2116,13 @@ def generate_scripts_batch(
     results = []
     for batch_idx, (batch_start, batch_size) in enumerate(batches):
         if progress_callback:
+            candidate_count = compute_candidate_count(batch_size)
             progress_callback(
                 "batch_start", batch_idx, len(batches),
-                f"批次 {batch_idx + 1}/{len(batches)}: 1 次调用生成 {batch_size} 条"
+                f"批次 {batch_idx + 1}/{len(batches)}: 生成 {candidate_count} 条候选, 筛选 {batch_size} 条"
             )
+        else:
+            candidate_count = compute_candidate_count(batch_size)
         batch_results = _generate_one_batch(
             topic=topic, style=style, count=batch_size, start_index=batch_start,
             target_chars_min=target_chars_min, target_chars_max=target_chars_max,
@@ -1908,6 +2134,7 @@ def generate_scripts_batch(
             video_type=video_type,
             material_capabilities=material_capabilities,
             accepted_texts=[r["text"] for r in results],
+            candidate_count=candidate_count,
         )
         results.extend(batch_results)
         if progress_callback:

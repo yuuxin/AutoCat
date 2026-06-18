@@ -3,26 +3,55 @@
 import sqlite3
 import json
 import shutil
+import threading
+import time
 from pathlib import Path
 from datetime import datetime
-from typing import Optional
+from typing import Callable, Optional, TypeVar
 
 from autokat.core.paths import TASKS_ROOT
 
 DB_DIR = TASKS_ROOT
 DB_PATH = DB_DIR / "autokat.db"
 SCHEMA_VERSION = 3
+_WRITE_LOCK = threading.RLock()
+_T = TypeVar("_T")
 
 
 def get_conn() -> sqlite3.Connection:
     DB_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    # 修: WAL 模式下并发写仍会锁, busy_timeout 让 SQLite 等 5s 而不是 OperationalError
-    conn.execute("PRAGMA busy_timeout=5000")
+    # journal_mode 是数据库级设置，不能在每个渲染线程的新连接上重复切换。
+    # 重复 PRAGMA journal_mode=WAL 本身需要锁，而且旧代码在 busy_timeout 前执行，
+    # 多线程渲染时可能直接抛出 "database is locked"。
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
+
+def run_write_transaction(operation: Callable[[sqlite3.Connection], _T],
+                          attempts: int = 6) -> _T:
+    """Serialize local writes and retry transient SQLite lock contention."""
+    last_error = None
+    for attempt in range(max(1, attempts)):
+        with _WRITE_LOCK:
+            conn = get_conn()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                result = operation(conn)
+                conn.commit()
+                return result
+            except sqlite3.OperationalError as exc:
+                conn.rollback()
+                if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                    raise
+                last_error = exc
+            finally:
+                conn.close()
+        if attempt + 1 < attempts:
+            time.sleep(min(2.0, 0.1 * (2 ** attempt)))
+    raise last_error or sqlite3.OperationalError("database write failed")
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -282,6 +311,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
 
 def init_db():
     conn = get_conn()
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS materials (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -650,16 +680,15 @@ def get_latest_task(limit_seconds: int = 60) -> Optional[dict]:
     return dict(row) if row else None
 
 def update_task_status(task_id: int, status: str, done: Optional[int] = None):
-    conn = get_conn()
-    if done is not None:
-        conn.execute(
-            "UPDATE tasks SET status=?, done=? WHERE id=?",
-            (status, done, task_id)
-        )
-    else:
-        conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, task_id))
-    conn.commit()
-    conn.close()
+    def _write(conn):
+        if done is not None:
+            conn.execute(
+                "UPDATE tasks SET status=?, done=? WHERE id=?",
+                (status, done, task_id)
+            )
+        else:
+            conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, task_id))
+    run_write_transaction(_write)
 
 
 def prepare_task_retry(task_id: int) -> int:
@@ -731,7 +760,6 @@ def add_clip(task_id: int, idx: int, script_path: str) -> int:
 def update_clip_status(clip_id: int, status: str, output_path: Optional[str] = None,
                        error_msg: Optional[str] = None,
                        duration: Optional[float] = None):
-    conn = get_conn()
     fields = {"status": status}
     if output_path:
         fields["output_path"] = output_path
@@ -740,12 +768,12 @@ def update_clip_status(clip_id: int, status: str, output_path: Optional[str] = N
     if duration is not None:
         fields["duration_seconds"] = float(duration)
     set_clause = ", ".join(f"{k}=?" for k in fields)
-    conn.execute(
-        f"UPDATE clips SET {set_clause} WHERE id=?",
-        (*fields.values(), clip_id)
+    run_write_transaction(
+        lambda conn: conn.execute(
+            f"UPDATE clips SET {set_clause} WHERE id=?",
+            (*fields.values(), clip_id)
+        )
     )
-    conn.commit()
-    conn.close()
 
 
 def get_pending_clips(task_id: int) -> list:
@@ -764,13 +792,13 @@ def update_clip_progress(clip_id: int, detail: str):
     调用方：renderer 在切分片段 / xfade / 最终合成等阶段写一句中文文案。
     UI 端每 2 秒轮询一次，从 DB 读出来显示，避免阻塞主线程。
     """
-    conn = get_conn()
-    conn.execute(
-        "UPDATE clips SET progress_detail=?, progress_at=datetime('now','localtime') WHERE id=?",
-        (detail, clip_id)
+    run_write_transaction(
+        lambda conn: conn.execute(
+            "UPDATE clips SET progress_detail=?, "
+            "progress_at=datetime('now','localtime') WHERE id=?",
+            (detail, clip_id)
+        )
     )
-    conn.commit()
-    conn.close()
 
 
 def get_rendering_clips(task_id: int) -> list:
