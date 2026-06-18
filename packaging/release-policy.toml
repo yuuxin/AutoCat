@@ -1,0 +1,97 @@
+# AutoCat macOS 发布策略的机器可读摘要。
+# 详细要求以 docs/MACOS_PACKAGING_STANDARD.md 为准。
+
+schema_version = 1
+policy_version = "1.0"
+status = "approved-not-implemented"
+
+[product]
+name = "AutoCat"
+bundle_identifier = "com.autokat.app"
+version_source = "pyproject.toml:project.version"
+
+[compatibility]
+minimum_macos = "13.3"
+architectures = ["arm64", "x86_64"]
+universal2_enabled = false
+requires_admin = false
+requires_network_to_launch = false
+external_runtime_allowed = false
+
+[artifacts]
+formats = ["dmg"]
+arm64_name = "AutoCat-{version}-macOS-arm64.dmg"
+x86_64_name = "AutoCat-{version}-macOS-x86_64.dmg"
+required_companions = [
+  "SHA256SUMS",
+  "build-manifest.json",
+  "sbom.cdx.json",
+  "THIRD_PARTY_LICENSES.txt",
+  "test-report.json",
+]
+
+[runtime]
+python_series = "3.12"
+python_exact_patch_required = true
+python_source = "approved-redistributable-artifact"
+packager = "pyinstaller"
+packager_mode = "onedir"
+packager_exact_version_required = true
+system_python_fallback_allowed = false
+homebrew_runtime_allowed = false
+
+[dependency_baseline]
+pyside6_series = "6.8"
+onnxruntime_max_for_broad_compatibility = "1.23.2"
+per_architecture_lockfiles_required = true
+hashes_required = true
+upgrade_requires_compatibility_review = true
+
+[paths]
+application_support = "~/Library/Application Support/AutoCat"
+caches = "~/Library/Caches/AutoCat"
+logs = "~/Library/Logs/AutoCat"
+app_bundle_is_read_only = true
+
+[native_audit]
+maximum_macos_deployment_target = "13.3"
+forbidden_absolute_prefixes = [
+  "/opt/homebrew",
+  "/usr/local",
+  "/Users/",
+]
+allowed_dependency_prefixes = [
+  "@rpath",
+  "@loader_path",
+  "@executable_path",
+  "/System/Library/",
+  "/usr/lib/",
+]
+reject_mixed_or_wrong_architecture = true
+reject_missing_dynamic_library = true
+
+[security]
+developer_id_required = true
+hardened_runtime_required = true
+apple_notarization_required = true
+staple_required = true
+ad_hoc_signature_for_release_allowed = false
+secrets_in_repository_allowed = false
+
+[quality_gates]
+source_tests_required = true
+packaged_runtime_tests_required = true
+clean_machine_tests_required = true
+sqlite_read_write_required = true
+onnx_inference_required = true
+ffmpeg_render_required = true
+finder_launch_required = true
+offline_launch_required = true
+unicode_and_space_paths_required = true
+
+[gitlab]
+arm64_runner_tag = "macos-13-arm64"
+x86_64_runner_tag = "macos-13-x86_64"
+release_from_protected_tag_only = true
+release_tag_pattern = "vMAJOR.MINOR.PATCH"
+publish_only_after_all_gates = true
