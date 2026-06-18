@@ -29,6 +29,54 @@ MINIMUM_MACOS_VERSION = "15.0"
 # 当前策略: Apple Silicon 单架构 + macOS 14+. Intel Mac 用户走 Rosetta 2 转译.
 # 如未来需要恢复 x86_64, 在此列表中加回 "x86_64" 并在 _ffmpeg_candidates_for_arch 加分支.
 SUPPORTED_ARCHS = ("arm64",)
+
+# 嵌入 .app 的 site-packages 白名单 (模块级, 让 tarball helper 也能用到)
+CORE_PKGS = {
+        "PySide6", "PySide6_Addons", "PySide6_Essentials",
+        "shiboken6",
+        "PIL", "Pillow.libs",
+        "numpy", "numpy.libs",
+        "tqdm",
+        "edge_tts",
+        "imagehash",
+        "soundfile",
+        "_soundfile", "_soundfile_data",
+        "pydub",
+        "PyWavelets",
+        "scipy",
+        "librosa",
+        "soxr",
+        "numba",
+        "llvmlite",
+        "joblib",
+        "msgpack",
+        "sklearn",
+        "threadpoolctl",
+        "narwhals",
+        "aifc",
+        "sunau",
+        "chunk",
+        "audioop",
+        "lazy_loader",
+        "audioread",
+        "decorator",
+        "pooch",
+        "platformdirs",
+        "packaging",
+        "typing_extensions",
+        "certifi",
+        "idna",
+        "aiohttp", "aiohappyeyeballs", "aiosignal",
+        "attrs",
+        "attr",
+        "frozenlist", "multidict", "propcache", "yarl",
+        "cffi", "pycparser",
+        "_cffi_backend",
+        "tabulate",
+        "onnxruntime",
+        "requests", "urllib3", "charset_normalizer",
+}
+
 TARGET_ARCH = "auto"  # 由 __main__ 通过 --arch 覆盖
 
 
@@ -201,73 +249,11 @@ def _embed_code(resources_dir: Path, site_packages: str, py_ver: str):
 
     # ── 复制 Python 依赖（白名单，排除大包） ──
     print(f"   复制 Python 依赖包...")
-    CORE_PKGS = {
-        "PySide6", "PySide6_Addons", "PySide6_Essentials",
-        "shiboken6",
-        "PIL", "Pillow.libs",
-        "numpy", "numpy.libs",
-        "tqdm",
-        "edge_tts",
-        "imagehash",
-        "soundfile",
-        "_soundfile", "_soundfile_data",
-        "pydub",
-        "PyWavelets",
-        "scipy",
-        "librosa",
-        "soxr",
-        "numba",
-        "llvmlite",
-        "joblib",
-        "msgpack",
-        "sklearn",
-        "threadpoolctl",
-        "narwhals",
-        "aifc",
-        "sunau",
-        "chunk",
-        "audioop",
-        "lazy_loader",
-        "audioread",
-        "decorator",
-        "pooch",
-        "platformdirs",
-        "packaging",
-        "typing_extensions",
-        "certifi",
-        "idna",
-        "aiohttp", "aiohappyeyeballs", "aiosignal",
-        "attrs",
-        "attr",
-        "frozenlist", "multidict", "propcache", "yarl",
-        "cffi", "pycparser",
-        "_cffi_backend",
-        "tabulate",
-        "onnxruntime",
-        "requests", "urllib3", "charset_normalizer",
-    }
-    # 之前逐包 shutil.copytree 在 1.5G site-packages 上跑 10+ 分钟.
-    # 改用 rsync 一次性拷贝, 排除 __pycache__/tests 等, 1.5G 几秒搞定.
+    # 之前 rsync + copytree 都会卡 (1.5G site-packages + Cellar Python 3.14 symlink 套套套).
+    # 改用 tarball: 启动时一次性 tar, build 时直接 tar -xf. 跟 framework 一样的策略.
     src_site = Path(site_packages)
-    rsync_args = ["rsync", "-a", "--exclude=__pycache__", "--exclude=*.pyc",
-                  "--exclude=test", "--exclude=tests",
-                  "--exclude=autokat.egg-info",
-                  f"{src_site}/", f"{lib_dst}/"]
-    for pkg_name in sorted(CORE_PKGS):
-        rsync_args.insert(4, f"--include={pkg_name}")
-        rsync_args.insert(4, f"--include={pkg_name}.*")
-    # rsync include 必须以 */ 收尾的 --exclude='*' 防止其他包被拷.
-    # 用 --include=PATTERN + --exclude=* 组合: 任何名字匹配 include 才拷.
-    rsync_args = ["rsync", "-a",
-                  "--exclude=__pycache__", "--exclude=*.pyc",
-                  "--exclude=test", "--exclude=tests",
-                  "--exclude=autokat.egg-info"]
-    for pkg_name in sorted(CORE_PKGS):
-        rsync_args.append(f"--include={pkg_name}")
-    rsync_args.append("--include=*/")
-    rsync_args.append("--exclude=*")
-    rsync_args.extend([f"{src_site}/", f"{lib_dst}/"])
-    subprocess.run(rsync_args, check=True, capture_output=True)
+    tarball = _stage_site_packages_tarball(site_packages)
+    _extract_site_packages_tarball(tarball, lib_dst)
 
     # ── 复制 Python 解释器 ──
     print(f"   复制 Python 解释器...")
@@ -494,6 +480,57 @@ def _build_dmg(app_dir: Path):
         raise RuntimeError(f"DMG 创建失败: {err}") from e
     finally:
         shutil.rmtree(dmg_dir, ignore_errors=True)
+
+
+# site-packages 缓存: 用 staging + tar.gz 避开 rsync 1万+ 小文件卡死
+SITE_PACKAGES_TARBALL = Path("/tmp/autokat_sitepackages.tar.gz")
+
+
+def _stage_site_packages_tarball(site_packages: str) -> Path:
+    """白名单打包 site-packages 到 tar.gz. 排除 __pycache__/tests/egg-info."""
+    src_site = Path(site_packages)
+    if SITE_PACKAGES_TARBALL.exists():
+        try:
+            src_mtime = src_site.stat().st_mtime
+            if src_mtime <= SITE_PACKAGES_TARBALL.stat().st_mtime:
+                print(f"      复用缓存: {SITE_PACKAGES_TARBALL} ({SITE_PACKAGES_TARBALL.stat().st_size // 1024 // 1024} MB)")
+                return SITE_PACKAGES_TARBALL
+        except OSError:
+            pass
+    staging = Path("/tmp/autokat_sitepackages_staging")
+    if staging.exists():
+        shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True)
+    for pkg_name in sorted(CORE_PKGS):
+        src = src_site / pkg_name
+        if src.exists() and src.is_dir():
+            dst = staging / pkg_name
+            # cp -R 在 macOS 上对符号链接默认 resolve, 不会像 rsync 那样在 Cellar Python 3.14 的
+            # 套套套 symlink 上卡住
+            subprocess.run(
+                ["cp", "-R", f"{src}/", f"{dst}/"],
+                check=True, capture_output=True,
+            )
+        else:
+            src_py = src_site / f"{pkg_name}.py"
+            if src_py.exists():
+                shutil.copy2(str(src_py), str(staging / f"{pkg_name}.py"))
+    print(f"      打包 site-packages 白名单到 {SITE_PACKAGES_TARBALL}...")
+    subprocess.run(
+        ["tar", "-czf", str(SITE_PACKAGES_TARBALL), "-C", str(staging), "."],
+        check=True, capture_output=True,
+    )
+    shutil.rmtree(staging, ignore_errors=True)
+    print(f"      ✅ tarball 大小: {SITE_PACKAGES_TARBALL.stat().st_size // 1024 // 1024} MB")
+    return SITE_PACKAGES_TARBALL
+
+
+def _extract_site_packages_tarball(tarball: Path, dst: Path) -> None:
+    dst.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["tar", "-xzf", str(tarball), "-C", str(dst)],
+        check=True, capture_output=True,
+    )
 
 
 # framework 缓存: 启动时一次性打成 tar.bz2, 之后 build 用 tar 提取.
@@ -768,3 +805,52 @@ if __name__ == "__main__":
     args = parser.parse_args()
     TARGET_ARCH = args.arch
     build_app(create_dmg=args.dmg)
+# site-packages 缓存: 同样用 tarball 策略
+SITE_PACKAGES_TARBALL = Path("/tmp/autokat_sitepackages.tar.gz")
+
+
+def _stage_site_packages_tarball(site_packages: str) -> Path:
+    """把 site-packages 白名单包打成 tar.gz 缓存. 跳过 __pycache__/tests/autokat.egg-info."""
+    src_site = Path(site_packages)
+    if SITE_PACKAGES_TARBALL.exists():
+        # 缓存未过期直接复用
+        src_mtime = src_site.stat().st_mtime
+        if src_mtime <= SITE_PACKAGES_TARBALL.stat().st_mtime:
+            print(f"      复用缓存: {SITE_PACKAGES_TARBALL} ({SITE_PACKAGES_TARBALL.stat().st_size // 1024 // 1024} MB)")
+            return SITE_PACKAGES_TARBALL
+    # 在 /tmp 临时目录里建白名单 symlink, 然后 tar 整个目录
+    # tar 没有 --include-from 列表功能, 用临时白名单目录最干净
+    staging = Path("/tmp/autokat_sitepackages_staging")
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True)
+    for pkg_name in sorted(CORE_PKGS):
+        for src in (src_site / pkg_name, src_site / f"{pkg_name}.py"):
+            if src.exists():
+                if src.is_dir():
+                    # 用 cp -R + 排除 __pycache__ 走 staging
+                    subprocess.run(
+                        ["rsync", "-a", "--exclude=__pycache__", "--exclude=*.pyc",
+                         "--exclude=test", "--exclude=tests",
+                         f"{src}/", f"{staging}/{pkg_name}/"],
+                        check=True, capture_output=True,
+                    )
+                else:
+                    subprocess.run(["cp", str(src), str(staging / src.name)], check=True)
+    # 打包
+    print(f"      打包 site-packages 白名单到 {SITE_PACKAGES_TARBALL}...")
+    subprocess.run(
+        ["tar", "-czf", str(SITE_PACKAGES_TARBALL), "-C", str(staging), "."],
+        check=True, capture_output=True,
+    )
+    shutil.rmtree(staging, ignore_errors=True)
+    print(f"      ✅ tarball 大小: {SITE_PACKAGES_TARBALL.stat().st_size // 1024 // 1024} MB")
+    return SITE_PACKAGES_TARBALL
+
+
+def _extract_site_packages_tarball(tarball: Path, dst: Path) -> None:
+    dst.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["tar", "-xzf", str(tarball), "-C", str(dst)],
+        check=True, capture_output=True,
+    )
