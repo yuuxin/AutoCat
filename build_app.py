@@ -12,6 +12,7 @@ import os
 import sys
 import shutil
 import subprocess
+import argparse
 import stat
 import json
 import platform
@@ -22,11 +23,19 @@ APP_VERSION = "3.0.1"
 PROJECT_DIR = Path(__file__).resolve().parent
 VENV_DIR = PROJECT_DIR / ".venv"
 DIST_DIR = PROJECT_DIR / "dist"
+# 方案 B (双架构 DMG) 配套: 同一脚本在 arm64 主机和 x86_64 主机/VM 上各跑一遍
+MINIMUM_MACOS_VERSION = "14.0"
+# 当前策略: Apple Silicon 单架构 + macOS 14+. Intel Mac 用户走 Rosetta 2 转译.
+# 如未来需要恢复 x86_64, 在此列表中加回 "x86_64" 并在 _ffmpeg_candidates_for_arch 加分支.
+SUPPORTED_ARCHS = ("arm64",)
+TARGET_ARCH = "auto"  # 由 __main__ 通过 --arch 覆盖
 
 
 def build_app(create_dmg: bool = False):
+    global TARGET_ARCH
+    TARGET_ARCH = _resolve_target_arch(TARGET_ARCH)
     print("=" * 60)
-    print(f"AutoCat v{APP_VERSION} macOS 安装包构建")
+    print(f"AutoCat v{APP_VERSION} macOS 安装包构建 (arch={TARGET_ARCH}, min={MINIMUM_MACOS_VERSION})")
     print("=" * 60)
 
     if not VENV_DIR.exists():
@@ -34,7 +43,7 @@ def build_app(create_dmg: bool = False):
         print("请先运行: python3 -m venv .venv && source .venv/bin/activate && pip install -e .")
         sys.exit(1)
 
-    _require_apple_silicon()
+    _require_target_arch(TARGET_ARCH)
 
     # 获取 site-packages 路径
     result = subprocess.run(
@@ -117,7 +126,7 @@ def _create_info_plist(contents_dir: Path):
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>LSMinimumSystemVersion</key>
-    <string>12.0</string>
+    <string>{MINIMUM_MACOS_VERSION}</string>
     <key>NSHumanReadableCopyright</key>
     <string>MIT License</string>
 </dict>
@@ -275,12 +284,7 @@ def _embed_code(resources_dir: Path, site_packages: str, py_ver: str):
     
     # ── 复制 FFmpeg ──
     print(f"   复制 FFmpeg...")
-    ffmpeg_candidates = [
-        "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg",
-        "/opt/homebrew/bin/ffmpeg",
-        "/usr/local/bin/ffmpeg",
-        "/usr/bin/ffmpeg",
-    ]
+    ffmpeg_candidates = _ffmpeg_candidates_for_arch(TARGET_ARCH)
     ffmpeg_dst = resources_dir / "ffmpeg"
     ffprobe_dst = resources_dir / "ffprobe"
     for src in ffmpeg_candidates:
@@ -449,7 +453,8 @@ print(f"PCM/VAD + MobileCLIP 校准通过: {intervals[0]}")
 
 def _build_dmg(app_dir: Path):
     print(f"\n[DMG] 创建磁盘映像...")
-    dmg_path = DIST_DIR / f"{APP_NAME}-{APP_VERSION}.dmg"
+    dmg_name = f"{APP_NAME}-{APP_VERSION}-macOS-{TARGET_ARCH}.dmg"
+    dmg_path = DIST_DIR / dmg_name
     dmg_dir = "/tmp/autokat_dmg_build"
 
     if os.path.exists(dmg_dir):
@@ -476,7 +481,7 @@ def _build_dmg(app_dir: Path):
         ], check=True, capture_output=True, timeout=600)
 
         actual = dmg_path.stat().st_size / 1024 / 1024
-        print(f"\n✅ .dmg 构建完成：{dmg_path} ({actual:.0f} MB)")
+        print(f"\n✅ .dmg 构建完成: {dmg_path} ({actual:.0f} MB, arch={TARGET_ARCH})")
         print(f"   用户操作：双击 .dmg → 拖拽 AutoCat.app 到 Applications")
 
     except subprocess.CalledProcessError as e:
@@ -602,24 +607,93 @@ def _bundle_macho_dependencies(binaries: list[Path], destination: Path):
 
 
 def _require_apple_silicon():
-    """拒绝从非 Apple Silicon 环境生成错误架构的安装包。"""
-    if platform.machine() != "arm64":
-        raise RuntimeError(f"当前构建机架构为 {platform.machine()}，必须使用 arm64 构建 Apple Silicon 安装包")
+    """旧 API 保留: 转发到 _require_target_arch 以防外部调用."""
+    _require_target_arch("arm64")
+
+
+def _resolve_target_arch(target: str) -> str:
+    """解析 --arch: auto=主机架构, 否则必须受支持."""
+    host = platform.machine()
+    if target == "auto":
+        if host not in SUPPORTED_ARCHS:
+            raise RuntimeError(
+                f"无法识别主机架构 {host}, 请显式传入 --arch {{{', '.join(SUPPORTED_ARCHS)}}}"
+            )
+        return host
+    if target not in SUPPORTED_ARCHS:
+        raise RuntimeError(
+            f"不支持的架构: {target}, 仅支持 {', '.join(SUPPORTED_ARCHS)} 或 auto"
+        )
+    return target
+
+
+def _require_target_arch(target_arch: str) -> None:
+    """校验主机、venv Python、Homebrew FFmpeg 都匹配目标架构.
+
+    方案 B 不交叉编译: 主机 == 目标架构.
+    跨架构构建由 CI 上的 x86_64 Runner / 开发者 UTM x86_64 虚拟机承担.
+    """
+    host = platform.machine()
+    if host != target_arch:
+        raise RuntimeError(
+            f"当前主机架构 {host} != 目标 {target_arch}。"
+            f"AutoCat 不在打包阶段做交叉编译，请在 {target_arch} 主机/Runner 上构建。"
+        )
 
     python_bin = VENV_DIR / "bin" / "python3"
-    result = subprocess.run(["file", str(python_bin)], capture_output=True, text=True, check=True)
-    if "arm64" not in result.stdout:
-        raise RuntimeError(f"虚拟环境 Python 不是 arm64: {result.stdout.strip()}")
+    result = subprocess.run(
+        ["file", str(python_bin)], capture_output=True, text=True, check=True,
+    )
+    if target_arch not in result.stdout:
+        raise RuntimeError(
+            f"虚拟环境 Python 不是 {target_arch}: {result.stdout.strip()}"
+        )
 
-    ffmpeg = Path("/opt/homebrew/bin/ffmpeg")
-    if ffmpeg.exists():
-        result = subprocess.run(["file", str(ffmpeg)], capture_output=True, text=True, check=True)
-        if "arm64" not in result.stdout:
-            raise RuntimeError(f"FFmpeg 不是 arm64: {result.stdout.strip()}")
+    for candidate in _ffmpeg_candidates_for_arch(target_arch):
+        candidate_path = Path(candidate)
+        if not candidate_path.exists():
+            continue
+        # /usr/bin/ffmpeg 是 Apple 系统自带的 universal2, 任意架构都通过
+        if str(candidate_path) == "/usr/bin/ffmpeg":
+            continue
+        result = subprocess.run(
+            ["file", str(candidate_path)], capture_output=True, text=True, check=True,
+        )
+        if target_arch not in result.stdout:
+            raise RuntimeError(
+                f"FFmpeg 候选 {candidate_path} 不是 {target_arch}: {result.stdout.strip()}"
+            )
 
-    print("✅ Apple Silicon 架构检查通过 (arm64)")
+    print(f"✅ 目标架构检查通过 ({target_arch})")
+
+
+def _ffmpeg_candidates_for_arch(target_arch: str) -> list[str]:
+    """按目标架构返回 Homebrew FFmpeg 候选路径.
+
+    Apple Silicon 走 /opt/homebrew, /usr/bin/ffmpeg 是 Apple 系统 universal2 兜底.
+    """
+    del target_arch  # 当前策略只支持 arm64
+    return [
+        "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg",
+        "/opt/homebrew/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+        "/usr/bin/ffmpeg",
+    ]
 
 
 if __name__ == "__main__":
-    create_dmg = "--dmg" in sys.argv
-    build_app(create_dmg=create_dmg)
+    parser = argparse.ArgumentParser(
+        description="AutoCat macOS 安装包构建 (macOS 14+, arm64 / x86_64)",
+    )
+    parser.add_argument(
+        "--dmg", action="store_true",
+        help="构建完成后额外打包 .dmg",
+    )
+    parser.add_argument(
+        "--arch", default="auto",
+        choices=("auto",) + SUPPORTED_ARCHS,
+        help="目标 CPU 架构, 默认 auto=主机架构",
+    )
+    args = parser.parse_args()
+    TARGET_ARCH = args.arch
+    build_app(create_dmg=args.dmg)

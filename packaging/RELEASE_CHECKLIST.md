@@ -1,4 +1,4 @@
-# AutoCat macOS 发布检查表
+# AutoCat macOS 发布检查表 (Apple Silicon + macOS 14+)
 
 该清单用于每次正式版本发布。任何标记为“必须”的项目未完成时，不得上传用户安装包。
 
@@ -11,7 +11,6 @@
 - [ ] 发布日期：
 - [ ] 最低 macOS：
 - [ ] arm64 Runner：
-- [ ] x86_64 Runner：
 
 ## 1. 源码与版本
 
@@ -41,7 +40,7 @@
 - [ ] 完整端到端测试通过。
 - [ ] 测试报告已保存为发布制品。
 
-## 4. arm64 安装包
+## 4. arm64 安装包 (Apple Silicon)
 
 - [ ] 在 `macos-13-arm64` 干净 Runner 构建。
 - [ ] 只包含 arm64 或明确批准的通用资源。
@@ -53,7 +52,14 @@
 - [ ] 包内 FFmpeg/FFprobe 可执行并完成短视频渲染。
 - [ ] Finder 启动、Terminal 启动和二次启动均正常。
 
-## 5. x86_64 安装包
+## 5. Intel Mac 用户 (Rosetta 2 转译)
+
+不再单独打 x86_64 安装包. Apple Silicon 上构建的 .app 在 Intel Mac 上由 macOS 自动走 Rosetta 2.
+
+- [ ] 在 Intel Mac (macOS 14+) 上双击 .app, 系统提示"为打开此应用需要 Rosetta"时点击"好"
+- [ ] Rosetta 2 已装 (intel mac 第一次会弹窗, 用户安装即可)
+- [ ] 转译后应用启动正常, 核心功能 (AI 文案 / TTS / 渲染) 可用
+- [ ] README 与发布说明明确写"Intel Mac 需要 macOS 14+ 和 Rosetta 2"
 
 - [ ] 在 `macos-13-x86_64` 干净 Runner 构建。
 - [ ] 只包含 x86_64 或明确批准的通用资源。
@@ -65,12 +71,12 @@
 - [ ] 包内 FFmpeg/FFprobe 可执行并完成短视频渲染。
 - [ ] Finder 启动、Terminal 启动和二次启动均正常。
 
-## 6. 常规用户环境
+## 6. 常规用户环境 (arm64 干净机器 + Intel Rosetta 兜底)
 
-- [ ] 无 Homebrew、无额外 Python 的最低系统 arm64 机器通过。
-- [ ] 无 Homebrew、无额外 Python 的最低系统 x86_64 机器通过。
+- [ ] 无 Homebrew、无额外 Python 的 macOS 14.x arm64 机器通过。
+- [ ] 无 Homebrew、无额外 Python 的 macOS 15.x arm64 机器通过。
 - [ ] 当前稳定 macOS arm64 机器通过。
-- [ ] 当前可用 Intel macOS 机器通过。
+- [ ] Intel Mac (macOS 14+) 通过 Rosetta 2 转译可正常启动与运行。
 - [ ] 已安装 Homebrew/Python/Conda 的机器通过，且没有加载外部运行时。
 - [ ] 普通用户、无管理员权限可以运行。
 - [ ] 安装在 `/Applications` 之外可以运行。
@@ -91,10 +97,9 @@
 - [ ] DMG staple 验证通过。
 - [ ] 从浏览器下载后 Gatekeeper 首次打开通过。
 
-## 8. 发布制品
+## 8. 发布制品 (单一 arm64 DMG)
 
 - [ ] `AutoCat-<version>-macOS-arm64.dmg`
-- [ ] `AutoCat-<version>-macOS-x86_64.dmg`
 - [ ] `SHA256SUMS`
 - [ ] `build-manifest.json`
 - [ ] `sbom.cdx.json`
@@ -107,6 +112,5 @@
 
 - [ ] 所有必须门禁通过。
 - [ ] arm64 安装包批准：
-- [ ] x86_64 安装包批准：
 - [ ] 签名/公证批准：
 - [ ] 最终发布批准：

@@ -11,9 +11,10 @@ bundle_identifier = "com.autokat.app"
 version_source = "pyproject.toml:project.version"
 
 [compatibility]
-minimum_macos = "13.3"
-architectures = ["arm64", "x86_64"]
-universal2_enabled = false
+minimum_macos = "14.0"
+# Apple Silicon 单架构. Intel Mac 用户使用 Rosetta 2 转译 (macOS 自动提示)
+architectures = ["arm64"]
+intel_fallback = "rosetta"
 requires_admin = false
 requires_network_to_launch = false
 external_runtime_allowed = false
@@ -21,7 +22,6 @@ external_runtime_allowed = false
 [artifacts]
 formats = ["dmg"]
 arm64_name = "AutoCat-{version}-macOS-arm64.dmg"
-x86_64_name = "AutoCat-{version}-macOS-x86_64.dmg"
 required_companions = [
   "SHA256SUMS",
   "build-manifest.json",
@@ -46,6 +46,7 @@ onnxruntime_max_for_broad_compatibility = "1.23.2"
 per_architecture_lockfiles_required = true
 hashes_required = true
 upgrade_requires_compatibility_review = true
+intel_user_action = "macOS 14+ arm64 DMG, Apple Silicon 原生运行; Intel Mac 首次启动由 macOS 自动走 Rosetta 2 转译"
 
 [paths]
 application_support = "~/Library/Application Support/AutoCat"
@@ -54,7 +55,7 @@ logs = "~/Library/Logs/AutoCat"
 app_bundle_is_read_only = true
 
 [native_audit]
-maximum_macos_deployment_target = "13.3"
+maximum_macos_deployment_target = "14.0"
 forbidden_absolute_prefixes = [
   "/opt/homebrew",
   "/usr/local",
@@ -69,6 +70,7 @@ allowed_dependency_prefixes = [
 ]
 reject_mixed_or_wrong_architecture = true
 reject_missing_dynamic_library = true
+reject_x86_64_in_release = true  # 单架构策略: release .app 不允许 x86_64 构件
 
 [security]
 developer_id_required = true
@@ -90,8 +92,7 @@ offline_launch_required = true
 unicode_and_space_paths_required = true
 
 [gitlab]
-arm64_runner_tag = "macos-13-arm64"
-x86_64_runner_tag = "macos-13-x86_64"
+arm64_runner_tag = "macos-14-arm64"
 release_from_protected_tag_only = true
 release_tag_pattern = "vMAJOR.MINOR.PATCH"
 publish_only_after_all_gates = true
