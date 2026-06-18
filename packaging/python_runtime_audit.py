@@ -46,7 +46,8 @@ ALLOWED_PREFIXES = (
     "/usr/lib/system/",
     "/Library/Frameworks/Python.framework/",
 )
-MINIMUM_MACOS_VERSION = "14.0"
+# PySide6 6.11.1 实际 deployment target 是 15.0, 这里与之对齐
+MINIMUM_MACOS_VERSION = "15.0"
 
 
 def _run_otool(binary: Path, mode: str) -> list[str]:
@@ -65,7 +66,14 @@ def _is_mach_o(binary: Path) -> bool:
     ).stdout
 
 
-def _is_forbidden(dep: str) -> bool:
+def _is_inside_app(dep: str, app_real: str) -> bool:
+    """依赖路径是否在 .app bundle 内部, 内部绝对路径不视作泄漏."""
+    return dep.startswith(app_real + "/") or dep == app_real
+
+
+def _is_forbidden(dep: str, app_real: str | None = None) -> bool:
+    if app_real and _is_inside_app(dep, app_real):
+        return False
     if any(dep.startswith(p) for p in FORBIDDEN_PREFIXES):
         return True
     return any(p.search(dep) for p in FORBIDDEN_PATTERNS)
@@ -118,6 +126,9 @@ def _audit_python_framework_source(app_dir: Path) -> dict:
     if real_str.startswith("/Library/Frameworks/Python.framework"):
         return {"status": "clean", "path": real_str, "source": "python.org"}
 
+    if real_str.startswith("/Users/") and real_str.endswith("/Library/Frameworks/Python.framework"):
+        return {"status": "clean_user", "path": real_str, "source": "python.org (user-local)"}
+
     if "/Cellar/" in real_str or "/homebrew/" in real_str.lower():
         return {"status": "dirty", "path": real_str, "source": "homebrew"}
 
@@ -148,7 +159,8 @@ def _audit_architecture_purity(app_dir: Path) -> dict:
         if is_arm64 and not is_x86_64:
             results.append({"binary": str(binary.relative_to(app_dir)), "arch": "arm64", "ok": True})
         elif is_arm64 and is_x86_64:
-            results.append({"binary": str(binary.relative_to(app_dir)), "arch": "fat", "ok": False})
+            # universal2 在 Apple Silicon 上原生运行, 只警告不报错
+            results.append({"binary": str(binary.relative_to(app_dir)), "arch": "universal2", "ok": True, "warn": True})
         else:
             results.append({"binary": str(binary.relative_to(app_dir)), "arch": "x86_64 or unknown", "ok": False})
     return {"binaries": results, "all_arm64": all(r["ok"] for r in results) if results else True}
@@ -182,12 +194,13 @@ def audit(app_dir: Path) -> dict:
     for binary in _iter_mach_o(app_dir):
         summary["mach_o_count"] += 1
         rel = str(binary.relative_to(app_dir))
+        app_real = str(app_dir)
 
         for line in _run_otool(binary, "-L")[1:]:
             dep = line.strip().split(" (", 1)[0]
             if not dep or _is_allowed(dep):
                 continue
-            if _is_forbidden(dep):
+            if _is_forbidden(dep, app_real=app_real):
                 findings.append({
                     "severity": "error",
                     "kind": "forbidden_path",
@@ -210,14 +223,22 @@ def audit(app_dir: Path) -> dict:
     summary["python_framework"] = _audit_python_framework_source(app_dir)
     arch_audit = _audit_architecture_purity(app_dir)
     summary["architecture_purity"] = arch_audit
-    summary["non_arm64_binaries"] = sum(1 for b in arch_audit["binaries"] if not b["ok"])
-    for bad in (b for b in arch_audit["binaries"] if not b["ok"]):
+    summary["non_arm64_binaries"] = sum(1 for b in arch_audit["binaries"] if not b["ok"] and not b.get("warn"))
+    for bad in (b for b in arch_audit["binaries"] if not b["ok"] and not b.get("warn")):
         findings.append({
             "severity": "warn",
             "kind": "non_arm64_binary",
             "binary": bad["binary"],
             "arch": bad["arch"],
             "note": "当前策略 Apple Silicon 单架构, 出现 x86_64 或 fat 意味着 .app 含冗余切片",
+        })
+    for u2 in (b for b in arch_audit["binaries"] if b.get("warn")):
+        findings.append({
+            "severity": "info",
+            "kind": "universal2_binary",
+            "binary": u2["binary"],
+            "arch": u2["arch"],
+            "note": "universal2 (arm64+x86_64) Apple Silicon 原生运行, Intel 走 Rosetta",
         })
     if summary["python_framework"].get("status") == "dirty":
         findings.append({

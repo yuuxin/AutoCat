@@ -11,7 +11,8 @@ bundle_identifier = "com.autokat.app"
 version_source = "pyproject.toml:project.version"
 
 [compatibility]
-minimum_macos = "14.0"
+# PySide6 6.11.1 实际 deployment target 是 15.0
+minimum_macos = "15.0"
 # Apple Silicon 单架构. Intel Mac 用户使用 Rosetta 2 转译 (macOS 自动提示)
 architectures = ["arm64"]
 intel_fallback = "rosetta"

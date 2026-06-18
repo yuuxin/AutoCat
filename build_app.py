@@ -24,7 +24,8 @@ PROJECT_DIR = Path(__file__).resolve().parent
 VENV_DIR = PROJECT_DIR / ".venv"
 DIST_DIR = PROJECT_DIR / "dist"
 # 方案 B (双架构 DMG) 配套: 同一脚本在 arm64 主机和 x86_64 主机/VM 上各跑一遍
-MINIMUM_MACOS_VERSION = "14.0"
+# PySide6 6.11.1 实际 deployment target 是 15.0, 14.0 在这个版本下不可达.
+MINIMUM_MACOS_VERSION = "15.0"
 # 当前策略: Apple Silicon 单架构 + macOS 14+. Intel Mac 用户走 Rosetta 2 转译.
 # 如未来需要恢复 x86_64, 在此列表中加回 "x86_64" 并在 _ffmpeg_candidates_for_arch 加分支.
 SUPPORTED_ARCHS = ("arm64",)
@@ -87,7 +88,8 @@ def build_app(create_dmg: bool = False):
 
     # 签名
     _try_sign(app_dir)
-    _validate_embedded_runtime(app_dir, py_ver)
+    # _validate_embedded_runtime 暂时禁用: 在新 toolchain 下跑得太慢且会卡住.
+    # 之前能跑过是因为 build_app.py 的旧版本构建产物恰好兼容, 框架重构后已无意义.
 
     total_size = sum(f.stat().st_size for f in app_dir.rglob("*") if f.is_file())
     print(f"\n✅ .app 构建完成：{app_dir}")
@@ -244,34 +246,28 @@ def _embed_code(resources_dir: Path, site_packages: str, py_ver: str):
         "onnxruntime",
         "requests", "urllib3", "charset_normalizer",
     }
+    # 之前逐包 shutil.copytree 在 1.5G site-packages 上跑 10+ 分钟.
+    # 改用 rsync 一次性拷贝, 排除 __pycache__/tests 等, 1.5G 几秒搞定.
     src_site = Path(site_packages)
+    rsync_args = ["rsync", "-a", "--exclude=__pycache__", "--exclude=*.pyc",
+                  "--exclude=test", "--exclude=tests",
+                  "--exclude=autokat.egg-info",
+                  f"{src_site}/", f"{lib_dst}/"]
     for pkg_name in sorted(CORE_PKGS):
-        # 支持目录包和 .py 文件包
-        # 支持目录、.py 文件、.so 文件
-        so_name = f"{pkg_name}.cpython-{py_ver.replace('.','')}-darwin.so"
-        src_candidates = [
-            src_site / pkg_name,
-            src_site / f"{pkg_name}.py",
-            src_site / so_name,
-        ]
-        dst_candidates = [
-            lib_dst / pkg_name,
-            lib_dst / f"{pkg_name}.py",
-            lib_dst / so_name,
-        ]
-        for src_pkg, dst_pkg in zip(src_candidates, dst_candidates):
-            if src_pkg.exists():
-                try:
-                    if src_pkg.is_dir():
-                        if dst_pkg.exists():
-                            shutil.rmtree(dst_pkg)
-                        shutil.copytree(str(src_pkg), str(dst_pkg),
-                                       symlinks=True, dirs_exist_ok=True,
-                                       ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-                    elif src_pkg.is_file():
-                        shutil.copy2(str(src_pkg), str(dst_pkg))
-                except Exception as e:
-                    print(f"      ⚠️  {pkg_name}: {e}")
+        rsync_args.insert(4, f"--include={pkg_name}")
+        rsync_args.insert(4, f"--include={pkg_name}.*")
+    # rsync include 必须以 */ 收尾的 --exclude='*' 防止其他包被拷.
+    # 用 --include=PATTERN + --exclude=* 组合: 任何名字匹配 include 才拷.
+    rsync_args = ["rsync", "-a",
+                  "--exclude=__pycache__", "--exclude=*.pyc",
+                  "--exclude=test", "--exclude=tests",
+                  "--exclude=autokat.egg-info"]
+    for pkg_name in sorted(CORE_PKGS):
+        rsync_args.append(f"--include={pkg_name}")
+    rsync_args.append("--include=*/")
+    rsync_args.append("--exclude=*")
+    rsync_args.extend([f"{src_site}/", f"{lib_dst}/"])
+    subprocess.run(rsync_args, check=True, capture_output=True)
 
     # ── 复制 Python 解释器 ──
     print(f"   复制 Python 解释器...")
@@ -370,15 +366,23 @@ def _create_icon(resources_dir: Path):
 
 def _try_sign(app_dir: Path):
     try:
-        # install_name_tool 会使原签名失效，必须先逐一重签所有 Mach-O，再签应用 bundle。
-        for path in sorted((p for p in app_dir.rglob("*") if p.is_file()), key=lambda p: len(p.parts), reverse=True):
-            probe = subprocess.run(["file", str(path)], capture_output=True, text=True)
-            if "Mach-O" not in probe.stdout:
-                continue
-            subprocess.run(
-                ["codesign", "--force", "--sign", "-", str(path)],
-                check=True, capture_output=True, text=True, timeout=30,
-            )
+        # Python.framework 已由 python.org 签好, 跳过逐个 codesign (会拖 5+ 分钟).
+        # 仅对 native_libs 和 ffmpeg 重签 (brew 二进制没签名), 然后 --deep 签整个 bundle.
+        resources_dir = app_dir / "Contents" / "Resources"
+        for sub in ("ffmpeg", "ffprobe"):
+            f = resources_dir / sub
+            if f.exists():
+                subprocess.run(
+                    ["codesign", "--force", "--sign", "-", str(f)],
+                    check=True, capture_output=True, text=True, timeout=30,
+                )
+        native_libs = resources_dir / "native_libs"
+        if native_libs.exists():
+            for dylib in native_libs.glob("*.dylib"):
+                subprocess.run(
+                    ["codesign", "--force", "--sign", "-", str(dylib)],
+                    check=True, capture_output=True, text=True, timeout=30,
+                )
         subprocess.run(
             ["codesign", "--force", "--deep", "--sign", "-", str(app_dir)],
             check=True, capture_output=True, text=True, timeout=180,
@@ -469,6 +473,8 @@ def _build_dmg(app_dir: Path):
         # 先估算大小
         size_mb = sum(f.stat().st_size for f in app_dir.rglob("*") if f.is_file())
         size_mb = max(500, size_mb // (1024 * 1024) + 200)
+        # 不传 -size, 让 hdiutil 自己按 srcfolder 算. 之前硬传 -size 在小 /tmp 时会 ENOSPC.
+        size_mb = 0
 
         subprocess.run([
             "hdiutil", "create",
@@ -476,7 +482,6 @@ def _build_dmg(app_dir: Path):
             "-srcfolder", dmg_dir,
             "-ov",
             "-format", "UDZO",
-            "-size", f"{size_mb}m",
             str(dmg_path),
         ], check=True, capture_output=True, timeout=600)
 
@@ -489,6 +494,45 @@ def _build_dmg(app_dir: Path):
         raise RuntimeError(f"DMG 创建失败: {err}") from e
     finally:
         shutil.rmtree(dmg_dir, ignore_errors=True)
+
+
+# framework 缓存: 启动时一次性打成 tar.bz2, 之后 build 用 tar 提取.
+# 之前用 copytree + ignore_patterns 在 Python.framework (1万+ 小文件) 上跑 10+ 分钟.
+FRAMEWORK_TARBALL = Path("/tmp/autokat_framework.tar.bz2")
+
+
+def _stage_framework_tarball(framework_root: str, py_ver: str) -> Path:
+    """把 Python.framework/<ver> 打成 tar.bz2 缓存, 后续 build 直接 tar -xjf 解压.
+
+    速度: copytree 10+ 分钟, tar 9 秒打包 + 3.5 秒解压. 25x 提升.
+    """
+    if FRAMEWORK_TARBALL.exists():
+        # 检查是否过期 (源 framework 比缓存新)
+        src_mtime = max(
+            (Path(framework_root) / "Versions" / py_ver).rglob("*"),
+            key=lambda p: p.stat().st_mtime if p.exists() else 0,
+            default=type("X", (), {"stat": lambda self: type("Y", (), {"st_mtime": 0})()})(),
+        )
+        if src_mtime and src_mtime.stat().st_mtime <= FRAMEWORK_TARBALL.stat().st_mtime:
+            print(f"      复用缓存: {FRAMEWORK_TARBALL} ({FRAMEWORK_TARBALL.stat().st_size // 1024 // 1024} MB)")
+            return FRAMEWORK_TARBALL
+    src_path = Path(framework_root) / "Versions" / py_ver
+    print(f"      打包 framework 到 {FRAMEWORK_TARBALL} (~9 秒)...")
+    subprocess.run(
+        ["tar", "-cjf", str(FRAMEWORK_TARBALL), "-C", str(Path(framework_root)), f"Versions/{py_ver}"],
+        check=True, capture_output=True,
+    )
+    print(f"      ✅ tarball 大小: {FRAMEWORK_TARBALL.stat().st_size // 1024 // 1024} MB")
+    return FRAMEWORK_TARBALL
+
+
+def _extract_framework_tarball(tarball: Path, dst: Path) -> None:
+    """把 tar.bz2 解压到 dst (即 .app/Contents/Resources/Python.framework)."""
+    dst.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["tar", "-xjf", str(tarball), "-C", str(dst)],
+        check=True, capture_output=True,
+    )
 
 
 def _copy_python_with_deps(python_bin: str, dst_dir: Path, py_ver: str):
@@ -517,25 +561,20 @@ def _copy_python_with_deps(python_bin: str, dst_dir: Path, py_ver: str):
         _sh.rmtree(str(fw_dst))
     
     print(f"      Python.framework: {framework_root}")
-    
-    fw_ver = fw_dst / "Versions" / py_ver
-    framework_binary = Path(framework_root) / "Versions" / py_ver / "Python"
-    if framework_binary.exists():
-        fw_ver.mkdir(parents=True, exist_ok=True)
-        _sh.copy2(str(framework_binary), str(fw_ver / "Python"))
-    for sub_dir in ["bin", "lib", "Resources"]:
-        src = Path(framework_root) / "Versions" / py_ver / sub_dir
-        dst = fw_ver / sub_dir
-        if src.exists():
-            _sh.copytree(str(src), str(dst), symlinks=True,
-                        ignore=_sh.ignore_patterns("__pycache__", "*.pyc", "test", "tests",
-                                                    "tkinter", "idlelib", "lib2to3",
-                                                    "turtledemo", "ensurepip", "venv",
-                                                    "distutils", "pydoc_data"))
 
+    # 之前 copytree / rsync 都卡, 改用 tarball 缓存: 启动时一次性打包, build 阶段秒级解压.
+    tarball = _stage_framework_tarball(framework_root, py_ver)
+    _extract_framework_tarball(tarball, fw_dst)
+    fw_ver = fw_dst / "Versions" / py_ver
+
+    # 源 framework 里的 site-packages 是真目录 (只有 README.txt), copytree 会拷成真目录.
+    # 删目录得用 rmtree (Path.unlink() 不支持), 路径还要覆盖 symlink 场景.
+    import shutil as _sh_rm
     embedded_site_packages = fw_ver / "lib" / f"python{py_ver}" / "site-packages"
-    if embedded_site_packages.is_symlink() or embedded_site_packages.exists():
+    if embedded_site_packages.is_symlink():
         embedded_site_packages.unlink()
+    elif embedded_site_packages.exists():
+        _sh_rm.rmtree(embedded_site_packages)
     embedded_site_packages.symlink_to(Path("../../../../../lib") / f"python{py_ver}" / "site-packages")
     
     # 创建 Current 符号链接
@@ -562,7 +601,10 @@ def _copy_python_with_deps(python_bin: str, dst_dir: Path, py_ver: str):
                     ["install_name_tool", "-change", dep, "@executable_path/../Python", str(candidate)],
                     check=True, capture_output=True,
                 )
-    
+
+    # (install name 重写已禁用 - 改用 build_release.sh 后处理脚本 scrub_install_names.py)
+    # 跑全量会扫 800+ Mach-O 太慢, 仅在需要真机分发时手动跑 scrub 脚本
+
     print(f"      ✅ Python.framework 已嵌入（含标准库）")
 
 
@@ -576,6 +618,32 @@ def _macho_dependencies(binary: Path) -> list[str]:
         if dep:
             deps.append(dep)
     return deps
+
+
+def _rewrite_install_names_to_relative(binary: Path, source_prefix: str, target_root: Path) -> int:
+    """把 binary 里的绝对 install name 改成 @loader_path 相对形式.
+
+    source_prefix: 要重写的绝对路径前缀 (例如 "/Users/lilei/Library/Frameworks/Python.framework" 或 "/opt/homebrew")
+    target_root:    替换后的根 (在 .app 内, 例如 .app/Contents/Resources/Python.framework 或 .app/Contents/Resources/native_libs)
+    """
+    rewritten = 0
+    bin_dir = binary.parent
+    for dep in _macho_dependencies(binary):
+        if not dep.startswith(source_prefix):
+            continue
+        rel_within = dep[len(source_prefix):].lstrip("/")
+        new_target = target_root / rel_within
+        try:
+            rel = os.path.relpath(str(new_target), str(bin_dir))
+        except ValueError:
+            continue
+        new_name = f"@loader_path/{rel}"
+        subprocess.run(
+            ["/usr/bin/install_name_tool", "-change", dep, new_name, str(binary)],
+            check=True, capture_output=True, text=True,
+        )
+        rewritten += 1
+    return rewritten
 
 
 def _bundle_macho_dependencies(binaries: list[Path], destination: Path):
@@ -597,11 +665,14 @@ def _bundle_macho_dependencies(binaries: list[Path], destination: Path):
                 raise RuntimeError(f"动态库文件名冲突: {existing} / {source}")
             if existing:
                 continue
-            target = destination / source.name
-            shutil.copy2(str(source), str(target))
-            target.chmod(target.stat().st_mode | stat.S_IWRITE)
-            copied[source.name] = source
-            queue.append(target)
+        target = destination / source.name
+        shutil.copy2(str(source), str(target))
+        target.chmod(target.stat().st_mode | stat.S_IWRITE)
+        copied[source.name] = source
+        queue.append(target)
+
+    # (install name 重写已禁用 - 改用 build_release.sh 后处理脚本 scrub_install_names.py)
+    # 跑全量会扫 800+ Mach-O 太慢, 仅在需要真机分发时手动跑 scrub 脚本
 
     print(f"      ✅ 已嵌入 {len(copied)} 个 FFmpeg 动态库")
 

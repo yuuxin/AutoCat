@@ -1289,3 +1289,13 @@ Deleting expired sessions...none found.
 6.兼容其他我未提到但是属于常规的范围场景环境等。
 
 帮我安装herness到新的项目目录/Users/lilei/work/code/TestHerness
+
+帮我创建一个适用于企业服务公司使用的线索管理和用户管理软件 以及
+
+之前给的建议：
+给 route.sh 的 patterns["module"] 补 r"新增.*(?:功能|模块)"（1 行 patch，5 分钟）
+给 intake-summary.md 加一个最小 JSON schema 校验 hook（防止模型产出格式飘了）
+真实 Codex CLI Plan mode 端到端跑一次，确认 request_user_input 工具实际可达
+也加到优化目标中执行 最终做完整的验证 并给我总结报告
+
+一台全新的机器 安装这个app的dmg文件能顺利跑起来吗
