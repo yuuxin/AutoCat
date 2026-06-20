@@ -11,11 +11,13 @@ from collections import Counter
 from pathlib import Path
 
 from autokat.core.paths import DATA_ROOT
-from autokat.core.ffmpeg_utils import FFMPEG, get_media_info, run_ffmpeg
+from autokat.core.ffmpeg_utils import (
+    FFMPEG, get_media_info, get_video_duration, run_ffmpeg,
+)
 from autokat.models.db import get_conn, run_write_transaction
 
 
-CACHE_VERSION = "slice-v4-base-bt709"
+CACHE_VERSION = "slice-v5-video-only"
 CACHE_ROOT = DATA_ROOT / "cache" / "slices"
 _locks_guard = threading.Lock()
 _locks: dict[str, threading.Lock] = {}
@@ -201,11 +203,20 @@ def cached_segment(clip: dict, fps: int, perturbation: dict | None = None,
             "-i", source, "-vf", ",".join(filters),
             "-frames:v", str(duration_frames),
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-g", "60",
-            "-pix_fmt", "yuv420p", "-r", str(fps),
+            "-pix_fmt", "yuv420p", "-r", str(fps), "-an",
             *color_args,
             str(target),
         ])
         run_ffmpeg(command, desc="缓存标准化片段")
+        if target.exists():
+            actual = get_video_duration(str(target))
+            expected = duration_frames / fps
+            tolerance = max(2 / fps, 0.08)
+            if actual <= 0 or abs(actual - expected) > tolerance:
+                raise RuntimeError(
+                    f"缓存切片视频时长异常: expected={expected:.3f}s "
+                    f"actual={actual:.3f}s"
+                )
 
     return cache.build(key, builder), key
 

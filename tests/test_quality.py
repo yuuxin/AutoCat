@@ -6,8 +6,9 @@ from unittest.mock import patch
 
 from autokat.core.quality import (
     QualityPolicy, _deep_validation_python, summarize_task_quality,
-    technical_report_text,
+    technical_report_text, quick_validate,
 )
+from autokat.core.renderer import _final_task_status
 from autokat.models import db
 
 
@@ -76,3 +77,56 @@ class QualityPolicyTests(unittest.TestCase):
         self.assertEqual(summary["auto_fixed"], 1)
         self.assertEqual(summary["deep_status"], "unavailable")
         self.assertIn("ASR/OCR environment missing", report)
+
+
+class QuickValidationFreezePolicyTests(unittest.TestCase):
+    def _validate(self, visual_log: str):
+        completed = type("Completed", (), {"stderr": visual_log})()
+        with patch(
+            "autokat.core.quality._probe",
+            return_value={"format": 10.0, "video": 10.0, "audio": 10.0},
+        ), patch("autokat.core.quality.subprocess.run", return_value=completed):
+            return quick_validate("/tmp/out.mp4", {
+                "final_duration": 10.0,
+                "subtitles": [{"start": 0.0, "end": 1.0}],
+            })
+
+    def test_short_internal_freeze_is_warning_only(self):
+        result = self._validate(
+            "lavfi.freezedetect.freeze_start: 2.0\n"
+            "lavfi.freezedetect.freeze_duration: 1.4\n"
+            "lavfi.freezedetect.freeze_end: 3.4\n"
+        )
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["freeze_details"][0]["severity"], "warning")
+
+    def test_medium_internal_freeze_requests_targeted_autofix(self):
+        result = self._validate(
+            "lavfi.freezedetect.freeze_start: 2.0\n"
+            "lavfi.freezedetect.freeze_duration: 1.6\n"
+            "lavfi.freezedetect.freeze_end: 3.6\n"
+        )
+        self.assertFalse(result["passed"])
+        self.assertTrue(result["auto_fixable"])
+        self.assertEqual(result["freeze_details"][0]["severity"], "auto_fix")
+
+    def test_tail_freeze_remains_blocking(self):
+        result = self._validate(
+            "lavfi.freezedetect.freeze_start: 9.0\n"
+            "lavfi.freezedetect.freeze_duration: 1.0\n"
+        )
+        self.assertFalse(result["passed"])
+        self.assertFalse(result["auto_fixable"])
+        self.assertTrue(result["freeze_details"][0]["reaches_tail"])
+
+
+class FinalTaskStatusTests(unittest.TestCase):
+    def test_partial_clip_failures_do_not_fail_task(self):
+        self.assertEqual(_final_task_status({
+            "total": 5, "done": 3, "failed": 2,
+        }), "done")
+
+    def test_all_clip_failures_fail_task(self):
+        self.assertEqual(_final_task_status({
+            "total": 5, "done": 0, "failed": 5,
+        }), "failed")

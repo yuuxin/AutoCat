@@ -30,7 +30,9 @@ from autokat.core.paths import OUTPUT_ROOT, TASKS_ROOT
 
 # ── FFmpeg 路径（统一从 ffmpeg_utils 导入） ──
 from autokat.core.ffmpeg_utils import (
-    FFMPEG, FFPROBE, run_ffmpeg, get_media_duration, get_media_info,
+    FFMPEG, FFPROBE, run_ffmpeg, get_media_duration, get_video_duration,
+    get_media_info,
+    get_supported_xfade_transitions,
 )
 from autokat.core.perturbation import build_perturbation, is_level_enabled
 from autokat.core.sync_check import verify_sync, parse_srt_last_end
@@ -118,13 +120,13 @@ def _h264_encoder_args(bitrate: str = "8M", preserve_color: bool = False,
 XFADE_TRANSITIONS = [
     "fade", "wipeleft", "wiperight", "wipeup", "wipedown",
     "slideleft", "slideright", "slideup", "slidedown",
-    "circlecrop", "rectcrop", "distance",
+    "circlecrop", "rectcrop", "distance", "fadeblack", "fadewhite",
     "radial", "smoothleft", "smoothright", "smoothup", "smoothdown",
     "circleopen", "circleclose", "vertopen", "vertclose",
     "horzopen", "horzclose", "dissolve", "pixelize",
     "diagtl", "diagtr", "diagbl", "diagbr",
     "hlslice", "hrslice", "vuslice", "vdslice",
-    "hblur",
+    "hblur", "fadegrays",
     "wipetl", "wipetr", "wipebl", "wipebr",
     "squeezeh", "squeezev", "zoomin", "fadefast", "fadeslow",
     "hlwind", "hrwind", "vuwind", "vdwind",
@@ -177,6 +179,7 @@ def _compose_cached_segments(seg_files: list[str], seg_durations: list[float],
     """Compose all cached slices in one FFmpeg graph and one encode."""
     if len(seg_files) == 1 and not perturbation:
         return seg_files[0], seg_durations[0]
+    supported_transitions = get_supported_xfade_transitions()
     filter_parts = [
         f"[{index}:v]setpts=PTS-STARTPTS[s{index}]"
         for index in range(len(seg_files))
@@ -196,7 +199,10 @@ def _compose_cached_segments(seg_files: list[str], seg_durations: list[float],
             transition_duration = transition_frames / fps
             output_label = f"gx{group_index}_{index}"
             transition = clips[index].get("transition") or "fade"
-            if transition not in XFADE_TRANSITIONS:
+            if (
+                transition not in XFADE_TRANSITIONS
+                or transition not in supported_transitions
+            ):
                 transition = "fade"
             filter_parts.append(
                 f"[{current}][s{index}]xfade=transition={transition}:"
@@ -247,9 +253,83 @@ def _compose_cached_segments(seg_files: list[str], seg_durations: list[float],
         *_h264_encoder_args("4M", preserve_color=not perturbation), "-r", str(fps), "-an",
         output,
     ])
-    run_ffmpeg(command, desc=f"单次组合拼接({len(seg_files)}段)", timeout=600)
-    duration = get_media_duration(output) or sum(group_durations)
+    try:
+        run_ffmpeg(command, desc=f"单次组合拼接({len(seg_files)}段)", timeout=600)
+    except subprocess.CalledProcessError as exc:
+        stderr = (
+            exc.stderr.decode(errors="replace")
+            if isinstance(exc.stderr, bytes)
+            else str(exc.stderr or "")
+        )
+        graph_index = command.index("-filter_complex") + 1
+        graph = command[graph_index]
+        transition_error = (
+            "xfade" in stderr.lower()
+            and ("transition" in stderr.lower() or "option not found" in stderr.lower())
+        )
+        has_non_fade = bool(re.search(r"xfade=transition=(?!fade:)[^:;]+", graph))
+        if not transition_error or not has_non_fade:
+            raise
+        # Last-resort compatibility path for unusual vendor builds whose help
+        # output advertises a transition that the filter cannot initialize.
+        command[graph_index] = re.sub(
+            r"xfade=transition=[^:;]+", "xfade=transition=fade", graph,
+        )
+        run_ffmpeg(
+            command,
+            desc=f"单次组合拼接({len(seg_files)}段，兼容转场)",
+            timeout=600,
+        )
+    duration = get_video_duration(output) or sum(group_durations)
     return output, duration
+
+
+def _retarget_frozen_clips(script: dict, freeze_details: list[dict]) -> int:
+    """替换与可恢复内部静帧重叠的切片，保留原整数时间轴。"""
+    recoverable = [
+        event for event in freeze_details
+        if event.get("severity") == "auto_fix" and not event.get("reaches_tail")
+    ]
+    clips = script.get("clips", [])
+    if not recoverable or not clips:
+        return 0
+    changed = 0
+    for clip in clips:
+        clip_start = float(clip.get("start_time", 0))
+        clip_end = float(clip.get("end_time", clip_start))
+        if not any(
+            min(clip_end, float(event["end"]))
+            - max(clip_start, float(event["start"])) >= 0.20
+            for event in recoverable
+        ):
+            continue
+        required = float(clip.get("duration", 0))
+        candidates = []
+        for candidate in clips:
+            if candidate is clip or candidate.get("source_type") == "image":
+                continue
+            source = str(candidate.get("source_path") or "")
+            if not source or source == clip.get("source_path"):
+                continue
+            source_duration = get_video_duration(source)
+            if source_duration >= required + 0.35:
+                candidates.append((candidate, source_duration))
+        if not candidates:
+            continue
+        candidate, source_duration = random.choice(candidates)
+        max_offset = max(0.0, source_duration - required - 0.35)
+        candidate_offset = max(0.0, float(candidate.get("offset", 0)))
+        clip.update({
+            "material_id": candidate.get("material_id"),
+            "virtual_slice_id": candidate.get("virtual_slice_id"),
+            "source_id": candidate.get("source_id"),
+            "source_path": candidate.get("source_path"),
+            "source_type": candidate.get("source_type", "video"),
+            "offset": round(min(candidate_offset, max_offset), 2),
+        })
+        clip.pop("cache_key", None)
+        changed += 1
+    return changed
 
 
 def _adaptive_worker_count(task_size: int) -> tuple[int, str]:
@@ -272,6 +352,13 @@ def _adaptive_worker_count(task_size: int) -> tuple[int, str]:
         f"任务 {task_size} 条→{task_limit}"
     )
     return workers, reason
+
+
+def _final_task_status(counts: dict) -> str:
+    """部分成片失败仍视为任务已完成；仅全部成片失败才标 failed。"""
+    total = int(counts.get("total") or 0)
+    failed = int(counts.get("failed") or 0)
+    return "failed" if total > 0 and failed >= total else "done"
 
 
 _TAIL_FREEZE_THRESHOLD = 0.5  # 秒, freezedetect 阈值 (与 _tail_freeze_duration 默认对齐)
@@ -600,7 +687,7 @@ def render_simple(script: dict, output_path: str, audio_path: str,
             seg_file = str(cached_path)
             clip["cache_key"] = cache_key
             # ffprobe 获取实际生成文件的真实时长（素材或裁剪边界可能偏短）
-            actual_dur = get_media_duration(seg_file) or dur
+            actual_dur = get_video_duration(seg_file) or dur
             # 实际输出 < 请求 × 50%，意味着 trim 越界（offset 超过素材结尾）
             # 或者源素材本身就比请求短。下游 concat+tpad 会把这一段冻结成静帧
             # 来补齐，但用户看到的就是一段死画面，必须显式告警以便排查
@@ -609,7 +696,12 @@ def render_simple(script: dict, output_path: str, audio_path: str,
                     f"segment {i} 实际输出 {actual_dur:.2f}s < 请求 {dur:.2f}s，"
                     f"拒绝使用短素材 (src={os.path.basename(src)} offset={offset:.2f}s)"
                 )
-            return seg_file, actual_dur
+            if actual_dur > dur + max(0.10, 2 / fps):
+                raise RuntimeError(
+                    f"segment {i} 视频流 {actual_dur:.2f}s > 请求 {dur:.2f}s，"
+                    f"缓存时长异常 (src={os.path.basename(src)} offset={offset:.2f}s)"
+                )
+            return seg_file, dur
 
         # 实时进度：每完成 1 段就推一次（避免 50 段时 UI 5 分钟没动静）
         # UI 端 _handle_render_log 用 in-place 替换，所以屏上始终 1 行
@@ -1258,19 +1350,38 @@ def _render_task(task_id: int, workers: int = 2, batch_cfg: Optional[dict] = Non
             from autokat.core.quality import quick_validate
             quality_result = quick_validate(output_path, script)
             if not quality_result["passed"]:
-                auto_fix_count = 1
-                _log_emit(f"🛠️  [{clip_idx+1}/{total}] 快速验收失败，自动重渲染一次（重随机扰动）")
-                if is_level_enabled(_pert_level):
-                    _pert = build_perturbation(_pert_level)
-                err_msg = render_simple(
-                    script, output_path, audio_path, bgm_path=bgm_path,
-                    fps=script.get("fps", 30), clip_id=clip["id"], perturbation=_pert,
+                hard_freeze = (
+                    quality_result.get("blocking_freeze_events", 0) > 0
+                    and not quality_result.get("auto_fixable")
                 )
-                quality_result = quick_validate(output_path, script) if err_msg is None else {
-                    "passed": False, "render_error": err_msg,
-                }
-                if not quality_result["passed"] and err_msg is None:
+                if hard_freeze:
                     err_msg = "快速质量验收失败: " + str(quality_result)[:180]
+                else:
+                    auto_fix_count = 1
+                    retargeted = _retarget_frozen_clips(
+                        script, quality_result.get("freeze_details", []),
+                    ) if quality_result.get("auto_fixable") else 0
+                    if retargeted:
+                        _log_emit(
+                            f"🛠️  [{clip_idx+1}/{total}] 检测到内部静止画面，"
+                            f"已替换 {retargeted} 个对应切片并重渲染"
+                        )
+                    else:
+                        _log_emit(
+                            f"🛠️  [{clip_idx+1}/{total}] 快速验收失败，"
+                            "自动重渲染一次（重随机扰动）"
+                        )
+                    if is_level_enabled(_pert_level):
+                        _pert = build_perturbation(_pert_level)
+                    err_msg = render_simple(
+                        script, output_path, audio_path, bgm_path=bgm_path,
+                        fps=script.get("fps", 30), clip_id=clip["id"], perturbation=_pert,
+                    )
+                    quality_result = quick_validate(output_path, script) if err_msg is None else {
+                        "passed": False, "render_error": err_msg,
+                    }
+                    if not quality_result["passed"] and err_msg is None:
+                        err_msg = "快速质量验收失败: " + str(quality_result)[:180]
             from autokat.core.quality import record_result
             record_result(task_id, clip["id"], "quick", quality_result, auto_fix_count)
         elapsed = time.time() - t0
@@ -1341,7 +1452,7 @@ def _render_task(task_id: int, workers: int = 2, batch_cfg: Optional[dict] = Non
 
     final_counts = get_task_clip_counts(task_id)
     done_count = final_counts["done"]
-    final_status = "done" if done_count == final_counts["total"] else "failed"
+    final_status = _final_task_status(final_counts)
     update_task_status(task_id, final_status, done=done_count)
     from autokat.core.quality import (
         finalize_task_quality, run_deep_validation, summarize_task_quality,

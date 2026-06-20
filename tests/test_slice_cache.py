@@ -1,17 +1,23 @@
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from autokat.core.batch_planner import BatchPlanner
-from autokat.core.renderer import _adaptive_worker_count, _compose_cached_segments
+from autokat.core.renderer import (
+    _adaptive_worker_count, _compose_cached_segments, _retarget_frozen_clips,
+)
 from autokat.core.slice_cache import (
-    SliceCache, build_cache_key, cached_segment, prewarm_scripts,
+    CACHE_VERSION, SliceCache, build_cache_key, cached_segment, prewarm_scripts,
 )
 from autokat.models import db
 
 
 class SliceCacheTests(unittest.TestCase):
+    def test_cache_version_invalidates_audio_polluted_entries(self):
+        self.assertEqual(CACHE_VERSION, "slice-v5-video-only")
+
     def test_same_key_builds_once_and_hits_cache(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -140,6 +146,7 @@ class SliceCacheTests(unittest.TestCase):
         vf = command[command.index("-vf") + 1]
         self.assertIn("tonemap=mobius", vf)
         self.assertIn("zscale=p=bt709:t=bt709:m=bt709:r=tv", vf)
+        self.assertIn("-an", command)
         self.assertEqual(command[command.index("-colorspace") + 1], "bt709")
         self.assertEqual(command[command.index("-color_primaries") + 1], "bt709")
 
@@ -162,6 +169,48 @@ class SliceCacheTests(unittest.TestCase):
         graph = command[command.index("-filter_complex") + 1]
         self.assertEqual(graph.count("xfade="), 4)
         self.assertIn("concat=n=2:v=1:a=0[composed]", graph)
+
+    @patch("autokat.core.renderer.get_supported_xfade_transitions", return_value=frozenset({"fade"}))
+    @patch("autokat.core.renderer.get_media_duration", return_value=0)
+    @patch("autokat.core.renderer.run_ffmpeg")
+    def test_old_script_unsupported_transition_falls_back_to_fade(
+        self, run_ffmpeg, _duration, _supported,
+    ):
+        _compose_cached_segments(
+            ["/tmp/0.mp4", "/tmp/1.mp4"], [2.0, 2.0],
+            [{"transition": "fade"}, {"transition": "revealleft", "transition_frames": 9}],
+            30, "/tmp",
+        )
+        command = run_ffmpeg.call_args.args[0]
+        graph = command[command.index("-filter_complex") + 1]
+        self.assertIn("xfade=transition=fade:", graph)
+        self.assertNotIn("revealleft", graph)
+
+    @patch(
+        "autokat.core.renderer.get_supported_xfade_transitions",
+        return_value=frozenset({"fade", "revealleft"}),
+    )
+    @patch("autokat.core.renderer.get_media_duration", return_value=0)
+    @patch("autokat.core.renderer.run_ffmpeg")
+    def test_xfade_transition_runtime_error_retries_with_fade(
+        self, run_ffmpeg, _duration, _supported,
+    ):
+        run_ffmpeg.side_effect = [
+            subprocess.CalledProcessError(
+                -11, ["ffmpeg"], stderr=b"Error applying option 'transition' to filter 'xfade': Option not found",
+            ),
+            None,
+        ]
+        _compose_cached_segments(
+            ["/tmp/0.mp4", "/tmp/1.mp4"], [2.0, 2.0],
+            [{"transition": "fade"}, {"transition": "revealleft", "transition_frames": 9}],
+            30, "/tmp",
+        )
+        self.assertEqual(run_ffmpeg.call_count, 2)
+        retry_command = run_ffmpeg.call_args.args[0]
+        graph = retry_command[retry_command.index("-filter_complex") + 1]
+        self.assertIn("xfade=transition=fade:", graph)
+        self.assertNotIn("revealleft", graph)
 
     @patch("autokat.core.renderer.get_media_duration", return_value=0)
     @patch("autokat.core.renderer.run_ffmpeg")
@@ -207,3 +256,27 @@ class SliceCacheTests(unittest.TestCase):
         workers, reason = _adaptive_worker_count(100)
         self.assertEqual(workers, 4)
         self.assertIn("任务 100 条", reason)
+
+    @patch("autokat.core.renderer.get_video_duration", return_value=20.0)
+    def test_retarget_frozen_clip_keeps_timeline_and_replaces_source(self, _duration):
+        script = {"clips": [
+            {
+                "material_id": 1, "source_id": 1, "source_path": "/a.mp4",
+                "source_type": "video", "offset": 5.0, "duration": 3.0,
+                "start_time": 0.0, "end_time": 3.0, "cache_key": "old",
+            },
+            {
+                "material_id": 2, "source_id": 2, "source_path": "/b.mp4",
+                "source_type": "video", "offset": 2.0, "duration": 3.0,
+                "start_time": 3.0, "end_time": 6.0,
+            },
+        ]}
+        changed = _retarget_frozen_clips(script, [{
+            "start": 1.0, "end": 2.5, "severity": "auto_fix",
+            "reaches_tail": False,
+        }])
+        self.assertEqual(changed, 1)
+        self.assertEqual(script["clips"][0]["source_path"], "/b.mp4")
+        self.assertEqual(script["clips"][0]["start_time"], 0.0)
+        self.assertEqual(script["clips"][0]["end_time"], 3.0)
+        self.assertNotIn("cache_key", script["clips"][0])

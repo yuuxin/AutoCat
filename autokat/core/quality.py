@@ -14,6 +14,10 @@ from autokat.core.ffmpeg_utils import FFMPEG, FFPROBE
 from autokat.core.timeline import SYNC_TOLERANCE_SECONDS
 from autokat.models.db import get_conn, run_write_transaction
 
+INTERNAL_FREEZE_WARNING_SECONDS = 1.5
+INTERNAL_FREEZE_AUTOFIX_SECONDS = 3.0
+TAIL_FREEZE_LIMIT_SECONDS = 0.5
+
 
 class QualityPolicy:
     @staticmethod
@@ -56,7 +60,57 @@ def quick_validate(output_path: str, script: dict) -> dict:
          "-an", "-f", "null", "-"],
         capture_output=True, text=True, timeout=180,
     ).stderr
-    freeze_events = len(re.findall(r"freeze_start:", visual))
+    freeze_starts = [
+        float(value) for value in re.findall(
+            r"(?:lavfi\.freezedetect\.)?freeze_start:\s*([0-9.]+)", visual
+        )
+    ]
+    freeze_ends = [
+        float(value) for value in re.findall(
+            r"(?:lavfi\.freezedetect\.)?freeze_end:\s*([0-9.]+)", visual
+        )
+    ]
+    freeze_durations = [
+        float(value) for value in re.findall(
+            r"(?:lavfi\.freezedetect\.)?freeze_duration:\s*([0-9.]+)", visual
+        )
+    ]
+    output_duration = durations.get("video") or durations.get("format") or target
+    freeze_details = []
+    for index, start in enumerate(freeze_starts):
+        end = freeze_ends[index] if index < len(freeze_ends) else output_duration
+        duration = (
+            freeze_durations[index]
+            if index < len(freeze_durations)
+            else max(0.0, end - start)
+        )
+        reaches_tail = end >= output_duration - 0.10
+        if reaches_tail:
+            severity = "blocking" if duration > TAIL_FREEZE_LIMIT_SECONDS else "warning"
+        elif duration <= INTERNAL_FREEZE_WARNING_SECONDS:
+            severity = "warning"
+        elif duration <= INTERNAL_FREEZE_AUTOFIX_SECONDS:
+            severity = "auto_fix"
+        else:
+            severity = "blocking"
+        freeze_details.append({
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "duration": round(duration, 3),
+            "reaches_tail": reaches_tail,
+            "severity": severity,
+        })
+    freeze_events = len(freeze_details)
+    blocking_freezes = [
+        event for event in freeze_details
+        if event["severity"] in {"auto_fix", "blocking"}
+    ]
+    hard_freezes = [
+        event for event in freeze_details if event["severity"] == "blocking"
+    ]
+    auto_fixable_freezes = [
+        event for event in freeze_details if event["severity"] == "auto_fix"
+    ]
     black_events = len(re.findall(r"black_start:", visual))
     subtitles = script.get("subtitles", [])
     subtitles_valid = all(
@@ -68,12 +122,15 @@ def quick_validate(output_path: str, script: dict) -> dict:
         and pair_diff_ms <= SYNC_TOLERANCE_SECONDS * 1000
         and target_diff_ms <= SYNC_TOLERANCE_SECONDS * 1000
         and black_events == 0
-        and freeze_events == 0
+        and not blocking_freezes
         and subtitles_valid
     )
     return {
         "passed": passed, "durations": durations, "pair_diff_ms": pair_diff_ms,
         "target_diff_ms": target_diff_ms, "freeze_events": freeze_events,
+        "freeze_details": freeze_details,
+        "blocking_freeze_events": len(blocking_freezes),
+        "auto_fixable": bool(auto_fixable_freezes) and not hard_freezes,
         "black_events": black_events, "subtitles_valid": subtitles_valid,
     }
 
