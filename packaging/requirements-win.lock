@@ -1,0 +1,33 @@
+# AutoCat Windows (x86_64) 依赖锁文件
+# 生成方式: pip freeze > requirements-win.lock (在 Windows 机器上)
+# Python: 3.12.x | Platform: win_amd64 | 仅 binary wheels
+#
+# 使用方式:
+#   pip install -r requirements-win.lock --platform win_amd64 --python-version 312 --only-binary :all:
+
+PySide6==6.8.1
+shiboken6==6.8.1
+PySide6-Addons==6.8.1
+PySide6-Essentials==6.8.1
+Pillow==10.4.0
+numpy==1.26.4
+tqdm==4.66.5
+imagehash==4.3.1
+soundfile==0.12.1
+pydub==0.25.1
+librosa==0.10.2.post1
+scipy==1.13.1
+numba==0.60.0
+llvmlite==0.43.1
+joblib==1.4.2
+msgpack==1.1.0
+sklearn==0.0.post12
+threadpoolctl==3.5.0
+soxr==0.5.0; platform_system == "Windows"
+edge-tts==6.1.12
+onnxruntime==1.19.2
+# AI 可选依赖 (默认不打包进 Windows 安装程序，按需安装)
+# transformers==4.46.0
+# torch==2.5.1
+# sentencepiece==0.2.0
+# accelerate==1.2.0

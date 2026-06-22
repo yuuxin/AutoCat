@@ -1,0 +1,196 @@
+# AutoCat Windows (x86_64) GitLab CI 打包流水线
+# 需要项目中有 windows 标签的 Runner（可自建或用 gitlab-runner）
+#
+# 注册 Runner 示例：
+#   gitlab-runner register --url http://60.205.128.186 \
+#     --tag-list "windows" \
+#     --executor "shell" \
+#     --clone-url "https://github.com"
+#
+# 使用方法：
+#   1. 提交代码到 main 分支，或手动触发 Pipeline
+#   2. 在 GitLab > CI/CD > Pipelines > Run pipeline 中填入版本号（可选）
+
+variables:
+  PYTHON_VERSION: "3.12"
+  APP_NAME: AutoCat
+
+stages:
+  - build
+  - package
+
+.windows_build: &windows_build
+  tags:
+    - windows
+  before_script:
+    - $ErrorActionPreference = "Stop"
+    - Write-Host "=== Python $env:PYTHON_VERSION 构建 ===" -ForegroundColor Cyan
+    - python --version
+    - pyinstaller --version 2>$null || pip install pyinstaller
+  script:
+    - python --version
+    - pip install --upgrade pip wheel setuptools
+    - pip install pyinstaller
+
+    # 下载 FFmpeg (gyan.dev essential)
+    - |
+      $ffmpegUrl = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+      $ffmpegZip = "$env:TEMP\ffmpeg-essentials.zip"
+      $ffmpegDir = "$env:RUNNER_TEMP\ffmpeg"
+      Write-Host "下载 FFmpeg..."
+      [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+      Invoke-WebRequest -Uri $ffmpegUrl -OutFile $ffmpegZip
+      New-Item -ItemType Directory -Force -Path $ffmpegDir | Out-Null
+      Expand-Archive -Path $ffmpegZip -DestinationPath $ffmpegDir -Force
+      $binDir = Get-ChildItem -Path $ffmpegDir -Directory | Select-Object -First 1 | Join-String -ChildPath "bin"
+      Copy-Item "$binDir\*" -Destination $ffmpegDir -Force
+      Get-ChildItem $ffmpegDir -File | Select-Object Name
+
+    # 下载 Python embeddable
+    - |
+      $ver = "$env:PYTHON_VERSION"
+      $embedUrl = "https://www.python.org/ftp/python/$ver/python-$ver-embed-amd64.zip"
+      $embedZip = "$env:TEMP\python-embed.zip"
+      $embedDir = "$env:RUNNER_TEMP\python-embed"
+      Write-Host "下载 Python $ver embeddable..."
+      Invoke-WebRequest -Uri $embedUrl -OutFile $embedZip
+      New-Item -ItemType Directory -Force -Path $embedDir | Out-Null
+      Expand-Archive -Path $embedZip -DestinationPath $embedDir -Force
+      Write-Host "Python embeddable 已解压"
+
+    # 为 embeddable 安装依赖
+    - |
+      $pyExe = "$env:RUNNER_TEMP\python-embed\python.exe"
+      $siteDir = "$env:RUNNER_TEMP\python-embed\Lib\site-packages"
+      New-Item -ItemType Directory -Force -Path $siteDir | Out-Null
+      Write-Host "安装 Python 依赖..."
+      & $pyExe -m pip install --upgrade pip 2>&1 | Out-Null
+      $deps = @(
+        "PySide6==6.8.1",
+        "Pillow==10.4.0",
+        "numpy==1.26.4",
+        "tqdm==4.66.5",
+        "imagehash==4.3.1",
+        "soundfile==0.12.1",
+        "pydub==0.25.1",
+        "librosa==0.10.2.post1",
+        "scipy==1.13.1",
+        "numba==0.60.0",
+        "llvmlite==0.43.1",
+        "joblib==1.4.2",
+        "msgpack==1.1.0",
+        "edge-tts==6.1.12",
+        "onnxruntime==1.19.2",
+      )
+      & $pyExe -m pip install $deps --no-warn-script-location 2>&1 | Out-Null
+      Write-Host "依赖安装完成"
+
+    # PyInstaller 构建
+    - |
+      $env:AUTOKAT_APP_VERSION = if ("$env:VERSION" -ne "") { "$env:VERSION" } else {
+        python -Command "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"
+      }
+      $env:AUTOKAT_LOCAL_MODEL_MODE = "$env:MODEL_MODE"
+      Write-Host "=== PyInstaller 构建 (v$env:AUTOKAT_APP_VERSION) ===" -ForegroundColor Yellow
+      pyinstaller packaging/AutoCat-win.spec --noconfirm --distpath dist --workpath build_win
+
+    # 复制 FFmpeg
+    - |
+      $ffmpegDir = "$env:RUNNER_TEMP\ffmpeg"
+      Copy-Item "$ffmpegDir\ffmpeg.exe" -Destination "dist\AutoCat\" -Force
+      Copy-Item "$ffmpegDir\ffprobe.exe" -Destination "dist\AutoCat\" -Force
+      Write-Host "FFmpeg 已复制"
+
+    # 复制 Python embeddable
+    - |
+      $embedDir = "$env:RUNNER_TEMP\python-embed"
+      Copy-Item -Path "$embedDir" -Destination "dist\AutoCat\python-embed" -Recurse -Force
+      Write-Host "Python embeddable 已复制"
+
+    # 列出产物
+    - Get-ChildItem "dist\AutoCat" -File | Select-Object Name, @{N="SizeKB";E={[math]::Round($_.Length/1KB,1)}}
+
+build:onedir:
+  stage: build
+  <<: *windows_build
+  variables:
+    VERSION: ""
+    MODEL_MODE: "bundled"
+  artifacts:
+    paths:
+      - dist/AutoCat/
+    name: "AutoCat-${CI_COMMIT_REF_NAME}-${CI_PIPELINE_ID}"
+    expire_in: 7 days
+  tags:
+    - windows
+
+package:nsis:
+  stage: package
+  needs:
+    - job: build:onedir
+      artifacts: true
+  variables:
+    VERSION: ""
+    MODEL_MODE: "bundled"
+  tags:
+    - windows
+  before_script:
+    - $ErrorActionPreference = "Stop"
+  script:
+    - |
+      $version = if ("$env:VERSION" -ne "") { "$env:VERSION" } else {
+        python -Command "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"
+      }
+      Write-Host "=== 检查 NSIS ===" -ForegroundColor Cyan
+      $nsis = Get-Command makensis -ErrorAction SilentlyContinue
+      if (-not $nsis) {
+        Write-Host "NSIS 未安装，尝试 choco 安装..." -ForegroundColor Yellow
+        choco install nsis -y --force 2>&1 | Out-Null
+        Start-Sleep -Seconds 15
+        $nsis = Get-Command makensis -ErrorAction SilentlyContinue
+      }
+      if (-not $nsis) {
+        Write-Host "NSIS 不可用，跳过 .exe 安装程序生成" -ForegroundColor Red
+        Get-ChildItem "dist" -Recurse -File | Select-Object FullName, @{N="SizeMB";E={[math]::Round($_.Length/1MB,2)}}
+        exit 0
+      }
+      Write-Host "NSIS 路径: $($nsis.Source)"
+
+    # 生成 NSIS
+    - |
+      $version = if ("$env:VERSION" -ne "") { "$env:VERSION" } else {
+        python -Command "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"
+      }
+      Write-Host "=== 生成 NSIS 安装程序 (v$version) ===" -ForegroundColor Yellow
+      $nsiContent = Get-Content "packaging\AutoCat-win.nsi" -Raw
+      $nsiContent = $nsiContent -replace '!define PRODUCT_VERSION "[\d\.]+"', "!define PRODUCT_VERSION `"$version`""
+      $tmpNsi = "$env:TEMP\AutoCat-win-tmp.nsi"
+      Set-Content -Path $tmpNsi -Value $nsiContent -Encoding UTF8
+      Copy-Item "LICENSE" -Destination "dist\LICENSE" -Force
+      & makensis $tmpNsi
+      Get-ChildItem "dist" -Filter "*.exe" | ForEach-Object {
+        Write-Host "输出: $($_.Name) ($([math]::Round($_.Length/1MB,2)) MB)"
+      }
+
+    # SHA256
+    - |
+      Get-ChildItem "dist" -Filter "*.exe" -Recurse | ForEach-Object {
+        $hash = (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash
+        Write-Host "$hash  $($_.Name)"
+        "$hash  $($_.Name)" | Out-File -Encoding ASCII -Append "dist/SHA256SUMS"
+      }
+      Get-Content "dist/SHA256SUMS"
+
+  artifacts:
+    paths:
+      - dist/*.exe
+      - dist/SHA256SUMS
+      - dist/AutoCat/
+    name: "AutoCat-win-${CI_COMMIT_REF_NAME}-${CI_PIPELINE_ID}"
+    expire_in: 30 days
+  tags:
+    - windows
+
+# ── 手动触发变量说明 ──────────────────────────────────────
+# VERSION:     版本号，如 "3.0.1"，留空则自动从 pyproject.toml 读取
+# MODEL_MODE:  bundled | download

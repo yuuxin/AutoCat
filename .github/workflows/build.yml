@@ -1,0 +1,190 @@
+name: Build Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号（如 3.0.1），留空则自动从 pyproject.toml 读取"
+        required: false
+        default: ""
+      model_mode:
+        description: "本地模型模式"
+        required: false
+        default: "bundled"
+        type: choice
+        options:
+          - bundled
+          - download
+
+  push:
+    branches:
+      - main
+    paths:
+      - "autokat/**"
+      - "models/**"
+      - "assets/**"
+      - "packaging/**"
+      - "build_win.py"
+      - "pyproject.toml"
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  build:
+    name: Build Windows x86_64
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set version
+        id: version
+        shell: bash
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          if [ -z "$VERSION" ]; then
+            VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "版本: $VERSION"
+
+      - name: Set model_mode
+        id: model_mode
+        run: |
+          MODE="${{ github.event.inputs.model_mode }}"
+          if [ -z "$MODE" ]; then MODE="bundled"; fi
+          echo "MODE=$MODE" >> $GITHUB_OUTPUT
+          echo "模型模式: $MODE"
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install PyInstaller
+        run: pip install --upgrade pip pyinstaller
+
+      - name: Download FFmpeg
+        id: ffmpeg
+        shell: pwsh
+        run: |
+          $url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+          $dest = "$env:TEMP\ffmpeg.zip"
+          Write-Host "下载 FFmpeg..."
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          Invoke-WebRequest -Uri $url -OutFile $dest
+          $ffmpegDir = "$env:RUNNER_TEMP\ffmpeg"
+          New-Item -ItemType Directory -Force -Path $ffmpegDir | Out-Null
+          Expand-Archive -Path $dest -DestinationPath $ffmpegDir -Force
+          $binDir = Get-ChildItem -Path $ffmpegDir -Directory | Select-Object -First 1 | Join-String -ChildPath "bin"
+          Copy-Item "$binDir\*" -Destination $ffmpegDir -Force
+          Get-ChildItem $ffmpegDir -File | Select-Object Name
+          "FFMPEG_DIR=$ffmpegDir" >> $env:GITHUB_OUTPUT
+
+      - name: Download Python embeddable
+        id: python_embed
+        shell: pwsh
+        run: |
+          $ver = "${{ env.PYTHON_VERSION }}"
+          $url = "https://www.python.org/ftp/python/$ver/python-$ver-embed-amd64.zip"
+          $dest = "$env:TEMP\python-embed.zip"
+          Write-Host "下载 Python $ver embeddable..."
+          Invoke-WebRequest -Uri $url -OutFile $dest
+          $embedDir = "$env:RUNNER_TEMP\python-embed"
+          New-Item -ItemType Directory -Force -Path $embedDir | Out-Null
+          Expand-Archive -Path $dest -DestinationPath $embedDir -Force
+          "EMBED_DIR=$embedDir" >> $env:GITHUB_OUTPUT
+
+      - name: Install dependencies into embeddable
+        shell: pwsh
+        timeout-minutes: 30
+        run: |
+          $pyExe = "${{ steps.python_embed.outputs.EMBED_DIR }}\python.exe"
+          $siteDir = "${{ steps.python_embed.outputs.EMBED_DIR }}\Lib\site-packages"
+          New-Item -ItemType Directory -Force -Path $siteDir | Out-Null
+
+          Write-Host "升级 pip..."
+          & $pyExe -m pip install --upgrade pip --no-warn-script-location 2>&1 | Out-Null
+
+          Write-Host "安装核心依赖..."
+          $deps = @(
+            "PySide6==6.8.1",
+            "Pillow==10.4.0",
+            "numpy==1.26.4",
+            "tqdm==4.66.5",
+            "imagehash==4.3.1",
+            "soundfile==0.12.1",
+            "pydub==0.25.1",
+            "librosa==0.10.2.post1",
+            "scipy==1.13.1",
+            "numba==0.60.0",
+            "llvmlite==0.43.1",
+            "joblib==1.4.2",
+            "msgpack==1.1.0",
+            "edge-tts==6.1.12",
+            "onnxruntime==1.19.2",
+          )
+          & $pyExe -m pip install $deps --no-warn-script-location 2>&1 | Out-Null
+          Write-Host "依赖安装完成"
+
+      - name: Build with PyInstaller
+        shell: pwsh
+        env:
+          AUTOKAT_APP_VERSION: ${{ steps.version.outputs.VERSION }}
+          AUTOKAT_LOCAL_MODEL_MODE: ${{ steps.model_mode.outputs.MODE }}
+        run: |
+          Write-Host "=== PyInstaller 构建 (v$env:AUTOKAT_APP_VERSION) ==="
+          pyinstaller packaging/AutoCat-win.spec --noconfirm --distpath dist --workpath build_win
+          Get-ChildItem "dist\AutoCat" -File | Select-Object Name, @{N="SizeKB";E={[math]::Round($_.Length/1KB,1)}}
+
+      - name: Bundle FFmpeg
+        shell: pwsh
+        run: |
+          $ffmpegDir = "${{ steps.ffmpeg.outputs.FFMPEG_DIR }}"
+          Copy-Item "$ffmpegDir\ffmpeg.exe" -Destination "dist\AutoCat\" -Force
+          Copy-Item "$ffmpegDir\ffprobe.exe" -Destination "dist\AutoCat\" -Force
+          Write-Host "FFmpeg 已复制"
+
+      - name: Bundle Python embeddable
+        shell: pwsh
+        run: |
+          $embedDir = "${{ steps.python_embed.outputs.EMBED_DIR }}"
+          Copy-Item -Path "$embedDir" -Destination "dist\AutoCat\python-embed" -Recurse -Force
+          Write-Host "Python embeddable 已复制"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoCat-${{ steps.version.outputs.VERSION }}-windows-x86_64
+          path: dist/AutoCat/
+          retention-days: 14
+
+      - name: Generate SHA256
+        shell: pwsh
+        run: |
+          Get-ChildItem "dist\AutoCat" -Filter "*.exe" | ForEach-Object {
+            $hash = (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash
+            Write-Host "$hash  $($_.Name)"
+          }
+          $allFiles = Get-ChildItem "dist\AutoCat" -Recurse -File
+          $totalMB = [math]::Round(($allFiles | Measure-Object -Property Length -Sum).Sum / 1MB, 1)
+          Write-Host "总大小: $totalMB MB"
+
+      - name: Summary
+        shell: pwsh
+        run: |
+          $v = "${{ steps.version.outputs.VERSION }}"
+          $m = "${{ steps.model_mode.outputs.MODE }}"
+          Write-Host ""
+          Write-Host "## ✅ Windows 构建完成"
+          Write-Host ""
+          Write-Host "| 项目 | 值 |"
+          Write-Host "|------|----|"
+          Write-Host "| 版本 | `$v |"
+          Write-Host "| 模型模式 | `$m |"
+          Write-Host "| 产物目录 | `dist/AutoCat/` |"
+          Write-Host "| 架构 | x86_64 |"
+          Write-Host "| 最低系统 | Windows 10 |"
