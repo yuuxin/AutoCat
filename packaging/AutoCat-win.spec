@@ -15,7 +15,8 @@ from pathlib import Path
 from PyInstaller.utils.hooks import collect_submodules
 
 
-project = Path(__file__).parent.parent.resolve()
+import os
+project = Path(os.environ.get("SPECPATH", "")).parent.resolve()
 
 app_version = os.environ.get("AUTOKAT_APP_VERSION", "3.0.1")
 icon_path = os.environ.get("AUTOKAT_ICON_PATH", "")
