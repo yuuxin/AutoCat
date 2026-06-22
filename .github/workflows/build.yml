@@ -28,7 +28,7 @@ on:
       - "pyproject.toml"
 
 env:
-  PYTHON_VERSION: "3.12.13"
+  PYTHON_VERSION: "3.12"
 
 jobs:
   build:
