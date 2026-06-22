@@ -71,11 +71,11 @@ jobs:
         id: ffmpeg
         shell: pwsh
         run: |
-          $url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+          $url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-7.1-essentials_build.zip"
           $dest = "$env:TEMP\ffmpeg.zip"
-          Write-Host "下载 FFmpeg..."
+          Write-Host "下载 FFmpeg: $url"
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-          Invoke-WebRequest -Uri $url -OutFile $dest
+          Invoke-WebRequest -Uri $url -OutFile $dest -Force
           $ffmpegDir = "$env:RUNNER_TEMP\ffmpeg"
           New-Item -ItemType Directory -Force -Path $ffmpegDir | Out-Null
           Expand-Archive -Path $dest -DestinationPath $ffmpegDir -Force
@@ -92,7 +92,7 @@ jobs:
           $url = "https://www.python.org/ftp/python/$ver/python-$ver-embed-amd64.zip"
           $dest = "$env:TEMP\python-embed.zip"
           Write-Host "下载 Python $ver embeddable..."
-          Invoke-WebRequest -Uri $url -OutFile $dest
+          Invoke-WebRequest -Uri $url -OutFile $dest -Force
           $embedDir = "$env:RUNNER_TEMP\python-embed"
           New-Item -ItemType Directory -Force -Path $embedDir | Out-Null
           Expand-Archive -Path $dest -DestinationPath $embedDir -Force
