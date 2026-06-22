@@ -72,7 +72,7 @@ jobs:
         id: ffmpeg
         shell: pwsh
         run: |
-          $url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-7.1-essentials_build.zip"
+          $url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
           $dest = "$env:TEMP\ffmpeg.zip"
           Write-Host "下载 FFmpeg: $url"
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
