@@ -80,7 +80,8 @@ jobs:
           $ffmpegDir = "$env:RUNNER_TEMP\ffmpeg"
           New-Item -ItemType Directory -Force -Path $ffmpegDir | Out-Null
           Expand-Archive -Path $dest -DestinationPath $ffmpegDir -Force
-          $binDir = Get-ChildItem -Path $ffmpegDir -Directory | Select-Object -First 1 | Join-String -ChildPath "bin"
+          $subDir = (Get-ChildItem -Path $ffmpegDir -Directory | Select-Object -First 1).FullName
+          $binDir = "$subDir\bin"
           Copy-Item "$binDir\*" -Destination $ffmpegDir -Force
           Get-ChildItem $ffmpegDir -File | Select-Object Name
           "FFMPEG_DIR=$ffmpegDir" >> $env:GITHUB_OUTPUT
