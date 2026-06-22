@@ -53,6 +53,7 @@ jobs:
 
       - name: Set model_mode
         id: model_mode
+        shell: bash
         run: |
           MODE="${{ github.event.inputs.model_mode }}"
           if [ -z "$MODE" ]; then MODE="bundled"; fi
