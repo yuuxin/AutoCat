@@ -15,7 +15,6 @@ from pathlib import Path
 from PyInstaller.utils.hooks import collect_submodules
 
 
-import os
 project = Path(os.environ.get("SPECPATH", "")).parent.resolve()
 
 app_version = os.environ.get("AUTOKAT_APP_VERSION", "3.0.1")
@@ -32,10 +31,9 @@ datas = [
 ]
 
 if local_model_mode == "bundled":
-    datas.append((
-        str(project / "models" / "Qwen2.5-0.5B-Instruct"),
-        "models/Qwen2.5-0.5B-Instruct",
-    ))
+    qwen_dir = project / "models" / "Qwen2.5-0.5B-Instruct"
+    if qwen_dir.exists():
+        datas.append((str(qwen_dir), "models/Qwen2.5-0.5B-Instruct"))
 
 bundled_bgm = project / "assets" / "bgm"
 if bundled_bgm.is_dir():
