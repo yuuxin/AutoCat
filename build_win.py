@@ -34,7 +34,7 @@ APP_VERSION = "3.0.1"
 PROJECT_DIR = Path(__file__).resolve().parent
 DIST_DIR = PROJECT_DIR / "dist"
 BUILD_DIR = PROJECT_DIR / "build_win"
-PY_VERSION = "3.12.8"          # CPython patch 版本（需与 requirements-win.lock 一致）
+PY_VERSION = "3.12.13"          # CPython patch 版本（需与 requirements-win.lock 一致）
 PYTHON_WIN_URL = (
     f"https://www.python.org/ftp/python/{PY_VERSION}/"
     f"python-{PY_VERSION}-embed-amd64.zip"
