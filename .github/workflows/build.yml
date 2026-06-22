@@ -65,8 +65,14 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install PyInstaller
-        run: pip install --upgrade pip pyinstaller
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install pyinstaller
+          pip install PySide6==6.8.1 Pillow==10.4.0 numpy==1.26.4 tqdm==4.66.5 \
+            imagehash==4.3.1 soundfile==0.12.1 pydub==0.25.1 \
+            librosa==0.10.2.post1 scipy==1.13.1 numba==0.60.0 llvmlite==0.43.1 \
+            joblib==1.4.2 msgpack==1.1.0 edge-tts==6.1.12 onnxruntime==1.19.2
 
       - name: Download FFmpeg
         id: ffmpeg
@@ -74,7 +80,7 @@ jobs:
         run: |
           $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
           $dest = "$env:TEMP\ffmpeg.zip"
-          Write-Host "下载 FFmpeg: $url"
+          Write-Host "下载 FFmpeg..."
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
           Invoke-WebRequest -Uri $url -OutFile $dest
           $ffmpegDir = "$env:RUNNER_TEMP\ffmpeg"
@@ -86,52 +92,6 @@ jobs:
           Get-ChildItem $ffmpegDir -File | Select-Object Name
           "FFMPEG_DIR=$ffmpegDir" >> $env:GITHUB_OUTPUT
 
-      - name: Download Python embeddable
-        id: python_embed
-        shell: pwsh
-        run: |
-          $ver = "${{ env.PYTHON_VERSION }}"
-          $url = "https://www.python.org/ftp/python/$ver/python-$ver-embed-amd64.zip"
-          $dest = "$env:TEMP\python-embed.zip"
-          Write-Host "下载 Python $ver embeddable..."
-          Invoke-WebRequest -Uri $url -OutFile $dest
-          $embedDir = "$env:RUNNER_TEMP\python-embed"
-          New-Item -ItemType Directory -Force -Path $embedDir | Out-Null
-          Expand-Archive -Path $dest -DestinationPath $embedDir -Force
-          "EMBED_DIR=$embedDir" >> $env:GITHUB_OUTPUT
-
-      - name: Install dependencies into embeddable
-        shell: pwsh
-        timeout-minutes: 30
-        run: |
-          $pyExe = "${{ steps.python_embed.outputs.EMBED_DIR }}\python.exe"
-          $siteDir = "${{ steps.python_embed.outputs.EMBED_DIR }}\Lib\site-packages"
-          New-Item -ItemType Directory -Force -Path $siteDir | Out-Null
-
-          Write-Host "升级 pip..."
-          & $pyExe -m pip install --upgrade pip --no-warn-script-location 2>&1 | Out-Null
-
-          Write-Host "安装核心依赖..."
-          $deps = @(
-            "PySide6==6.8.1",
-            "Pillow==10.4.0",
-            "numpy==1.26.4",
-            "tqdm==4.66.5",
-            "imagehash==4.3.1",
-            "soundfile==0.12.1",
-            "pydub==0.25.1",
-            "librosa==0.10.2.post1",
-            "scipy==1.13.1",
-            "numba==0.60.0",
-            "llvmlite==0.43.1",
-            "joblib==1.4.2",
-            "msgpack==1.1.0",
-            "edge-tts==6.1.12",
-            "onnxruntime==1.19.2",
-          )
-          & $pyExe -m pip install $deps --no-warn-script-location 2>&1 | Out-Null
-          Write-Host "依赖安装完成"
-
       - name: Build with PyInstaller
         shell: pwsh
         env:
@@ -140,7 +100,7 @@ jobs:
         run: |
           Write-Host "=== PyInstaller 构建 (v$env:AUTOKAT_APP_VERSION) ==="
           pyinstaller packaging/AutoCat-win.spec --noconfirm --distpath dist --workpath build_win
-          Get-ChildItem "dist\AutoCat" -File | Select-Object Name, @{N="SizeKB";E={[math]::Round($_.Length/1KB,1)}}
+          Get-ChildItem "dist\AutoCat" -File | Select-Object Name, @{N="SizeMB";E={[math]::Round($_.Length/1MB,1)}}
 
       - name: Bundle FFmpeg
         shell: pwsh
@@ -149,13 +109,7 @@ jobs:
           Copy-Item "$ffmpegDir\ffmpeg.exe" -Destination "dist\AutoCat\" -Force
           Copy-Item "$ffmpegDir\ffprobe.exe" -Destination "dist\AutoCat\" -Force
           Write-Host "FFmpeg 已复制"
-
-      - name: Bundle Python embeddable
-        shell: pwsh
-        run: |
-          $embedDir = "${{ steps.python_embed.outputs.EMBED_DIR }}"
-          Copy-Item -Path "$embedDir" -Destination "dist\AutoCat\python-embed" -Recurse -Force
-          Write-Host "Python embeddable 已复制"
+          Get-ChildItem "dist\AutoCat" -Filter "*.exe" | Select-Object Name, @{N="SizeMB";E={[math]::Round($_.Length/1MB,1)}}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -164,22 +118,13 @@ jobs:
           path: dist/AutoCat/
           retention-days: 14
 
-      - name: Generate SHA256
-        shell: pwsh
-        run: |
-          Get-ChildItem "dist\AutoCat" -Filter "*.exe" | ForEach-Object {
-            $hash = (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash
-            Write-Host "$hash  $($_.Name)"
-          }
-          $allFiles = Get-ChildItem "dist\AutoCat" -Recurse -File
-          $totalMB = [math]::Round(($allFiles | Measure-Object -Property Length -Sum).Sum / 1MB, 1)
-          Write-Host "总大小: $totalMB MB"
-
       - name: Summary
         shell: pwsh
         run: |
           $v = "${{ steps.version.outputs.VERSION }}"
           $m = "${{ steps.model_mode.outputs.MODE }}"
+          $allFiles = Get-ChildItem "dist\AutoCat" -Recurse -File
+          $totalMB = [math]::Round(($allFiles | Measure-Object -Property Length -Sum).Sum / 1MB, 1)
           Write-Host ""
           Write-Host "## ✅ Windows 构建完成"
           Write-Host ""
@@ -187,6 +132,7 @@ jobs:
           Write-Host "|------|----|"
           Write-Host "| 版本 | `$v |"
           Write-Host "| 模型模式 | `$m |"
+          Write-Host "| 总大小 | `$totalMB MB |"
           Write-Host "| 产物目录 | `dist/AutoCat/` |"
           Write-Host "| 架构 | x86_64 |"
           Write-Host "| 最低系统 | Windows 10 |"
