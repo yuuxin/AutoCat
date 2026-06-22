@@ -76,7 +76,7 @@ jobs:
           $dest = "$env:TEMP\ffmpeg.zip"
           Write-Host "下载 FFmpeg: $url"
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-          Invoke-WebRequest -Uri $url -OutFile $dest -Force
+          Invoke-WebRequest -Uri $url -OutFile $dest
           $ffmpegDir = "$env:RUNNER_TEMP\ffmpeg"
           New-Item -ItemType Directory -Force -Path $ffmpegDir | Out-Null
           Expand-Archive -Path $dest -DestinationPath $ffmpegDir -Force
@@ -93,7 +93,7 @@ jobs:
           $url = "https://www.python.org/ftp/python/$ver/python-$ver-embed-amd64.zip"
           $dest = "$env:TEMP\python-embed.zip"
           Write-Host "下载 Python $ver embeddable..."
-          Invoke-WebRequest -Uri $url -OutFile $dest -Force
+          Invoke-WebRequest -Uri $url -OutFile $dest
           $embedDir = "$env:RUNNER_TEMP\python-embed"
           New-Item -ItemType Directory -Force -Path $embedDir | Out-Null
           Expand-Archive -Path $dest -DestinationPath $embedDir -Force
