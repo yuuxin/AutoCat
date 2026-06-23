@@ -42,7 +42,10 @@ if bundled_bgm.is_dir():
             datas.append((str(f), "assets/bgm"))
 
 # ── 隐藏导入（edge-tts 有大量子模块）──────────────────────
-hiddenimports = collect_submodules("edge_tts")
+hiddenimports = collect_submodules("edge_tts") + [
+    "typing",
+    "typing_extensions",
+]
 
 a = Analysis(
     [str(project / "autokat" / "__main__.py")],
