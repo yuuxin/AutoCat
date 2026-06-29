@@ -116,6 +116,9 @@ jobs:
               "${env:ProgramFiles(x86)}\NSIS",
               "$env:ProgramFiles\NSIS"
             )
+            $candidateDirs | Where-Object { Test-Path $_ } | ForEach-Object {
+              $_ | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            }
             $env:PATH = ($candidateDirs + $env:PATH) -join ";"
             $nsis = Get-Command makensis -ErrorAction SilentlyContinue
             if (-not $nsis) {
