@@ -111,8 +111,23 @@ jobs:
           $nsis = Get-Command makensis -ErrorAction SilentlyContinue
           if (-not $nsis) {
             choco install nsis -y --no-progress
-            $env:PATH = "$env:ProgramFiles\NSIS;$env:PATH"
+            $candidateDirs = @(
+              "$env:ProgramData\chocolatey\bin",
+              "${env:ProgramFiles(x86)}\NSIS",
+              "$env:ProgramFiles\NSIS"
+            )
+            $env:PATH = ($candidateDirs + $env:PATH) -join ";"
             $nsis = Get-Command makensis -ErrorAction SilentlyContinue
+            if (-not $nsis) {
+              $nsisExe = $candidateDirs |
+                ForEach-Object { Join-Path $_ "makensis.exe" } |
+                Where-Object { Test-Path $_ } |
+                Select-Object -First 1
+              if ($nsisExe) {
+                Set-Alias makensis $nsisExe
+                $nsis = Get-Command makensis -ErrorAction SilentlyContinue
+              }
+            }
           }
           if (-not $nsis) {
             throw "makensis not found after NSIS installation"
