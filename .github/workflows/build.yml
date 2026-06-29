@@ -143,9 +143,13 @@ jobs:
           $version = "${{ steps.version.outputs.VERSION }}"
           $nsiContent = Get-Content "packaging\AutoCat-win.nsi" -Raw
           $nsiContent = $nsiContent -replace '!define PRODUCT_VERSION "[^"]+"', "!define PRODUCT_VERSION `"$version`""
-          $tmpNsi = "$env:RUNNER_TEMP\AutoCat-win.nsi"
+          $tmpNsi = "AutoCat-win-ci.nsi"
           Set-Content -Path $tmpNsi -Value $nsiContent -Encoding UTF8
           makensis $tmpNsi
+          if ($LASTEXITCODE -ne 0) {
+            throw "makensis failed with exit code $LASTEXITCODE"
+          }
+          Remove-Item $tmpNsi -Force
           $installer = "dist\AutoCat-$version-windows-x86_64.exe"
           if (-not (Test-Path $installer)) {
             throw "NSIS installer was not created: $installer"
