@@ -1,37 +1,80 @@
-import inspect
 import unittest
-
-import build_app
+from pathlib import Path
 
 
 class PackagingTests(unittest.TestCase):
-    def test_librosa_runtime_dependencies_are_bundled(self):
-        source = inspect.getsource(build_app._embed_code)
-        for package in (
-            "librosa", "soundfile", "soxr", "numba", "llvmlite",
-            "joblib", "msgpack", "sklearn", "aifc", "sunau", "chunk", "audioop",
+    def test_pyinstaller_spec_bundles_models_and_native_packages(self):
+        source = Path("packaging/AutoCat.spec").read_text(encoding="utf-8")
+        self.assertIn("mobileclip_s0_image.onnx", source)
+        self.assertIn("mobileclip_s0_labels.npz", source)
+        self.assertIn('collect_submodules("edge_tts")', source)
+        self.assertNotIn("collect_all", source)
+        self.assertIn("runtime_hook.py", source)
+        self.assertNotIn("assets/clips", source)
+        self.assertIn("AUTOKAT_LOCAL_MODEL_MODE", source)
+        self.assertIn('"download"', source)
+
+    def test_packaged_smoke_test_covers_required_runtime(self):
+        source = Path("autokat/__main__.py").read_text(encoding="utf-8")
+        for marker in (
+            "--packaged-smoke-test",
+            "sqlite3.connect",
+            "InferenceSession",
+            "CPUExecutionProvider",
+            "libx264",
+            "qVersion",
+            "_call_local_model",
+            "local_model_mode",
+            "local_model_response",
         ):
-            self.assertIn(f'"{package}"', source)
+            self.assertIn(marker, source)
 
-    def test_build_runs_packaged_pcm_vad_validation(self):
-        build_source = inspect.getsource(build_app.build_app)
-        validation_source = inspect.getsource(build_app._validate_embedded_runtime)
-        self.assertIn("_validate_embedded_runtime", build_source)
-        self.assertIn("detect_speech_intervals", validation_source)
-        self.assertIn("NUMBA_CACHE_DIR", validation_source)
-        self.assertIn("codesign", validation_source)
+    def test_runtime_hook_isolates_user_environment(self):
+        source = Path("packaging/runtime_hook.py").read_text(encoding="utf-8")
+        for variable in (
+            "PYTHONHOME",
+            "PYTHONPATH",
+            "VIRTUAL_ENV",
+            "CONDA_PREFIX",
+            "DYLD_LIBRARY_PATH",
+            "DYLD_FRAMEWORK_PATH",
+        ):
+            self.assertIn(variable, source)
+        self.assertIn("AUTOKAT_TOOLS_DIR", source)
+        self.assertIn("AUTOKAT_LOCAL_MODEL_DIR", source)
+        self.assertIn("TRANSFORMERS_OFFLINE", source)
+        self.assertIn("HF_HOME", source)
+        self.assertIn('"download"', source)
 
-    def test_visual_model_and_onnx_runtime_are_bundled_and_validated(self):
-        embed_source = inspect.getsource(build_app._embed_code)
-        validation_source = inspect.getsource(build_app._validate_embedded_runtime)
-        launcher_source = inspect.getsource(build_app._create_launcher)
-        self.assertIn('"onnxruntime"', embed_source)
-        self.assertIn("mobileclip_s0_image.onnx", embed_source)
-        self.assertIn("mobileclip_s0_labels.npz", embed_source)
-        self.assertIn("InferenceSession", validation_source)
-        self.assertIn("(1, 512)", validation_source)
-        self.assertIn("MobileCLIP", validation_source)
-        self.assertIn("AUTOKAT_MODEL_DIR", launcher_source)
+    def test_windows_workflow_uploads_verified_distributables(self):
+        source = Path(".github/workflows/build.yml").read_text(encoding="utf-8")
+        for marker in (
+            "Build installer",
+            "Build portable zip",
+            "Verify distributables",
+            "Expand-Archive -Path $zipPath",
+            "AutoCat.exe",
+            "ffmpeg.exe",
+            "dist/SHA256SUMS",
+            "compression-level: 0",
+            "windows-x86_64-portable.zip",
+        ):
+            self.assertIn(marker, source)
+        self.assertNotIn("path: dist/AutoCat/", source)
+
+    def test_windows_local_build_script_creates_portable_outputs(self):
+        source = Path("build_win.py").read_text(encoding="utf-8")
+        for marker in (
+            "build_portable_zip",
+            "allowZip64=True",
+            "AutoCat.exe",
+            "ffmpeg.exe",
+            "testzip",
+            "write_sha256sums",
+            "SHA256SUMS",
+            "windows-x86_64-portable.zip",
+        ):
+            self.assertIn(marker, source)
 
 
 if __name__ == "__main__":

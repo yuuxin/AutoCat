@@ -105,11 +105,92 @@ jobs:
           Write-Host "FFmpeg 已复制"
           Get-ChildItem "dist\AutoCat" -Filter "*.exe" | Select-Object Name, @{N="SizeMB";E={[math]::Round($_.Length/1MB,1)}}
 
+      - name: Install NSIS
+        shell: pwsh
+        run: |
+          $nsis = Get-Command makensis -ErrorAction SilentlyContinue
+          if (-not $nsis) {
+            choco install nsis -y --no-progress
+            $env:PATH = "$env:ProgramFiles\NSIS;$env:PATH"
+            $nsis = Get-Command makensis -ErrorAction SilentlyContinue
+          }
+          if (-not $nsis) {
+            throw "makensis not found after NSIS installation"
+          }
+          Write-Host "NSIS: $($nsis.Source)"
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.VERSION }}"
+          $nsiContent = Get-Content "packaging\AutoCat-win.nsi" -Raw
+          $nsiContent = $nsiContent -replace '!define PRODUCT_VERSION "[^"]+"', "!define PRODUCT_VERSION `"$version`""
+          $tmpNsi = "$env:RUNNER_TEMP\AutoCat-win.nsi"
+          Set-Content -Path $tmpNsi -Value $nsiContent -Encoding UTF8
+          makensis $tmpNsi
+          $installer = "dist\AutoCat-$version-windows-x86_64.exe"
+          if (-not (Test-Path $installer)) {
+            throw "NSIS installer was not created: $installer"
+          }
+          Get-Item $installer | Select-Object Name, @{N="SizeMB";E={[math]::Round($_.Length/1MB,1)}}
+
+      - name: Build portable zip
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.VERSION }}"
+          $zipPath = "dist\AutoCat-$version-windows-x86_64-portable.zip"
+          $zipFullPath = (Join-Path (Get-Location) $zipPath)
+          Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+          $sevenZip = "${env:ProgramFiles}\7-Zip\7z.exe"
+          if (Test-Path $sevenZip) {
+            Push-Location "dist\AutoCat"
+            try {
+              & $sevenZip a -tzip -mm=Deflate -mcu=on $zipFullPath ".\*" | Out-Host
+            } finally {
+              Pop-Location
+            }
+          } else {
+            Compress-Archive -Path "dist\AutoCat\*" -DestinationPath $zipPath -CompressionLevel Optimal
+          }
+          if (-not (Test-Path $zipPath)) {
+            throw "Portable zip was not created: $zipPath"
+          }
+          Get-Item $zipPath | Select-Object Name, @{N="SizeMB";E={[math]::Round($_.Length/1MB,1)}}
+
+      - name: Verify distributables
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.VERSION }}"
+          $installer = "dist\AutoCat-$version-windows-x86_64.exe"
+          $zipPath = "dist\AutoCat-$version-windows-x86_64-portable.zip"
+          $extractDir = "$env:RUNNER_TEMP\autocat-portable-check"
+          Remove-Item $extractDir -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+          if (-not (Test-Path "$extractDir\AutoCat.exe")) {
+            throw "Portable zip does not extract to AutoCat.exe"
+          }
+          if (-not (Test-Path "$extractDir\ffmpeg.exe")) {
+            throw "Portable zip does not include ffmpeg.exe"
+          }
+          if ((Get-Item $installer).Length -le 0) {
+            throw "Installer is empty"
+          }
+          Remove-Item "dist\SHA256SUMS" -Force -ErrorAction SilentlyContinue
+          Get-ChildItem "dist" -File | Where-Object { $_.Extension -in ".exe", ".zip" } | Sort-Object Name | ForEach-Object {
+            $hash = (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)" | Out-File -Encoding ASCII -Append "dist\SHA256SUMS"
+          }
+          Get-Content "dist\SHA256SUMS"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: AutoCat-${{ steps.version.outputs.VERSION }}-windows-x86_64
-          path: dist/AutoCat/
+          path: |
+            dist/AutoCat-${{ steps.version.outputs.VERSION }}-windows-x86_64.exe
+            dist/AutoCat-${{ steps.version.outputs.VERSION }}-windows-x86_64-portable.zip
+            dist/SHA256SUMS
+          compression-level: 0
           retention-days: 14
 
       - name: Summary
@@ -127,6 +208,7 @@ jobs:
           Write-Host "| 版本 | `$v |"
           Write-Host "| 模型模式 | `$m |"
           Write-Host "| 总大小 | `$totalMB MB |"
-          Write-Host "| 产物目录 | `dist/AutoCat/` |"
+          Write-Host "| 安装包 | `dist/AutoCat-$v-windows-x86_64.exe` |"
+          Write-Host "| 便携包 | `dist/AutoCat-$v-windows-x86_64-portable.zip` |"
           Write-Host "| 架构 | x86_64 |"
           Write-Host "| 最低系统 | Windows 10 |"

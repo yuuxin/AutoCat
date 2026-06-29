@@ -16,7 +16,11 @@ cd AutoCat
 python build_win.py
 ```
 
-输出：`dist/AutoCat-3.0.1-windows-x86_64.exe`
+输出：
+
+- `dist/AutoCat-3.0.1-windows-x86_64.exe`
+- `dist/AutoCat-3.0.1-windows-x86_64-portable.zip`
+- `dist/SHA256SUMS`
 
 ---
 
@@ -28,8 +32,12 @@ build_win.py
   ├── [2/5] pip install 依赖到 embeddable site-packages
   ├── [3/5] PyInstaller onedir (AutoCat.spec)
   ├── [4/5] 打包 FFmpeg/Python embeddable 到 onedir/
-  └── [5/5] NSIS 生成安装程序
+  ├── [5/6] NSIS 生成安装程序
+  └── [6/6] 生成便携 zip 和 SHA256SUMS
 ```
+
+GitHub Actions 会在 Windows runner 上用 `Expand-Archive` 立即做便携 zip 的
+解压校验，确认 zip 根目录包含 `AutoCat.exe` 和 `ffmpeg.exe` 后才上传。
 
 ## 文件说明
 
@@ -70,5 +78,11 @@ build_win.py
 每个正式版本应包含：
 
 - `AutoCat-{version}-windows-x86_64.exe` — NSIS 安装程序
+- `AutoCat-{version}-windows-x86_64-portable.zip` — 便携版，仅在不能安装时使用
 - `SHA256SUMS` — 安装包校验和
 - `requirements-win.lock` — 依赖快照
+
+优先分发 `.exe` 安装包。不要把 `dist/AutoCat/` 目录在 macOS Finder、聊天软件
+或网盘客户端里二次压缩后再发给别人；大体积 PyInstaller 目录经过这些工具处理
+后，其他 macOS 或 Windows 11 机器可能无法解压。需要便携版时，使用 CI 生成并
+校验过的 `*-portable.zip`。

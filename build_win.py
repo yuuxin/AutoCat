@@ -7,6 +7,7 @@
   3. 安装 Python 依赖到 embeddable
   4. 运行 PyInstaller (onedir)
   5. 用 NSIS 打包成安装程序
+  6. 生成便携 zip 和 SHA256SUMS
 
 用法（PowerShell）：
     python build_win.py
@@ -240,7 +241,7 @@ def bundle_native(onedir: Path):
 
 def build_nsis_installer(onedir: Path):
     """用 NSIS 生成安装程序。"""
-    print(f"\n[5/5] 生成 NSIS 安装程序...")
+    print(f"\n[5/6] 生成 NSIS 安装程序...")
 
     nsi_file = PROJECT_DIR / "packaging" / "AutoCat-win.nsi"
 
@@ -288,6 +289,54 @@ def build_nsis_installer(onedir: Path):
     print(f"\n   安装后数据目录: %APPDATA%\\AutoCat")
     print(f"   日志目录: %LOCALAPPDATA%\\AutoCat\\logs")
     print(f"\n   注意: 首次运行 Windows SmartScreen 可能提示\"未知发布者\"，点击\"仍要运行\"即可。")
+    return exe_path
+
+
+def build_portable_zip(onedir: Path) -> Path:
+    """生成可跨平台解压的便携 zip，zip 根目录直接包含 AutoCat.exe。"""
+    zip_path = DIST_DIR / f"AutoCat-{APP_VERSION}-windows-x86_64-portable.zip"
+    if zip_path.exists():
+        zip_path.unlink()
+
+    print(f"\n[6/6] 生成便携 zip...")
+    with zipfile.ZipFile(
+        zip_path,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=6,
+        allowZip64=True,
+    ) as z:
+        for path in sorted(onedir.rglob("*")):
+            if path.is_file():
+                z.write(path, path.relative_to(onedir).as_posix())
+
+    with zipfile.ZipFile(zip_path, "r") as z:
+        names = set(z.namelist())
+        for required in ("AutoCat.exe", "ffmpeg.exe"):
+            if required not in names:
+                raise RuntimeError(f"便携 zip 缺少必要文件: {required}")
+        bad_file = z.testzip()
+        if bad_file:
+            raise RuntimeError(f"便携 zip 校验失败: {bad_file}")
+
+    size_mb = zip_path.stat().st_size // (1024 * 1024)
+    print(f"   文件: {zip_path}")
+    print(f"   大小: {size_mb} MB")
+    return zip_path
+
+
+def write_sha256sums(paths: list[Path]) -> Path:
+    """为分发产物写 SHA256SUMS。"""
+    sums_path = DIST_DIR / "SHA256SUMS"
+    with open(sums_path, "w", encoding="ascii", newline="\n") as out:
+        for path in sorted(paths, key=lambda p: p.name):
+            digest = hashlib.sha256()
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            out.write(f"{digest.hexdigest()}  {path.name}\n")
+    print(f"   校验和: {sums_path}")
+    return sums_path
 
 
 def main():
@@ -330,7 +379,11 @@ def main():
     bundle_native(onedir)
 
     # 5. NSIS 安装程序
-    build_nsis_installer(onedir)
+    installer = build_nsis_installer(onedir)
+
+    # 6. 便携 zip + 校验和
+    portable_zip = build_portable_zip(onedir)
+    write_sha256sums([installer, portable_zip])
 
 
 if __name__ == "__main__":
